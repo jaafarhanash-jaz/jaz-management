@@ -379,7 +379,14 @@ async def update_company(company_id: str, updates: dict, current_user: dict = De
     if current_user["role"] != UserRole.SUPER_ADMIN:
         raise HTTPException(status_code=403, detail="Access denied")
     
-    result = await db.companies.update_one({"id": company_id}, {"$set": updates})
+    # Whitelist allowed fields
+    allowed_fields = ["name", "address", "subscription_status", "subscription_plan_id", "subscription_end_date"]
+    safe_updates = {k: v for k, v in updates.items() if k in allowed_fields}
+    
+    if not safe_updates:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
+    
+    result = await db.companies.update_one({"id": company_id}, {"$set": safe_updates})
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Company not found")
     
@@ -529,10 +536,19 @@ async def update_employee(employee_id: str, updates: dict, current_user: dict = 
     if current_user["role"] != UserRole.COMPANY_OWNER:
         raise HTTPException(status_code=403, detail="Access denied")
     
+    # Whitelist allowed fields to prevent tampering
+    allowed_fields = ["name", "phone", "department", "position", "status", "avatar"]
+    safe_updates = {k: v for k, v in updates.items() if k in allowed_fields}
+    if "password" in updates and updates["password"]:
+        safe_updates["password"] = hash_password(updates["password"])
+    
+    if not safe_updates:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
+    
     # Ensure can only update employees from same company
     result = await db.users.update_one(
         {"id": employee_id, "company_id": current_user["company_id"], "role": UserRole.EMPLOYEE},
-        {"$set": updates}
+        {"$set": safe_updates}
     )
     
     if result.matched_count == 0:

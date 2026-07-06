@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react';
 import { Layout } from '@/components/Layout';
 import { Card } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
 import api from '@/utils/api';
 import { t } from '@/utils/translations';
-import { FileText, Image as ImageIcon, Paperclip } from 'lucide-react';
+import { FileText, Paperclip, Download } from 'lucide-react';
 import { toast } from 'sonner';
 
 const OwnerReports = ({ onLogout, language, setLanguage }) => {
@@ -21,16 +22,38 @@ const OwnerReports = ({ onLogout, language, setLanguage }) => {
     setLoading(false);
   };
 
+  const exportReports = () => {
+    // Simple CSV export
+    const rows = [['العنوان', 'الموظف', 'الوصف', 'التاريخ', 'الحالة']];
+    reports.forEach(r => {
+      rows.push([r.title, r.employee_name || '', r.description, r.created_at, r.status]);
+    });
+    const csv = '\uFEFF' + rows.map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = `reports_${new Date().toISOString().split('T')[0]}.csv`;
+    link.click();
+    toast.success('تم تصدير التقارير');
+  };
+
   const formatDate = (iso) => new Date(iso).toLocaleString('ar-EG');
 
   return (
     <Layout userRole="company_owner" onLogout={onLogout} language={language} setLanguage={setLanguage}>
       <div className="space-y-6">
-        <div>
-          <h1 className="text-4xl font-bold text-[#0A0A0A]" data-testid="reports-title">
-            {t('reports', language)}
-          </h1>
-          <p className="text-gray-600 mt-2">تقارير الموظفين المرسلة</p>
+        <div className="flex justify-between items-center flex-wrap gap-3">
+          <div>
+            <h1 className="text-4xl font-bold text-[#0A0A0A]" data-testid="reports-title">
+              {t('reports', language)}
+            </h1>
+            <p className="text-gray-600 mt-2">تقارير الموظفين المرسلة</p>
+          </div>
+          {reports.length > 0 && (
+            <Button onClick={exportReports} data-testid="export-reports-btn" variant="outline" className="rounded-sm">
+              <Download className="w-4 h-4 me-2" /> تصدير CSV
+            </Button>
+          )}
         </div>
 
         {loading ? (
