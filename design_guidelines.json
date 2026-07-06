@@ -1,0 +1,129 @@
+{
+  "project_name": "JAZ Platform",
+  "domain": "HR & Task Management SaaS",
+  "theme": "Light",
+  "archetype": "4 (Swiss & High-Contrast)",
+  "rtl_guidelines": {
+    "direction": "rtl",
+    "tailwindcss_support": "Use Tailwind logical properties (e.g., ms-4 instead of ml-4, pe-6 instead of pr-6, text-start instead of text-left) to seamlessly support both Arabic (RTL) and English (LTR).",
+    "font_family_integration": "IBM Plex Sans Arabic natively handles both Latin and Arabic scripts elegantly, maintaining the Swiss precision feel across both languages.",
+    "icons": "Ensure directional icons (arrows, chevrons, etc.) flip when in RTL mode (using `rtl:-scale-x-100` utility)."
+  },
+  "typography": {
+    "primary_font": "IBM Plex Sans Arabic",
+    "fallback_font": "sans-serif",
+    "weights": {
+      "light": 300,
+      "regular": 400,
+      "medium": 500,
+      "bold": 700
+    },
+    "scale": {
+      "h1": "text-4xl sm:text-5xl lg:text-5xl tracking-tight leading-none font-bold",
+      "h2": "text-2xl sm:text-3xl lg:text-4xl tracking-tight leading-none font-bold",
+      "h3": "text-xl sm:text-2xl tracking-tight leading-tight font-medium",
+      "h4": "text-lg sm:text-xl font-medium",
+      "body": "text-base leading-relaxed font-regular",
+      "small": "text-sm leading-normal",
+      "overline": "text-xs uppercase tracking-[0.2em] font-medium"
+    },
+    "rules": "Avoid center alignment for data-dense dashboards. Strict left (or start for RTL) alignment for all forms, tables, and metric cards."
+  },
+  "colors": {
+    "background": {
+      "base": "#F4F4F5",
+      "surface": "#FFFFFF",
+      "glass": "rgba(255, 255, 255, 0.85)"
+    },
+    "text": {
+      "primary": "#0A0A0A",
+      "secondary": "#52525B",
+      "tertiary": "#A1A1AA",
+      "inverse": "#FFFFFF"
+    },
+    "primary": {
+      "default": "#0033A0",
+      "hover": "#002277",
+      "foreground": "#FFFFFF"
+    },
+    "accent": {
+      "warning": "#FFB800",
+      "warning_foreground": "#422006",
+      "success": "#00A36C",
+      "success_foreground": "#FFFFFF",
+      "danger": "#E11D48",
+      "danger_foreground": "#FFFFFF"
+    },
+    "border": {
+      "default": "#E4E4E7",
+      "focus": "#0033A0"
+    }
+  },
+  "layout_and_spacing": {
+    "system": "Tailwind Scale (p-4, p-6, p-8, p-12)",
+    "container_padding": "p-6 sm:p-8 md:p-12",
+    "grid_strategy": "Control Room Grid (Dense, Data-heavy)",
+    "gap": "gap-4 md:gap-6",
+    "surface_styles": {
+      "cards": "bg-white border border-gray-200 rounded-md shadow-sm",
+      "navigation": "bg-white border-b border-gray-200 sticky top-0 z-50 backdrop-blur-xl bg-white/90",
+      "side_panel": "bg-zinc-50 border-r border-gray-200"
+    },
+    "rules": "Utilize grid-cols-1 md:grid-cols-3 lg:grid-cols-4 for KPI metric cards. Use col-span-2 or col-span-3 for complex charts and tables. Every surface must have a crisp 1px solid border with subtle ambient shadow."
+  },
+  "components": {
+    "buttons": {
+      "primary": "bg-[#0033A0] text-white hover:bg-[#002277] transition-colors rounded-sm px-4 py-2 font-medium shadow-sm",
+      "secondary": "bg-white border border-gray-300 text-gray-900 hover:bg-gray-50 transition-colors rounded-sm px-4 py-2 font-medium shadow-sm",
+      "ghost": "text-gray-600 hover:bg-gray-100 hover:text-gray-900 transition-colors rounded-sm px-4 py-2 font-medium"
+    },
+    "inputs": "bg-white border border-gray-300 rounded-sm px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#0033A0]/20 focus:border-[#0033A0] transition-shadow",
+    "tables": "w-full text-sm text-start. Headers should be uppercase, tracking-wider, text-xs text-gray-500 bg-gray-50/50. Rows have border-b border-gray-100 hover:bg-gray-50/50 transition-colors.",
+    "badges": "rounded-full px-2.5 py-0.5 text-xs font-medium border",
+    "shadcn_overrides": "Remove heavy rounded corners. Use rounded-sm (2px) or rounded-md (4px). Go flat and rectangular for a technical, Swiss feel."
+  },
+  "animations": {
+    "hover": "transition-all duration-200 ease-out",
+    "entrance": "Staggered fade-in for lists and grid items (framer-motion standard initial={{opacity:0, y:10}} animate={{opacity:1, y:0}})",
+    "micro_interactions": "Active states on navigation links translate slightly (-translate-y-[1px]) or feature a crisp active bottom-border.",
+    "reduced_motion": "Ensure respect for `prefers-reduced-motion` media queries."
+  },
+  "image_urls": [
+    {
+      "category": "Hero/Login Background",
+      "url": "https://images.unsplash.com/photo-1488972685288-c3fd157d7c7a?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1Mjh8MHwxfHNlYXJjaHwxfHxhYnN0cmFjdCUyMG9mZmljZSUyMGdlb21ldHJpY3xlbnwwfHx8fDE3ODI5Mjk0MDl8MA&ixlib=rb-4.1.0&q=85",
+      "description": "Low angle photography of gray building, geometric and professional."
+    },
+    {
+      "category": "Abstract Accent / Promo",
+      "url": "https://images.unsplash.com/photo-1709626011485-6fe000ea2dbc?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1Mjh8MHwxfHNlYXJjaHwyfHxhYnN0cmFjdCUyMG9mZmljZSUyMGdlb21ldHJpY3xlbnwwfHx8fDE3ODI5Mjk0MDl8MA&ixlib=rb-4.1.0&q=85",
+      "description": "Black and blue abstract geometric background."
+    },
+    {
+      "category": "Avatar / Profile Placeholder 1",
+      "url": "https://images.pexels.com/photos/33646670/pexels-photo-33646670.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+      "description": "Confident woman in suit (Employee/Owner Avatar)."
+    },
+    {
+      "category": "Avatar / Profile Placeholder 2",
+      "url": "https://images.pexels.com/photos/29852895/pexels-photo-29852895.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+      "description": "Confident professional headshot (Employee/Owner Avatar)."
+    }
+  ],
+  "accessibility": {
+    "contrast": "Maintain strictly WCAG AA (4.5:1 minimum) on all text. The primary blue (#0033A0) on white has a high contrast ratio.",
+    "testing_attributes": "All interactive elements (buttons, inputs, links, tabs) MUST include data-testid attributes (e.g., data-testid='login-submit-button').",
+    "focus_states": "Ensure keyboard focus is visible using high-contrast ring utilities."
+  },
+  "instructions_to_main_agent": [
+    "Design a highly functional, data-dense HR & Task Management dashboard for 'JAZ Platform'.",
+    "The application requires full Arabic RTL support. Use Tailwind logical properties (start, end, ps, pe, ms, me) instead of left/right properties to ensure the layout flips perfectly when direction is RTL.",
+    "Use 'IBM Plex Sans Arabic' as the primary font for both Arabic and English text.",
+    "The UI should feel 'Swiss Brutalist'—functional, high contrast, avoiding unnecessary decorations, gradients, or soft blurred shadows.",
+    "Implement the 'Control Room' grid layout for the dashboards. The gaps should be tight, and the data should be clearly readable.",
+    "All navigation elements and actionable items must be strictly aligned and utilize a modular component structure.",
+    "Ensure 'data-testid' is added to every clickable or interactable UI element.",
+    "For components, rely heavily on Shadcn UI but modify them to use sharp corners (rounded-sm or none) and remove heavy shadows in favor of 1px solid borders.",
+    "Do NOT use placeholder images from dummyimage.com; ONLY use the images provided in the image_urls array."
+  ]
+}
