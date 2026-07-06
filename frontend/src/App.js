@@ -10,6 +10,7 @@ import OwnerTasks from './pages/Owner/Tasks';
 import OwnerAttendance from './pages/Owner/Attendance';
 import OwnerReports from './pages/Owner/Reports';
 import OwnerDepartments from './pages/Owner/Departments';
+import OwnerSubscription from './pages/Owner/Subscription';
 import EmployeeDashboard from './pages/Employee/Dashboard';
 import EmployeeTasks from './pages/Employee/Tasks';
 import EmployeeAttendance from './pages/Employee/Attendance';
@@ -149,6 +150,14 @@ function App() {
             element={
               <ProtectedRoute allowedRoles={['company_owner']}>
                 <OwnerDepartments onLogout={handleLogout} language={language} setLanguage={setLanguage} />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/company-owner/subscription"
+            element={
+              <ProtectedRoute allowedRoles={['company_owner']}>
+                <OwnerSubscription onLogout={handleLogout} language={language} setLanguage={setLanguage} />
               </ProtectedRoute>
             }
           />

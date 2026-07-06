@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, status
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -15,6 +15,7 @@ from jose import JWTError, jwt
 import qrcode
 from io import BytesIO
 import base64
+from emergentintegrations.payments.stripe.checkout import StripeCheckout, CheckoutSessionResponse, CheckoutStatusResponse, CheckoutSessionRequest
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -1195,6 +1196,184 @@ async def seed_data():
         await db.departments.insert_one(dept_doc)
     
     return {"message": "Seed data created successfully", "admin_email": "admin@jaz.com", "admin_password": "admin123", "owner_email": "owner@demo.com", "owner_password": "owner123", "employee_email": "employee1@demo.com", "employee_password": "emp123"}
+
+
+# ============ Stripe Payment Routes ============
+
+class CheckoutRequest(BaseModel):
+    plan_id: str
+    origin_url: str
+
+@api_router.post("/payments/checkout")
+async def create_checkout(req: CheckoutRequest, request: Request, current_user: dict = Depends(get_current_user)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Only company owners can subscribe")
+    
+    # Fetch plan from DB (server-side price only, no frontend manipulation)
+    plan = await db.subscription_plans.find_one({"id": req.plan_id}, {"_id": 0})
+    if not plan:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    
+    amount = float(plan["price"])
+    currency = "usd"
+    
+    stripe_key = os.environ.get('STRIPE_API_KEY')
+    if not stripe_key:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
+    
+    host_url = str(request.base_url).rstrip("/")
+    webhook_url = f"{host_url}/api/webhook/stripe"
+    stripe_checkout = StripeCheckout(api_key=stripe_key, webhook_url=webhook_url)
+    
+    success_url = f"{req.origin_url}/company-owner/subscription?session_id={{CHECKOUT_SESSION_ID}}"
+    cancel_url = f"{req.origin_url}/company-owner/subscription"
+    
+    metadata = {
+        "user_id": current_user["id"],
+        "company_id": current_user["company_id"],
+        "plan_id": req.plan_id
+    }
+    
+    checkout_req = CheckoutSessionRequest(
+        amount=amount,
+        currency=currency,
+        success_url=success_url,
+        cancel_url=cancel_url,
+        metadata=metadata
+    )
+    
+    session: CheckoutSessionResponse = await stripe_checkout.create_checkout_session(checkout_req)
+    
+    # Create payment transaction record
+    tx_doc = {
+        "id": str(uuid.uuid4()),
+        "session_id": session.session_id,
+        "user_id": current_user["id"],
+        "company_id": current_user["company_id"],
+        "plan_id": req.plan_id,
+        "amount": amount,
+        "currency": currency,
+        "metadata": metadata,
+        "payment_status": "initiated",
+        "status": "pending",
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    await db.payment_transactions.insert_one(tx_doc)
+    
+    return {"url": session.url, "session_id": session.session_id}
+
+
+@api_router.get("/payments/status/{session_id}")
+async def check_payment_status(session_id: str, request: Request, current_user: dict = Depends(get_current_user)):
+    stripe_key = os.environ.get('STRIPE_API_KEY')
+    if not stripe_key:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
+    
+    host_url = str(request.base_url).rstrip("/")
+    webhook_url = f"{host_url}/api/webhook/stripe"
+    stripe_checkout = StripeCheckout(api_key=stripe_key, webhook_url=webhook_url)
+    
+    status_resp: CheckoutStatusResponse = await stripe_checkout.get_checkout_status(session_id)
+    
+    # Update payment transaction (only if not already processed)
+    tx = await db.payment_transactions.find_one({"session_id": session_id}, {"_id": 0})
+    if tx and tx["payment_status"] != "paid" and status_resp.payment_status == "paid":
+        await db.payment_transactions.update_one(
+            {"session_id": session_id},
+            {"$set": {
+                "payment_status": status_resp.payment_status,
+                "status": status_resp.status,
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }}
+        )
+        
+        # Activate subscription for company
+        plan = await db.subscription_plans.find_one({"id": tx["plan_id"]}, {"_id": 0})
+        if plan:
+            end_date = datetime.now(timezone.utc) + timedelta(days=30 * plan["duration_months"])
+            await db.companies.update_one(
+                {"id": tx["company_id"]},
+                {"$set": {
+                    "subscription_status": "active",
+                    "subscription_plan_id": tx["plan_id"],
+                    "subscription_end_date": end_date.isoformat()
+                }}
+            )
+    
+    return {
+        "status": status_resp.status,
+        "payment_status": status_resp.payment_status,
+        "amount_total": status_resp.amount_total,
+        "currency": status_resp.currency
+    }
+
+
+@api_router.post("/webhook/stripe")
+async def stripe_webhook(request: Request):
+    stripe_key = os.environ.get('STRIPE_API_KEY')
+    host_url = str(request.base_url).rstrip("/")
+    webhook_url = f"{host_url}/api/webhook/stripe"
+    stripe_checkout = StripeCheckout(api_key=stripe_key, webhook_url=webhook_url)
+    
+    body = await request.body()
+    signature = request.headers.get("Stripe-Signature", "")
+    
+    webhook_response = await stripe_checkout.handle_webhook(body, signature)
+    
+    # Update payment transaction based on webhook
+    if webhook_response.session_id:
+        tx = await db.payment_transactions.find_one({"session_id": webhook_response.session_id}, {"_id": 0})
+        if tx and tx["payment_status"] != "paid" and webhook_response.payment_status == "paid":
+            await db.payment_transactions.update_one(
+                {"session_id": webhook_response.session_id},
+                {"$set": {
+                    "payment_status": webhook_response.payment_status,
+                    "updated_at": datetime.now(timezone.utc).isoformat()
+                }}
+            )
+            
+            # Activate subscription
+            plan = await db.subscription_plans.find_one({"id": tx["plan_id"]}, {"_id": 0})
+            if plan:
+                end_date = datetime.now(timezone.utc) + timedelta(days=30 * plan["duration_months"])
+                await db.companies.update_one(
+                    {"id": tx["company_id"]},
+                    {"$set": {
+                        "subscription_status": "active",
+                        "subscription_plan_id": tx["plan_id"],
+                        "subscription_end_date": end_date.isoformat()
+                    }}
+                )
+    
+    return {"status": "received"}
+
+
+@api_router.get("/owner/subscription-plans")
+async def get_public_subscription_plans(current_user: dict = Depends(get_current_user)):
+    """Get available subscription plans for company owners"""
+    plans = await db.subscription_plans.find({"is_active": True}, {"_id": 0}).to_list(100)
+    return plans
+
+
+@api_router.get("/owner/subscription")
+async def get_owner_subscription(current_user: dict = Depends(get_current_user)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    
+    company = await db.companies.find_one({"id": current_user["company_id"]}, {"_id": 0})
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+    
+    plan = None
+    if company.get("subscription_plan_id"):
+        plan = await db.subscription_plans.find_one({"id": company["subscription_plan_id"]}, {"_id": 0})
+    
+    return {
+        "subscription_status": company.get("subscription_status"),
+        "subscription_end_date": company.get("subscription_end_date"),
+        "current_plan": plan
+    }
+
 
 # Include router
 app.include_router(api_router)

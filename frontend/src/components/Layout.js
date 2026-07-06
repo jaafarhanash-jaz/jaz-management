@@ -11,8 +11,7 @@ import {
   LogOut,
   Menu,
   X,
-} from 'lucide-react';
-import { useState } from 'react';
+} from 'lucide-react';import { useState } from 'react';
 import { t } from '@/utils/translations';
 
 export const Layout = ({ children, userRole, onLogout, language, setLanguage }) => {
@@ -34,6 +33,7 @@ export const Layout = ({ children, userRole, onLogout, language, setLanguage }) 
         { icon: Clock, label: t('attendance', language), path: '/company-owner/attendance' },
         { icon: FileText, label: t('reports', language), path: '/company-owner/reports' },
         { icon: Building2, label: t('departments', language), path: '/company-owner/departments' },
+        { icon: CreditCard, label: 'الاشتراك', path: '/company-owner/subscription' },
       ];
     } else if (userRole === 'employee') {
       return [
