@@ -31,9 +31,19 @@ dist/
 dist
 
 # Environment files (comprehensive coverage)
+.env
+.env.*
+*/.env
+*/.env.*
 
 *token.json*
 *credentials.json*
+
+# Portable local-dev service binaries/data (downloaded, not source) - see
+# backend/docs/BACKUP_RESTORE.md and the migration plan for provenance.
+postgres-portable/
+minio-portable/
+mongodb-backups/
 
 # Logs and debug files
 npm-debug.log*
