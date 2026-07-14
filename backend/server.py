@@ -31,6 +31,7 @@ import services.auth as auth_service
 import services.departments as departments_service
 import services.employees as employees_service
 import services.heartbeat as heartbeat_service
+import services.notifications as notifications_service
 import services.reports as reports_service
 import services.seed as seed_service
 import services.tasks as tasks_service
@@ -867,30 +868,7 @@ async def get_accessible_message(message_id: str, current_user: dict) -> dict:
 
 REMINDER_PRESETS = {"30m": timedelta(minutes=30), "1h": timedelta(hours=1), "tomorrow": timedelta(days=1)}
 
-async def deliver_due_reminders(user_id: str):
-    """Self-heal on read, the same house pattern used for subscription
-    expiry/presence: no scheduler exists in this codebase and none is
-    introduced here. Whichever request next reads this user's notifications
-    (an existing, already-polled-by-nothing-new endpoint) converts any
-    reminder whose time has passed into a real notification row, then marks
-    it delivered so it's never converted twice."""
-    now_iso = datetime.now(timezone.utc).isoformat()
-    due = await db.message_reminders.find(
-        {"user_id": user_id, "notified_at": None, "remind_at": {"$lte": now_iso}}, {"_id": 0}
-    ).to_list(100)
-    for reminder in due:
-        message = await db.messages.find_one({"id": reminder["message_id"]}, {"_id": 0, "subject": 1})
-        await db.notifications.insert_one({
-            "id": str(uuid.uuid4()),
-            "user_id": user_id,
-            "company_id": reminder["company_id"],
-            "type": "message_reminder",
-            "title": "تذكير برسالة",
-            "message": f"تذكير: {message['subject'] if message else ''}",
-            "read_status": False,
-            "created_at": now_iso,
-        })
-        await db.message_reminders.update_one({"id": reminder["id"]}, {"$set": {"notified_at": now_iso}})
+# deliver_due_reminders moved to services/notifications.py (Postgres-backed).
 
 async def deliver_message(message: dict, employee_ids: List[str]):
     """Creates a brand-new thread's participant rows - one per (thread,
@@ -1415,27 +1393,7 @@ async def filter_out_holiday_attendance(company_id: str, records: List[dict]) ->
         return records
     return [r for r in records if r.get("date") not in off_dates]
 
-async def deliver_due_calendar_reminders(user_id: str):
-    """Same self-heal-on-read pattern as message reminders, deliberately a
-    separate function/collection - folded into the same GET /notifications
-    read alongside (not instead of) the existing message-reminder check."""
-    now_iso = datetime.now(timezone.utc).isoformat()
-    due = await db.calendar_event_reminders.find(
-        {"user_id": user_id, "notified_at": None, "remind_at": {"$lte": now_iso}}, {"_id": 0}
-    ).to_list(100)
-    for reminder in due:
-        event = await db.calendar_events.find_one({"id": reminder["event_id"]}, {"_id": 0, "title": 1, "company_id": 1})
-        await db.notifications.insert_one({
-            "id": str(uuid.uuid4()),
-            "user_id": user_id,
-            "company_id": reminder["company_id"],
-            "type": "calendar_reminder",
-            "title": "تذكير بموعد",
-            "message": f"تذكير: {event['title'] if event else ''}",
-            "read_status": False,
-            "created_at": now_iso,
-        })
-        await db.calendar_event_reminders.update_one({"id": reminder["id"]}, {"$set": {"notified_at": now_iso}})
+# deliver_due_calendar_reminders moved to services/notifications.py (Postgres-backed).
 
 async def compute_calendar_dashboard_widgets(current_user: dict, is_owner: bool) -> dict:
     """Shared by both GET /owner/dashboard and GET /employee/dashboard -
@@ -2250,27 +2208,12 @@ async def update_profile(updates: dict, current_user: dict = Depends(get_current
 # ============ Common Routes ============
 
 @api_router.get("/notifications", response_model=List[NotificationResponse])
-async def get_notifications(current_user: dict = Depends(get_current_user)):
-    await deliver_due_reminders(current_user["id"])
-    await deliver_due_calendar_reminders(current_user["id"])
-    notifications = await db.notifications.find(
-        {"user_id": current_user["id"]},
-        {"_id": 0}
-    ).sort("created_at", -1).limit(50).to_list(50)
-
-    return notifications
+async def get_notifications(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await notifications_service.get_notifications(pg, current_user)
 
 @api_router.put("/notifications/{notification_id}/read")
-async def mark_notification_read(notification_id: str, current_user: dict = Depends(get_current_user)):
-    result = await db.notifications.update_one(
-        {"id": notification_id, "user_id": current_user["id"]},
-        {"$set": {"read_status": True}}
-    )
-    
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Notification not found")
-    
-    return {"message": "Notification marked as read"}
+async def mark_notification_read(notification_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await notifications_service.mark_notification_read(pg, current_user, notification_id)
 
 @api_router.get("/company/{company_id}/qr")
 async def get_company_qr(company_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
