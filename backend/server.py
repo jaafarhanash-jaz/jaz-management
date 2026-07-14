@@ -28,6 +28,7 @@ import services.admin as admin_service
 import services.attendance as attendance_service
 import services.auth as auth_service
 import services.calendar as calendar_service
+import services.dashboard as dashboard_service
 import services.departments as departments_service
 import services.employees as employees_service
 import services.heartbeat as heartbeat_service
@@ -83,28 +84,6 @@ class UserRole:
     COMPANY_OWNER = "company_owner"
     EMPLOYEE = "employee"
 
-class TaskStatus:
-    NEW = "new"                # = "Pending" in the daily/urgent workflow
-    RECEIVED = "received"       # Critical Task Alert: employee acknowledged before starting work
-    SEEN = "seen"               # daily/urgent only
-    IN_PROGRESS = "in_progress"
-    PENDING_REVIEW = "pending_review"  # legacy tasks only, unchanged
-    COMPLETED = "completed"
-    REJECTED = "rejected"       # legacy tasks only, unchanged
-    OVERDUE = "overdue"         # legacy tasks only, unchanged
-    CANCELLED = "cancelled"     # daily/urgent only
-
-class TaskPriority:
-    CRITICAL = "critical"       # triggers the Critical Task Alert System - nothing else does
-    HIGH = "high"
-    MEDIUM = "medium"
-    LOW = "low"
-
-class TaskCategory:
-    URGENT = "urgent"
-    DAILY = "daily"
-    # None/absent = legacy standard task, fully backward compatible
-
 class RecurrenceType:
     # Only DAILY is implemented now; the schema supports the others so
     # recurring schedules can be extended later without a migration.
@@ -112,16 +91,6 @@ class RecurrenceType:
     WEEKLY = "weekly"
     MONTHLY = "monthly"
     SELECTED_DAYS = "selected_days"
-
-class AttendanceStatus:
-    PRESENT = "present"
-    LATE = "late"
-    ABSENT = "absent"
-
-class SubscriptionStatus:
-    ACTIVE = "active"
-    EXPIRED = "expired"
-    SUSPENDED = "suspended"
 
 class MessagePriority:
     NORMAL = "normal"
@@ -198,23 +167,6 @@ class EventRecipientType:
     # generally available since the fan-out code path is identical to
     # "department" with no department filter.
 
-class EventLocationType:
-    OFFICE = "office"
-    CLIENT_SITE = "client_site"
-    ONLINE = "online"
-    OTHER = "other"
-
-class AttendanceResponseStatus:
-    NO_RESPONSE = "no_response"
-    ACCEPTED = "accepted"
-    DECLINED = "declined"
-    TENTATIVE = "tentative"
-
-class FinalAttendanceStatus:
-    # Post-meeting record of who actually showed up - independent of
-    # AttendanceResponseStatus above, which is the pre-meeting RSVP.
-    ATTENDED = "attended"
-    ABSENT = "absent"
 
 class RecurrenceType:
     NONE = "none"
@@ -735,26 +687,6 @@ def generate_qr_code(data: str) -> str:
 # next_reference_number (MSG-###### counter) moved to
 # repositories/counters.py + services/messages.py (Postgres-backed).
 
-def classify_attachment_type(mime_type: str) -> str:
-    mime_type = (mime_type or "").lower()
-    if mime_type.startswith("image/"):
-        return AttachmentType.IMAGE
-    if mime_type == "application/pdf":
-        return AttachmentType.PDF
-    if "word" in mime_type or mime_type == "application/msword":
-        return AttachmentType.WORD
-    if "excel" in mime_type or "spreadsheet" in mime_type:
-        return AttachmentType.EXCEL
-    if "powerpoint" in mime_type or "presentation" in mime_type:
-        return AttachmentType.POWERPOINT
-    if "zip" in mime_type or "compressed" in mime_type:
-        return AttachmentType.ZIP
-    if mime_type.startswith("audio/"):
-        return AttachmentType.AUDIO
-    if mime_type.startswith("video/"):
-        return AttachmentType.VIDEO
-    return AttachmentType.OTHER
-
 # Work Messaging helpers (resolve_recipients, write_message_activity,
 # compute_delivery_progress, get_accessible_message, deliver_message,
 # notify_reply_participants, enrich_messages) moved to services/messages.py
@@ -762,229 +694,11 @@ def classify_attachment_type(mime_type: str) -> str:
 # message_attachments,counters}.py.
 
 # ---- Calendar helpers ----
-# create/update/cancel/notify/access-check/conflict-check moved to
-# services/calendar.py (Postgres-backed). combine_event_datetime,
-# get_working_hours, step_occurrence, expand_event_occurrences, and the
-# holiday-check chain below stay here - the not-yet-migrated owner/employee
-# dashboard and analytics routes still call into them directly.
-
-def combine_event_datetime(date_str: str, time_str: Optional[str], all_day: bool, is_end: bool) -> datetime:
-    if all_day:
-        time_str = "23:59:59" if is_end else "00:00:00"
-    elif not time_str:
-        time_str = "23:59:59" if is_end else "00:00:00"
-    if len(time_str) == 5:
-        time_str += ":00"
-    return datetime.fromisoformat(f"{date_str}T{time_str}+00:00")
-
-async def get_working_hours(company_id: str) -> dict:
-    company = await db.companies.find_one({"id": company_id}, {"_id": 0, "working_hours": 1})
-    stored = (company or {}).get("working_hours") or {}
-    return {
-        "working_days": stored.get("working_days", [0, 1, 2, 3, 4]),
-        "start_time": stored.get("start_time", "08:00"),
-        "end_time": stored.get("end_time", "17:00"),
-    }
-
-def step_occurrence(dt: datetime, recurrence_type: str, interval: int) -> datetime:
-    interval = max(interval, 1)
-    if recurrence_type == RecurrenceType.DAILY or recurrence_type == RecurrenceType.CUSTOM:
-        return dt + timedelta(days=interval)
-    if recurrence_type == RecurrenceType.WEEKLY:
-        return dt + timedelta(weeks=interval)
-    if recurrence_type == RecurrenceType.MONTHLY:
-        return dt + relativedelta(months=interval)
-    if recurrence_type == RecurrenceType.YEARLY:
-        return dt + relativedelta(years=interval)
-    return dt
-
-# Safety bound on recurrence expansion regardless of how the rule is shaped -
-# never a runaway loop, and consistent with "never load an entire year":
-# expansion itself never generates more than this many candidate occurrences.
-MAX_OCCURRENCE_ITERATIONS = 3660
-
-async def expand_event_occurrences(event: dict, range_start: datetime, range_end: datetime) -> List[dict]:
-    """Occurrences are computed on read for the requested window only -
-    nothing is pre-materialized per-occurrence in storage. Applies
-    calendar_event_exceptions (skip if cancelled, merge if overridden) so
-    'This Event Only' edits/cancellations don't require touching the series."""
-    base_start = combine_event_datetime(event["start_date"], event.get("start_time"), event["all_day"], False)
-    base_end = combine_event_datetime(event["end_date"], event.get("end_time"), event["all_day"], True)
-    duration = base_end - base_start
-
-    exceptions = await db.calendar_event_exceptions.find({"event_id": event["id"]}, {"_id": 0}).to_list(1000)
-    exceptions_by_date = {e["occurrence_date"]: e for e in exceptions}
-
-    occurrences = []
-    if event.get("recurrence_type", RecurrenceType.NONE) == RecurrenceType.NONE:
-        if base_start <= range_end and base_end >= range_start:
-            occurrences.append({"occurrence_date": event["start_date"], "start": base_start, "end": base_end})
-    else:
-        cursor = base_start
-        end_type = event.get("recurrence_end_type", RecurrenceEndType.NEVER)
-        end_value = event.get("recurrence_end_value")
-        end_date_limit = datetime.fromisoformat(f"{end_value}T23:59:59+00:00") if end_type == RecurrenceEndType.ON_DATE and end_value else None
-        max_count = int(end_value) if end_type == RecurrenceEndType.AFTER_COUNT and end_value else None
-        count = 0
-        iterations = 0
-        while cursor <= range_end and iterations < MAX_OCCURRENCE_ITERATIONS:
-            iterations += 1
-            count += 1
-            if end_date_limit and cursor > end_date_limit:
-                break
-            if max_count and count > max_count:
-                break
-            occurrence_date = cursor.date().isoformat()
-            occurrence_end = cursor + duration
-            if cursor <= range_end and occurrence_end >= range_start:
-                occurrences.append({"occurrence_date": occurrence_date, "start": cursor, "end": occurrence_end})
-            cursor = step_occurrence(cursor, event["recurrence_type"], event.get("recurrence_interval", 1))
-
-    result = []
-    for occ in occurrences:
-        exception = exceptions_by_date.get(occ["occurrence_date"])
-        if exception and exception.get("is_cancelled"):
-            continue
-        merged = {**event, **(exception.get("override_fields") or {} if exception else {})}
-        merged["occurrence_date"] = occ["occurrence_date"]
-        merged["occurrence_start"] = occ["start"].isoformat()
-        merged["occurrence_end"] = occ["end"].isoformat()
-        merged["has_exception"] = exception is not None
-        result.append(merged)
-    return result
-
-async def is_company_holiday(company_id: str, date_str: str) -> Optional[dict]:
-    """Returns {"id", "title"} if date_str (YYYY-MM-DD) falls on an active,
-    non-cancelled company holiday - else None. Used by Attendance/Reports to
-    exclude holiday dates from absence/late/penalty/overtime calculations.
-    The Mongo pre-filter widens for recurring holidays (base end_date only
-    reflects the first occurrence) - expand_event_occurrences does the real,
-    precise per-date check downstream."""
-    holidays = await db.calendar_events.find({
-        "company_id": company_id, "category": EventCategory.COMPANY_HOLIDAY,
-        "status": {"$ne": "cancelled"}, "is_active": True,
-        "start_date": {"$lte": date_str},
-        "$or": [{"end_date": {"$gte": date_str}}, {"recurrence_type": {"$ne": RecurrenceType.NONE}}],
-    }, {"_id": 0}).to_list(200)
-    if not holidays:
-        return None
-    day_start = datetime.fromisoformat(f"{date_str}T00:00:00+00:00")
-    day_end = datetime.fromisoformat(f"{date_str}T23:59:59+00:00")
-    for holiday in holidays:
-        for occ in await expand_event_occurrences(holiday, day_start, day_end):
-            if occ["occurrence_date"] == date_str:
-                return {"id": holiday["id"], "title": holiday["title"]}
-    return None
-
-async def is_weekly_holiday(company_id: str, date_str: str) -> bool:
-    """True if date_str's weekday is NOT one of the company's configured
-    working_days (the Default Weekly Working Schedule section's Working Day
-    / Weekly Holiday toggle) - reuses the existing working_hours settings
-    rather than a new collection. 0=Sunday..6=Saturday, same convention as
-    working_hours.working_days."""
-    working_hours = await get_working_hours(company_id)
-    weekday = (datetime.fromisoformat(f"{date_str}T00:00:00+00:00").date().weekday() + 1) % 7
-    return weekday not in working_hours.get("working_days", [0, 1, 2, 3, 4])
-
-async def get_day_off_info(company_id: str, date_str: str) -> Optional[dict]:
-    """Combined non-working-day check: an active named company holiday
-    (calendar_events) or a configured weekly holiday (working_hours), in
-    that priority order since a named holiday is the more specific label.
-    Returns {"type": "company_holiday"|"weekly_holiday", "title": str|None}
-    or None on an ordinary working day."""
-    holiday = await is_company_holiday(company_id, date_str)
-    if holiday:
-        return {"type": "company_holiday", "title": holiday["title"]}
-    if await is_weekly_holiday(company_id, date_str):
-        return {"type": "weekly_holiday", "title": None}
-    return None
-
-async def filter_out_holiday_attendance(company_id: str, records: List[dict]) -> List[dict]:
-    """Drops attendance records whose date falls on a non-working day
-    (named company holiday or configured weekly holiday), per the Company
-    Holiday Management requirement to exclude those dates from
-    absence/late/attendance-rate/penalty calculations entirely - a stray
-    check-in on a day off should never count as a 'late' violation or skew
-    the attendance-rate denominator. One get_day_off_info lookup per
-    distinct date in the batch, not per record."""
-    dates = {r["date"] for r in records if r.get("date")}
-    if not dates:
-        return records
-    off_dates = {d for d in dates if await get_day_off_info(company_id, d)}
-    if not off_dates:
-        return records
-    return [r for r in records if r.get("date") not in off_dates]
-
-# deliver_due_calendar_reminders moved to services/notifications.py (Postgres-backed).
-
-async def compute_calendar_dashboard_widgets(current_user: dict, is_owner: bool) -> dict:
-    """Shared by both GET /owner/dashboard and GET /employee/dashboard -
-    additive widget data only, computed from a small bounded window (today
-    through +7 days), never a broader scan. Owner sees company-wide events
-    (oversight model); Employee sees only events they're actually invited to."""
-    company_id = current_user["company_id"]
-    now = datetime.now(timezone.utc)
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    week_end = today_start + timedelta(days=7)
-
-    if is_owner:
-        candidates = await db.calendar_events.find({
-            "company_id": company_id, "status": {"$ne": "cancelled"},
-            "start_date": {"$lte": week_end.date().isoformat()}, "end_date": {"$gte": today_start.date().isoformat()},
-        }, {"_id": 0}).to_list(500)
-    else:
-        my_rows = await db.calendar_event_participants.find(
-            {"company_id": company_id, "participant_id": current_user["id"]}, {"_id": 0, "event_id": 1}
-        ).to_list(2000)
-        my_event_ids = list({r["event_id"] for r in my_rows})
-        candidates = await db.calendar_events.find({
-            "id": {"$in": my_event_ids}, "status": {"$ne": "cancelled"},
-            "start_date": {"$lte": week_end.date().isoformat()}, "end_date": {"$gte": today_start.date().isoformat()},
-        }, {"_id": 0}).to_list(500) if my_event_ids else []
-
-    occurrences = []
-    for event in candidates:
-        for occ in await expand_event_occurrences(event, today_start, week_end):
-            occurrences.append({**event, **occ, "start": datetime.fromisoformat(occ["occurrence_start"])})
-    occurrences.sort(key=lambda o: o["start"])
-
-    tomorrow_start = today_start + timedelta(days=1)
-    tomorrow_end = today_start + timedelta(days=2)
-    today_events = [o for o in occurrences if today_start <= o["start"] < tomorrow_start]
-    tomorrow_events = [o for o in occurrences if tomorrow_start <= o["start"] < tomorrow_end]
-    future_occurrences = [o for o in occurrences if o["start"] >= now]
-    next_event = future_occurrences[0] if future_occurrences else None
-    meetings_starting_soon = [o for o in future_occurrences if o["category"] == EventCategory.MEETING and o["start"] <= now + timedelta(hours=1)]
-    upcoming_meetings = [o for o in future_occurrences if o["category"] == EventCategory.MEETING][:5]
-    upcoming_holidays = [o for o in occurrences if o["category"] == EventCategory.COMPANY_HOLIDAY][:5]
-    high_priority = [o for o in future_occurrences if o["priority"] in (EventPriority.HIGH, EventPriority.CRITICAL)][:5]
-
-    widgets = {
-        "today_events": [{"id": o["id"], "title": o["title"], "start": o["occurrence_start"], "category": o["category"], "priority": o["priority"]} for o in today_events],
-        "tomorrow_events": [{"id": o["id"], "title": o["title"], "start": o["occurrence_start"]} for o in tomorrow_events],
-        "next_event": {"id": next_event["id"], "title": next_event["title"], "start": next_event["occurrence_start"],
-                        "seconds_remaining": max(int((next_event["start"] - now).total_seconds()), 0)} if next_event else None,
-        "upcoming_meetings": [{"id": o["id"], "title": o["title"], "start": o["occurrence_start"]} for o in upcoming_meetings],
-        "upcoming_holidays": [{"id": o["id"], "title": o["title"], "start": o["occurrence_start"]} for o in upcoming_holidays],
-    }
-    if is_owner:
-        waiting_ids = [o["id"] for o in future_occurrences]
-        waiting_rows = await db.calendar_event_participants.find(
-            {"event_id": {"$in": waiting_ids}, "attendance_status": AttendanceResponseStatus.NO_RESPONSE}, {"_id": 0, "event_id": 1}
-        ).to_list(2000) if waiting_ids else []
-        waiting_event_ids = {r["event_id"] for r in waiting_rows}
-        widgets.update({
-            "meetings_starting_soon": [{"id": o["id"], "title": o["title"], "start": o["occurrence_start"]} for o in meetings_starting_soon],
-            "events_requiring_response": len(waiting_event_ids),
-            "high_priority_events": [{"id": o["id"], "title": o["title"], "start": o["occurrence_start"], "priority": o["priority"]} for o in high_priority],
-        })
-    else:
-        my_pending = await db.calendar_event_participants.count_documents({
-            "company_id": company_id, "participant_id": current_user["id"],
-            "attendance_status": AttendanceResponseStatus.NO_RESPONSE, "event_id": {"$in": [o["id"] for o in future_occurrences]},
-        }) if future_occurrences else 0
-        widgets["unanswered_invitations"] = my_pending
-    return widgets
+# All moved to services/calendar.py, services/calendar_occurrences.py, and
+# services/holidays.py (Postgres-backed) - see Module 9's completion report.
+# The last remaining Mongo-backed callers (owner/employee dashboard and
+# analytics) migrated to services/dashboard.py; nothing here calls into
+# Mongo anymore.
 
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
@@ -1097,291 +811,17 @@ async def delete_subscription_plan(plan_id: str, current_user: dict = Depends(ge
 # ============ Company Owner Routes ============
 
 @api_router.get("/owner/dashboard")
-async def get_owner_dashboard(current_user: dict = Depends(get_current_user)):
-    if current_user["role"] != UserRole.COMPANY_OWNER:
-        raise HTTPException(status_code=403, detail="Access denied")
-    
-    company_id = current_user["company_id"]
-    today = datetime.now(timezone.utc).date().isoformat()
-    today_holiday = await get_day_off_info(company_id, today)
-    working_hours_for_dashboard = await get_working_hours(company_id)
-
-    # Get statistics
-    # Scope attendance stats to CURRENT employees only, deduped per employee.
-    # Counting raw attendance rows (the previous approach) let orphaned rows
-    # (from deleted employees) or duplicate same-day check-ins inflate the
-    # counts, producing impossible values like absent_today < 0 or
-    # attendance_percentage > 100%. Company sizes are bounded by the
-    # subscription's max_employees, so loading the id set is cheap.
-    employee_ids = [u["id"] for u in await db.users.find(
-        {"company_id": company_id, "role": UserRole.EMPLOYEE}, {"_id": 0, "id": 1}
-    ).to_list(100000)]
-    total_employees = len(employee_ids)
-
-    today_rows = await db.attendance.find(
-        {"company_id": company_id, "date": today, "employee_id": {"$in": employee_ids}}, {"_id": 0}
-    ).to_list(100000) if employee_ids else []
-    # Dedupe per employee (a stray duplicate check-in must not double-count).
-    status_by_employee = {}
-    checked_out_ids = set()
-    for row in today_rows:
-        status_by_employee[row["employee_id"]] = row.get("status")
-        if row.get("check_out_time"):
-            checked_out_ids.add(row["employee_id"])
-
-    present_today = sum(1 for s in status_by_employee.values() if s == AttendanceStatus.PRESENT)
-    # On a company holiday nobody is expected to check in, so "late" and
-    # "absent" are not violations - suppressed entirely rather than counted.
-    late_today = 0 if today_holiday else sum(1 for s in status_by_employee.values() if s == AttendanceStatus.LATE)
-    # Clamp: absent can never be negative even if data is inconsistent.
-    absent_today = 0 if today_holiday else max(0, total_employees - present_today - late_today)
-    checked_out_today = len(checked_out_ids)
-    # Clamp: attendance rate is a percentage of the workforce, never > 100%.
-    attendance_percentage = min(100.0, round((present_today + late_today) / total_employees * 100, 1)) if total_employees > 0 else 0
-
-    open_tasks = await db.tasks.count_documents({
-        "company_id": company_id,
-        # SEEN is a new status introduced by Smart Task Management, sitting
-        # between NEW and IN_PROGRESS for daily/urgent tasks - included here
-        # so this existing "still open" count stays accurate rather than
-        # silently undercounting once a task is auto-marked seen.
-        "status": {"$in": [TaskStatus.NEW, TaskStatus.SEEN, TaskStatus.IN_PROGRESS]}
-    })
-    completed_tasks = await db.tasks.count_documents({
-        "company_id": company_id,
-        "status": TaskStatus.COMPLETED
-    })
-    overdue_tasks = await db.tasks.count_documents({
-        "company_id": company_id,
-        "status": TaskStatus.OVERDUE
-    })
-
-    active_daily_tasks = await db.daily_tasks.count_documents({"company_id": company_id, "is_active": True})
-    pending_urgent_tasks = await db.tasks.count_documents({
-        "company_id": company_id,
-        "task_category": TaskCategory.URGENT,
-        "status": {"$in": [TaskStatus.NEW, TaskStatus.SEEN, TaskStatus.IN_PROGRESS]}
-    })
-    completed_urgent_tasks = await db.tasks.count_documents({
-        "company_id": company_id,
-        "task_category": TaskCategory.URGENT,
-        "status": TaskStatus.COMPLETED
-    })
-
-    # Get recent reports
-    recent_reports = await db.reports.find(
-        {"company_id": company_id},
-        {"_id": 0}
-    ).sort("created_at", -1).limit(5).to_list(5)
-
-    return {
-        "total_employees": total_employees,
-        "present_today": present_today,
-        "late_today": late_today,
-        "absent_today": absent_today,
-        "checked_out_today": checked_out_today,
-        "attendance_percentage": attendance_percentage,
-        "open_tasks": open_tasks,
-        "completed_tasks": completed_tasks,
-        "overdue_tasks": overdue_tasks,
-        "active_daily_tasks": active_daily_tasks,
-        "pending_urgent_tasks": pending_urgent_tasks,
-        "completed_urgent_tasks": completed_urgent_tasks,
-        "recent_reports": recent_reports,
-        "calendar_widgets": await compute_calendar_dashboard_widgets(current_user, is_owner=True),
-        "today_is_holiday": today_holiday is not None,
-        "today_holiday_type": today_holiday["type"] if today_holiday else None,
-        "today_holiday_title": today_holiday["title"] if today_holiday else None,
-        "weekly_holiday_days": [d for d in range(7) if d not in working_hours_for_dashboard["working_days"]],
-    }
-
-def compute_star_rating(score: float) -> str:
-    if score >= 90:
-        return "★★★★★ Excellent"
-    if score >= 75:
-        return "★★★★ Good"
-    if score >= 50:
-        return "★★★ Average"
-    return "★★ Needs Improvement"
-
-def _duration_minutes(start_iso: Optional[str], end_iso: Optional[str]) -> Optional[float]:
-    if not start_iso or not end_iso:
-        return None
-    try:
-        delta = (datetime.fromisoformat(end_iso) - datetime.fromisoformat(start_iso)).total_seconds() / 60
-        return delta if delta >= 0 else None
-    except ValueError:
-        return None
+async def get_owner_dashboard(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await dashboard_service.get_owner_dashboard(pg, current_user)
 
 @api_router.get("/owner/analytics")
-async def get_owner_analytics(current_user: dict = Depends(get_current_user)):
+async def get_owner_analytics(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     """Employee performance analytics, computed entirely from existing task
     and attendance data - no AI, no new data sources. Reuses the same
     completion_rate/attendance_rate calculation already used by
     /employee/performance, extended with more factors and aggregated across
     the whole company for the owner's view."""
-    if current_user["role"] != UserRole.COMPANY_OWNER:
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    company_id = current_user["company_id"]
-    employees = await db.users.find(
-        {"company_id": company_id, "role": UserRole.EMPLOYEE}, {"_id": 0, "password": 0}
-    ).to_list(1000)
-    all_tasks = await db.tasks.find({"company_id": company_id}, {"_id": 0}).to_list(5000)
-
-    today = datetime.now(timezone.utc).date()
-    week_start = today - timedelta(days=today.weekday())
-    month_start = today.replace(day=1)
-
-    def completed_since(task, start_date):
-        completed_at = task.get("completed_at")
-        if not completed_at:
-            return False
-        try:
-            return datetime.fromisoformat(completed_at).date() >= start_date
-        except ValueError:
-            return False
-
-    completed_tasks_all = [t for t in all_tasks if t.get("status") == TaskStatus.COMPLETED]
-    pending_tasks_all = [t for t in all_tasks if t.get("status") in (TaskStatus.NEW, TaskStatus.SEEN, TaskStatus.IN_PROGRESS)]
-    urgent_tasks_all = [t for t in all_tasks if t.get("task_category") == TaskCategory.URGENT]
-
-    tasks_completed_today = sum(1 for t in completed_tasks_all if (t.get("completed_at") or "")[:10] == today.isoformat())
-    tasks_completed_week = sum(1 for t in completed_tasks_all if completed_since(t, week_start))
-    tasks_completed_month = sum(1 for t in completed_tasks_all if completed_since(t, month_start))
-
-    completion_durations = [d for t in all_tasks if (d := _duration_minutes(t.get("started_at"), t.get("completed_at"))) is not None]
-    avg_completion_time = round(sum(completion_durations) / len(completion_durations), 1) if completion_durations else None
-
-    response_durations = [d for t in all_tasks if (d := _duration_minutes(t.get("created_at"), t.get("started_at"))) is not None]
-    avg_response_time = round(sum(response_durations) / len(response_durations), 1) if response_durations else None
-
-    # Fetched once and holiday-filtered here rather than via count_documents,
-    # so both the company-wide and per-employee stats below share a single
-    # exclusion pass - a stray check-in on a company holiday must not count
-    # as a "late" violation or skew anyone's attendance rate.
-    all_attendance = await db.attendance.find(
-        {"company_id": company_id}, {"_id": 0, "employee_id": 1, "date": 1, "status": 1}
-    ).to_list(20000)
-    all_attendance = await filter_out_holiday_attendance(company_id, all_attendance)
-
-    total_attendance_all = len(all_attendance)
-    present_attendance_all = sum(1 for a in all_attendance if a.get("status") == AttendanceStatus.PRESENT)
-    late_attendance_all = sum(1 for a in all_attendance if a.get("status") == AttendanceStatus.LATE)
-    company_attendance_rate = round((present_attendance_all / total_attendance_all * 100), 1) if total_attendance_all > 0 else 0
-
-    employee_stats = []
-    for emp in employees:
-        emp_id = emp["id"]
-        emp_tasks = [t for t in all_tasks if t.get("assigned_to") == emp_id]
-        emp_completed = [t for t in emp_tasks if t.get("status") == TaskStatus.COMPLETED]
-        emp_urgent = [t for t in emp_tasks if t.get("task_category") == TaskCategory.URGENT]
-        emp_urgent_completed = [t for t in emp_urgent if t.get("status") == TaskStatus.COMPLETED]
-
-        emp_attendance = [a for a in all_attendance if a.get("employee_id") == emp_id]
-        emp_total_days = len(emp_attendance)
-        emp_present_days = sum(1 for a in emp_attendance if a.get("status") == AttendanceStatus.PRESENT)
-        emp_late_days = sum(1 for a in emp_attendance if a.get("status") == AttendanceStatus.LATE)
-
-        completion_rate = (len(emp_completed) / len(emp_tasks) * 100) if emp_tasks else 0
-        # No urgent tasks assigned yet shouldn't penalize the score - treat as neutral.
-        urgent_completion_rate = (len(emp_urgent_completed) / len(emp_urgent) * 100) if emp_urgent else 100
-        attendance_rate = (emp_present_days / emp_total_days * 100) if emp_total_days > 0 else 0
-
-        emp_durations = [d for t in emp_completed if (d := _duration_minutes(t.get("started_at"), t.get("completed_at"))) is not None]
-        emp_avg_completion = round(sum(emp_durations) / len(emp_durations), 1) if emp_durations else None
-
-        if emp_avg_completion is None:
-            speed_score = 70  # neutral - not enough data yet
-        elif emp_avg_completion <= 60:
-            speed_score = 100
-        elif emp_avg_completion <= 180:
-            speed_score = 75
-        elif emp_avg_completion <= 480:
-            speed_score = 50
-        else:
-            speed_score = 25
-
-        late_penalty = min(emp_late_days * 2, 20)
-        performance_score = (
-            completion_rate * 0.35
-            + urgent_completion_rate * 0.20
-            + attendance_rate * 0.25
-            + speed_score * 0.20
-        ) - late_penalty
-        performance_score = max(0, min(100, round(performance_score, 1)))
-
-        employee_stats.append({
-            "employee_id": emp_id,
-            "name": emp["name"],
-            "total_tasks": len(emp_tasks),
-            "completed_tasks": len(emp_completed),
-            "completion_rate": round(completion_rate, 1),
-            "urgent_tasks": len(emp_urgent),
-            "urgent_completed": len(emp_urgent_completed),
-            "avg_completion_time_minutes": emp_avg_completion,
-            "attendance_rate": round(attendance_rate, 1),
-            "late_count": emp_late_days,
-            "performance_score": performance_score,
-            "rating": compute_star_rating(performance_score)
-        })
-
-    employee_stats.sort(key=lambda e: e["performance_score"], reverse=True)
-    for idx, e in enumerate(employee_stats):
-        e["rank"] = idx + 1
-
-    # Insights - deterministic rules over the stats above, no AI/ML involved.
-    insights = []
-    for e in employee_stats:
-        if e["urgent_tasks"] >= 2 and e["urgent_completed"] == e["urgent_tasks"]:
-            insights.append(f"{e['name']} consistently completes urgent tasks quickly.")
-        if e["late_count"] >= 3:
-            insights.append(f"{e['name']} has frequent late arrivals.")
-    if employee_stats:
-        top = max(employee_stats, key=lambda e: e["completion_rate"])
-        if top["total_tasks"] > 0:
-            insights.append(f"{top['name']} has the highest completion rate this month.")
-
-    tasks_completed_over_time = []
-    for i in range(6, -1, -1):
-        day = (today - timedelta(days=i)).isoformat()
-        count = sum(1 for t in completed_tasks_all if (t.get("completed_at") or "")[:10] == day)
-        tasks_completed_over_time.append({"date": day, "count": count})
-
-    status_counts = {}
-    for t in all_tasks:
-        status_counts[t.get("status", "unknown")] = status_counts.get(t.get("status", "unknown"), 0) + 1
-    task_distribution = [{"status": s, "count": c} for s, c in status_counts.items()]
-
-    attendance_trend = []
-    for i in range(6, -1, -1):
-        day = (today - timedelta(days=i)).isoformat()
-        day_total = await db.attendance.count_documents({"company_id": company_id, "date": day})
-        day_present = await db.attendance.count_documents({"company_id": company_id, "date": day, "status": AttendanceStatus.PRESENT})
-        rate = round((day_present / day_total * 100), 1) if day_total > 0 else 0
-        attendance_trend.append({"date": day, "rate": rate})
-
-    return {
-        "total_tasks": len(all_tasks),
-        "completed_tasks": len(completed_tasks_all),
-        "pending_tasks": len(pending_tasks_all),
-        "urgent_tasks": len(urgent_tasks_all),
-        "avg_completion_time_minutes": avg_completion_time,
-        "avg_response_time_minutes": avg_response_time,
-        "tasks_completed_today": tasks_completed_today,
-        "tasks_completed_week": tasks_completed_week,
-        "tasks_completed_month": tasks_completed_month,
-        "attendance_rate": company_attendance_rate,
-        "late_attendance_count": late_attendance_all,
-        "employee_ranking": employee_stats,
-        "insights": insights,
-        "charts": {
-            "tasks_completed_over_time": tasks_completed_over_time,
-            "task_distribution": task_distribution,
-            "employee_performance_ranking": [{"name": e["name"], "score": e["performance_score"]} for e in employee_stats],
-            "attendance_trend": attendance_trend
-        }
-    }
+    return await dashboard_service.get_owner_analytics(pg, current_user)
 
 @api_router.get("/owner/employees", response_model=List[UserResponse])
 async def get_employees(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
@@ -1558,55 +998,8 @@ async def create_department(department: DepartmentCreate, current_user: dict = D
 # ============ Employee Routes ============
 
 @api_router.get("/employee/dashboard")
-async def get_employee_dashboard(current_user: dict = Depends(get_current_user)):
-    if current_user["role"] != UserRole.EMPLOYEE:
-        raise HTTPException(status_code=403, detail="Access denied")
-    
-    employee_id = current_user["id"]
-    today = datetime.now(timezone.utc).date().isoformat()
-    
-    # Get statistics
-    total_tasks = await db.tasks.count_documents({"assigned_to": employee_id})
-    completed_tasks = await db.tasks.count_documents({
-        "assigned_to": employee_id,
-        "status": TaskStatus.COMPLETED
-    })
-    pending_tasks = await db.tasks.count_documents({
-        "assigned_to": employee_id,
-        "status": {"$in": [TaskStatus.NEW, TaskStatus.IN_PROGRESS]}
-    })
-    
-    # Calculate completion rate
-    completion_rate = (completed_tasks / total_tasks * 100) if total_tasks > 0 else 0
-    
-    # Get today's attendance
-    attendance = await db.attendance.find_one(
-        {"employee_id": employee_id, "date": today},
-        {"_id": 0}
-    )
-    
-    # Get latest notification
-    latest_notification = await db.notifications.find_one(
-        {"user_id": employee_id},
-        {"_id": 0},
-        sort=[("created_at", -1)]
-    )
-
-    today_holiday = await get_day_off_info(current_user["company_id"], today)
-
-    return {
-        "total_tasks": total_tasks,
-        "completed_tasks": completed_tasks,
-        "pending_tasks": pending_tasks,
-        "completion_rate": round(completion_rate, 1),
-        "checked_in": attendance is not None and attendance.get("check_in_time") is not None,
-        "checked_out": attendance is not None and attendance.get("check_out_time") is not None,
-        "latest_notification": latest_notification,
-        "calendar_widgets": await compute_calendar_dashboard_widgets(current_user, is_owner=False),
-        "today_is_holiday": today_holiday is not None,
-        "today_holiday_type": today_holiday["type"] if today_holiday else None,
-        "today_holiday_title": today_holiday["title"] if today_holiday else None,
-    }
+async def get_employee_dashboard(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await dashboard_service.get_employee_dashboard(pg, current_user)
 
 @api_router.get("/employee/tasks", response_model=List[TaskResponse])
 async def get_employee_tasks(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
@@ -1663,54 +1056,8 @@ async def get_attendance_history(current_user: dict = Depends(get_current_user),
     return await attendance_service.get_attendance_history(pg, current_user)
 
 @api_router.get("/employee/performance")
-async def get_employee_performance(current_user: dict = Depends(get_current_user)):
-    if current_user["role"] != UserRole.EMPLOYEE:
-        raise HTTPException(status_code=403, detail="Access denied")
-    
-    employee_id = current_user["id"]
-    
-    # Get task statistics
-    total_tasks = await db.tasks.count_documents({"assigned_to": employee_id})
-    completed_tasks = await db.tasks.count_documents({
-        "assigned_to": employee_id,
-        "status": TaskStatus.COMPLETED
-    })
-    overdue_tasks = await db.tasks.count_documents({
-        "assigned_to": employee_id,
-        "status": TaskStatus.OVERDUE
-    })
-    
-    # Get attendance statistics - holiday dates excluded entirely (see
-    # filter_out_holiday_attendance) so a stray check-in on a company
-    # holiday never counts as a late/absent violation or skews the rate.
-    employee_attendance = await db.attendance.find(
-        {"employee_id": employee_id}, {"_id": 0, "date": 1, "status": 1}
-    ).to_list(20000)
-    employee_attendance = await filter_out_holiday_attendance(current_user["company_id"], employee_attendance)
-    total_days = len(employee_attendance)
-    present_days = sum(1 for a in employee_attendance if a.get("status") == AttendanceStatus.PRESENT)
-    late_days = sum(1 for a in employee_attendance if a.get("status") == AttendanceStatus.LATE)
-    absent_days = sum(1 for a in employee_attendance if a.get("status") == AttendanceStatus.ABSENT)
-
-    # Calculate metrics
-    completion_rate = (completed_tasks / total_tasks * 100) if total_tasks > 0 else 0
-    attendance_rate = (present_days / total_days * 100) if total_days > 0 else 0
-    
-    # Simple performance rating
-    performance_score = (completion_rate * 0.6 + attendance_rate * 0.4)
-    
-    return {
-        "total_tasks": total_tasks,
-        "completed_tasks": completed_tasks,
-        "overdue_tasks": overdue_tasks,
-        "completion_rate": round(completion_rate, 1),
-        "total_days": total_days,
-        "present_days": present_days,
-        "late_days": late_days,
-        "absent_days": absent_days,
-        "attendance_rate": round(attendance_rate, 1),
-        "performance_score": round(performance_score, 1)
-    }
+async def get_employee_performance(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await dashboard_service.get_employee_performance(pg, current_user)
 
 @api_router.post("/employee/reports", response_model=ReportResponse)
 async def create_report(report: ReportCreate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
