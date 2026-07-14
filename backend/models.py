@@ -29,10 +29,10 @@ def uuid_pk():
     return mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
 
 
-def fk_uuid(target: str, nullable: bool = False, deferrable: bool = False):
+def fk_uuid(target: str, nullable: bool = False, deferrable: bool = False, ondelete: str = None):
     return mapped_column(
         PG_UUID(as_uuid=True),
-        ForeignKey(target, deferrable=deferrable, initially="DEFERRED" if deferrable else None),
+        ForeignKey(target, deferrable=deferrable, initially="DEFERRED" if deferrable else None, ondelete=ondelete),
         nullable=nullable,
     )
 
@@ -176,7 +176,13 @@ class Task(Base, TimestampMixin, SoftDeleteMixin):
     task_category: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     alert_delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     received_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    daily_task_id: Mapped[Optional[uuid.UUID]] = fk_uuid("daily_tasks.id", nullable=True)
+    # ON DELETE SET NULL: deleting a daily-task template must leave its
+    # already-materialized occurrences in place (existing "delete template
+    # only, past occurrences untouched" behavior) - the default RESTRICT
+    # would instead make the template undeletable once any occurrence
+    # exists, which is not what the old Mongo implementation did (there,
+    # occurrences held a plain, unenforced id reference).
+    daily_task_id: Mapped[Optional[uuid.UUID]] = fk_uuid("daily_tasks.id", nullable=True, ondelete="SET NULL")
     occurrence_date: Mapped[Optional[str]] = mapped_column(Date, nullable=True)
     execution_date: Mapped[Optional[str]] = mapped_column(Date, nullable=True)
     execution_time: Mapped[Optional[str]] = mapped_column(String(5), nullable=True)
@@ -217,7 +223,12 @@ class DailyTaskAssignee(Base):
     __tablename__ = "daily_task_assignees"
 
     id: Mapped[uuid.UUID] = uuid_pk()
-    daily_task_id: Mapped[uuid.UUID] = fk_uuid("daily_tasks.id")
+    # ON DELETE CASCADE: an assignee row has no independent meaning once its
+    # template is gone (unlike task occurrences, which stay meaningful on
+    # their own) - deleting the template should delete these automatically
+    # rather than leaving the delete blocked or requiring the caller to
+    # clean them up first.
+    daily_task_id: Mapped[uuid.UUID] = fk_uuid("daily_tasks.id", ondelete="CASCADE")
     employee_id: Mapped[uuid.UUID] = fk_uuid("users.id")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

@@ -31,6 +31,7 @@ import services.departments as departments_service
 import services.employees as employees_service
 import services.heartbeat as heartbeat_service
 import services.seed as seed_service
+import services.tasks as tasks_service
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -904,32 +905,6 @@ def classify_attachment_type(mime_type: str) -> str:
     if mime_type.startswith("video/"):
         return AttachmentType.VIDEO
     return AttachmentType.OTHER
-
-def validate_task_attachments(attachments: Optional[List[Dict[str, str]]]) -> List[Dict[str, Any]]:
-    """Same base64-inline validation as calendar/message attachments (reused
-    classify_attachment_type/MAX_ATTACHMENT_BYTES, unmodified), but stored
-    directly on the task document rather than a separate collection -
-    matches the existing proof_files convention for tasks specifically."""
-    if not attachments:
-        return []
-    validated = []
-    for a in attachments:
-        filename, mime_type, data = a.get("filename"), a.get("mime_type"), a.get("data")
-        if not filename or not data:
-            raise HTTPException(status_code=400, detail="Each attachment requires a filename and data")
-        raw = data.split(",", 1)[-1] if data.startswith("data:") else data
-        try:
-            decoded_size = len(base64.b64decode(raw, validate=False))
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid file data")
-        if decoded_size > MAX_ATTACHMENT_BYTES:
-            raise HTTPException(status_code=400, detail=f"File exceeds the {MAX_ATTACHMENT_BYTES // (1024*1024)}MB limit")
-        validated.append({
-            "filename": filename, "mime_type": mime_type,
-            "attachment_type": classify_attachment_type(mime_type),
-            "data": data, "size_bytes": decoded_size,
-        })
-    return validated
 
 async def resolve_recipients(company_id: str, recipient_type: str, recipient_ids: List[str]) -> tuple:
     """Fan-out resolution at send time (same approach already used for
@@ -2094,269 +2069,74 @@ async def delete_employee(employee_id: str, current_user: dict = Depends(get_cur
     return await employees_service.delete_employee(pg, current_user["company_id"], employee_id)
 
 @api_router.get("/owner/tasks", response_model=List[TaskResponse])
-async def get_tasks(current_user: dict = Depends(get_current_user)):
+async def get_tasks(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     if current_user["role"] != UserRole.COMPANY_OWNER:
         raise HTTPException(status_code=403, detail="Access denied")
-    
-    tasks = await db.tasks.find(
-        {"company_id": current_user["company_id"]},
-        {"_id": 0}
-    ).to_list(1000)
-
-    # Add employee names
-    for task in tasks:
-        employee = await db.users.find_one({"id": task["assigned_to"]}, {"_id": 0})
-        if employee:
-            task["assigned_to_name"] = employee["name"]
-        if task.get("completed_by"):
-            completer = await db.users.find_one({"id": task["completed_by"]}, {"_id": 0})
-            if completer:
-                task["completed_by_name"] = completer["name"]
-
-    return tasks
+    return await tasks_service.list_tasks_for_owner(pg, current_user["company_id"])
 
 @api_router.post("/owner/tasks", response_model=TaskResponse)
-async def create_task(task: TaskCreate, current_user: dict = Depends(get_current_user)):
+async def create_task(task: TaskCreate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     if current_user["role"] != UserRole.COMPANY_OWNER:
         raise HTTPException(status_code=403, detail="Access denied")
-    
-    task_doc = {
-        "id": str(uuid.uuid4()),
-        "company_id": current_user["company_id"],
-        "assigned_to": task.assigned_to,
-        "title": task.title,
-        "description": task.description,
-        "priority": task.priority,
-        "status": TaskStatus.NEW,
-        "due_date": task.due_date,
-        "due_time": task.due_time,
-        "requires_proof": task.requires_proof,
-        "proof_files": [],
-        "attachments": validate_task_attachments(task.attachments),
-        "created_by": current_user["id"],
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "completed_at": None,
-        # Critical Task Alert timeline - additive, populated for all tasks
-        # for consistency though only read for priority == "critical".
-        "alert_delivered_at": None,
-        "received_at": None
-    }
-    await db.tasks.insert_one(task_doc)
-    
-    # Create notification for employee
-    notification = {
-        "id": str(uuid.uuid4()),
-        "user_id": task.assigned_to,
-        "company_id": current_user["company_id"],
-        "type": "task_assigned",
-        "title": "مهمة جديدة",
-        "message": f"تم تعيين مهمة جديدة لك: {task.title}",
-        "read_status": False,
-        "created_at": datetime.now(timezone.utc).isoformat()
-    }
-    await db.notifications.insert_one(notification)
-    
-    # Get employee name
-    employee = await db.users.find_one({"id": task.assigned_to}, {"_id": 0})
-    if employee:
-        task_doc["assigned_to_name"] = employee["name"]
-    
-    return TaskResponse(**task_doc)
+    return await tasks_service.create_task(pg, current_user["company_id"], current_user["id"], task)
 
 @api_router.put("/owner/tasks/{task_id}")
-async def update_task(task_id: str, updates: TaskUpdate, current_user: dict = Depends(get_current_user)):
+async def update_task(task_id: str, updates: TaskUpdate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     if current_user["role"] != UserRole.COMPANY_OWNER:
         raise HTTPException(status_code=403, detail="Access denied")
-    
-    update_dict = {k: v for k, v in updates.model_dump().items() if v is not None}
-    
-    result = await db.tasks.update_one(
-        {"id": task_id, "company_id": current_user["company_id"]},
-        {"$set": update_dict}
-    )
-    
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Task not found")
-    
-    return {"message": "Task updated successfully"}
+    return await tasks_service.update_task(pg, current_user["company_id"], task_id, updates)
 
 @api_router.delete("/owner/tasks/{task_id}")
-async def delete_task(task_id: str, current_user: dict = Depends(get_current_user)):
+async def delete_task(task_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     if current_user["role"] != UserRole.COMPANY_OWNER:
         raise HTTPException(status_code=403, detail="Access denied")
-
-    task = await db.tasks.find_one({"id": task_id, "company_id": current_user["company_id"]}, {"_id": 0})
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    # Task history must always remain available - in-progress, completed, and
-    # cancelled tasks are never physically deleted. An in-progress task can be
-    # cancelled instead (see /owner/tasks/{id}/cancel), which keeps the row.
-    status = task.get("status")
-    if status == TaskStatus.IN_PROGRESS:
-        raise HTTPException(status_code=400, detail="Cannot delete a task that is in progress. Cancel it instead to preserve history.")
-    if status in (TaskStatus.COMPLETED, TaskStatus.CANCELLED):
-        raise HTTPException(status_code=400, detail=f"Cannot delete a {status} task - history must remain available.")
-
-    result = await db.tasks.delete_one(
-        {"id": task_id, "company_id": current_user["company_id"]}
-    )
-
-    if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    return {"message": "Task deleted successfully"}
+    return await tasks_service.delete_task(pg, current_user["company_id"], task_id)
 
 @api_router.post("/owner/tasks/{task_id}/cancel")
-async def cancel_task(task_id: str, current_user: dict = Depends(get_current_user)):
+async def cancel_task(task_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     if current_user["role"] != UserRole.COMPANY_OWNER:
         raise HTTPException(status_code=403, detail="Access denied")
-
-    task = await db.tasks.find_one({"id": task_id, "company_id": current_user["company_id"]}, {"_id": 0})
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    if task.get("status") in (TaskStatus.COMPLETED, TaskStatus.CANCELLED):
-        raise HTTPException(status_code=400, detail=f"Task is already {task.get('status')}")
-
-    await db.tasks.update_one({"id": task_id}, {"$set": {"status": TaskStatus.CANCELLED}})
-    return {"message": "Task cancelled successfully"}
+    return await tasks_service.cancel_task(pg, current_user["company_id"], task_id)
 
 # ---- Daily Recurring Tasks (templates) ----
 
 @api_router.get("/owner/daily-tasks", response_model=List[DailyTaskResponse])
-async def get_daily_tasks(current_user: dict = Depends(get_current_user)):
+async def get_daily_tasks(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     if current_user["role"] != UserRole.COMPANY_OWNER:
         raise HTTPException(status_code=403, detail="Access denied")
-
-    templates = await db.daily_tasks.find({"company_id": current_user["company_id"]}, {"_id": 0}).to_list(1000)
-    for template in templates:
-        names = []
-        for emp_id in template.get("assigned_to", []):
-            emp = await db.users.find_one({"id": emp_id}, {"_id": 0})
-            if emp:
-                names.append(emp["name"])
-        template["assigned_to_names"] = names
-    return templates
+    return await tasks_service.list_daily_tasks(pg, current_user["company_id"])
 
 @api_router.post("/owner/daily-tasks", response_model=DailyTaskResponse)
-async def create_daily_task(template: DailyTaskCreate, current_user: dict = Depends(get_current_user)):
+async def create_daily_task(template: DailyTaskCreate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     if current_user["role"] != UserRole.COMPANY_OWNER:
         raise HTTPException(status_code=403, detail="Access denied")
-    if not template.assigned_to:
-        raise HTTPException(status_code=400, detail="At least one employee must be assigned")
-
-    template_doc = {
-        "id": str(uuid.uuid4()),
-        "company_id": current_user["company_id"],
-        "title": template.title,
-        "description": template.description,
-        "assigned_to": template.assigned_to,
-        "execution_time": template.execution_time,
-        "requires_proof": template.requires_proof,
-        "is_active": True,
-        "recurrence_type": RecurrenceType.DAILY,
-        "recurrence_config": {},
-        "created_by": current_user["id"],
-        "created_at": datetime.now(timezone.utc).isoformat()
-    }
-    await db.daily_tasks.insert_one(template_doc)
-    return DailyTaskResponse(**template_doc)
+    return await tasks_service.create_daily_task(pg, current_user["company_id"], current_user["id"], template)
 
 @api_router.put("/owner/daily-tasks/{template_id}")
-async def update_daily_task(template_id: str, updates: DailyTaskUpdate, current_user: dict = Depends(get_current_user)):
+async def update_daily_task(template_id: str, updates: DailyTaskUpdate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     if current_user["role"] != UserRole.COMPANY_OWNER:
         raise HTTPException(status_code=403, detail="Access denied")
-
-    update_dict = updates.model_dump(exclude_none=True)
-    if not update_dict:
-        raise HTTPException(status_code=400, detail="No valid fields to update")
-
-    result = await db.daily_tasks.update_one(
-        {"id": template_id, "company_id": current_user["company_id"]},
-        {"$set": update_dict}
-    )
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Daily task not found")
-    return {"message": "Daily task updated successfully"}
+    return await tasks_service.update_daily_task(pg, current_user["company_id"], template_id, updates)
 
 @api_router.post("/owner/daily-tasks/{template_id}/toggle")
-async def toggle_daily_task(template_id: str, current_user: dict = Depends(get_current_user)):
+async def toggle_daily_task(template_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     if current_user["role"] != UserRole.COMPANY_OWNER:
         raise HTTPException(status_code=403, detail="Access denied")
-
-    template = await db.daily_tasks.find_one({"id": template_id, "company_id": current_user["company_id"]}, {"_id": 0})
-    if not template:
-        raise HTTPException(status_code=404, detail="Daily task not found")
-
-    new_active = not template.get("is_active", True)
-    await db.daily_tasks.update_one({"id": template_id}, {"$set": {"is_active": new_active}})
-    return {"message": "Daily task updated successfully", "is_active": new_active}
+    return await tasks_service.toggle_daily_task(pg, current_user["company_id"], template_id)
 
 @api_router.delete("/owner/daily-tasks/{template_id}")
-async def delete_daily_task(template_id: str, current_user: dict = Depends(get_current_user)):
+async def delete_daily_task(template_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     if current_user["role"] != UserRole.COMPANY_OWNER:
         raise HTTPException(status_code=403, detail="Access denied")
-
-    # Deletes the template only - past daily-task occurrences already created
-    # in the tasks collection are left untouched, preserving history.
-    result = await db.daily_tasks.delete_one({"id": template_id, "company_id": current_user["company_id"]})
-    if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Daily task not found")
-    return {"message": "Daily task deleted successfully"}
+    return await tasks_service.delete_daily_task(pg, current_user["company_id"], template_id)
 
 # ---- Urgent Tasks ----
 
 @api_router.post("/owner/urgent-tasks")
-async def create_urgent_task(task: UrgentTaskCreate, current_user: dict = Depends(get_current_user)):
+async def create_urgent_task(task: UrgentTaskCreate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     if current_user["role"] != UserRole.COMPANY_OWNER:
         raise HTTPException(status_code=403, detail="Access denied")
-    if not task.assigned_to:
-        raise HTTPException(status_code=400, detail="At least one employee must be assigned")
-
-    batch_id = str(uuid.uuid4())
-    now = datetime.now(timezone.utc).isoformat()
-    created_ids = []
-
-    for employee_id in task.assigned_to:
-        task_doc = {
-            "id": str(uuid.uuid4()),
-            "company_id": current_user["company_id"],
-            "assigned_to": employee_id,
-            "title": task.title,
-            "description": task.description,
-            "priority": TaskPriority.HIGH,
-            "status": TaskStatus.NEW,
-            "due_date": task.due_date,
-            "requires_proof": task.requires_proof,
-            "proof_files": [],
-            "created_by": current_user["id"],
-            "created_at": now,
-            "completed_at": None,
-            "task_category": TaskCategory.URGENT,
-            "execution_date": task.execution_date,
-            "execution_time": task.execution_time,
-            "due_time": task.due_time,
-            "started_at": None,
-            "seen_at": None,
-            "completed_by": None,
-            "batch_id": batch_id
-        }
-        await db.tasks.insert_one(task_doc)
-        created_ids.append(task_doc["id"])
-
-        notification = {
-            "id": str(uuid.uuid4()),
-            "user_id": employee_id,
-            "company_id": current_user["company_id"],
-            "type": "urgent_task",
-            "title": "مهمة جديدة",
-            "message": f"لديك مهمة جديدة: {task.title}",
-            "read_status": False,
-            "created_at": now
-        }
-        await db.notifications.insert_one(notification)
-
-    return {"message": "Urgent task created successfully", "task_ids": created_ids, "batch_id": batch_id}
+    return await tasks_service.create_urgent_task(pg, current_user["company_id"], current_user["id"], task)
 
 @api_router.get("/owner/attendance", response_model=List[AttendanceResponse])
 async def get_attendance(
@@ -2831,206 +2611,45 @@ async def get_employee_dashboard(current_user: dict = Depends(get_current_user))
         "today_holiday_title": today_holiday["title"] if today_holiday else None,
     }
 
-async def generate_daily_task_instances(employee_id: str, company_id: str):
-    """Self-heal on read: lazily creates today's occurrence (as an ordinary
-    tasks row) for every active daily task template assigned to this employee,
-    the same no-scheduler approach already used for subscription expiry and
-    presence. If the employee never opens their task list on a given day, no
-    instance is created for that day - an accepted tradeoff of not running a
-    background job."""
-    today = datetime.now(timezone.utc).date().isoformat()
-    templates = await db.daily_tasks.find(
-        {"company_id": company_id, "is_active": True, "assigned_to": employee_id},
-        {"_id": 0}
-    ).to_list(1000)
-
-    for template in templates:
-        existing = await db.tasks.find_one({
-            "daily_task_id": template["id"],
-            "assigned_to": employee_id,
-            "occurrence_date": today
-        })
-        if existing:
-            continue
-        await db.tasks.insert_one({
-            "id": str(uuid.uuid4()),
-            "company_id": company_id,
-            "assigned_to": employee_id,
-            "title": template["title"],
-            "description": template["description"],
-            "priority": TaskPriority.MEDIUM,
-            "status": TaskStatus.NEW,
-            "due_date": today,
-            "requires_proof": template.get("requires_proof", False),
-            "proof_files": [],
-            "created_by": template["created_by"],
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "completed_at": None,
-            "task_category": TaskCategory.DAILY,
-            "daily_task_id": template["id"],
-            "occurrence_date": today,
-            "execution_time": template.get("execution_time"),
-            "started_at": None,
-            "seen_at": None,
-            "completed_by": None
-        })
-
 @api_router.get("/employee/tasks", response_model=List[TaskResponse])
-async def get_employee_tasks(current_user: dict = Depends(get_current_user)):
+async def get_employee_tasks(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     if current_user["role"] != UserRole.EMPLOYEE:
         raise HTTPException(status_code=403, detail="Access denied")
-
-    await generate_daily_task_instances(current_user["id"], current_user["company_id"])
-
-    tasks = await db.tasks.find(
-        {"assigned_to": current_user["id"]},
-        {"_id": 0}
-    ).to_list(1000)
-
-    for task in tasks:
-        task["assigned_to_name"] = current_user["name"]
-        # Self-heal: the first time a daily/urgent task is returned to the
-        # employee, mark it seen - answers "was it opened?" without a
-        # separate explicit endpoint.
-        if task.get("task_category") in (TaskCategory.URGENT, TaskCategory.DAILY) and task.get("status") == TaskStatus.NEW:
-            seen_at = datetime.now(timezone.utc).isoformat()
-            await db.tasks.update_one({"id": task["id"]}, {"$set": {"status": TaskStatus.SEEN, "seen_at": seen_at}})
-            task["status"] = TaskStatus.SEEN
-            task["seen_at"] = seen_at
-
-    return tasks
+    return await tasks_service.list_tasks_for_employee(pg, current_user)
 
 @api_router.put("/employee/tasks/{task_id}/status")
-async def update_task_status(task_id: str, status_data: dict, current_user: dict = Depends(get_current_user)):
+async def update_task_status(task_id: str, status_data: dict, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     if current_user["role"] != UserRole.EMPLOYEE:
         raise HTTPException(status_code=403, detail="Access denied")
-
-    new_status = status_data.get("status")
-    update_data = {"status": new_status}
-    if new_status == TaskStatus.COMPLETED:
-        update_data["completed_at"] = datetime.now(timezone.utc).isoformat()
-
-    critical_task_started = None
-    if new_status == TaskStatus.IN_PROGRESS:
-        # Critical Task Alert "Start Task" reuses this generic endpoint
-        # instead of the dedicated /start endpoint, so stamp started_at
-        # here too (only if not already set) to keep the timeline populated.
-        existing = await db.tasks.find_one(
-            {"id": task_id, "assigned_to": current_user["id"]}, {"_id": 0}
-        )
-        if existing:
-            if not existing.get("started_at"):
-                update_data["started_at"] = datetime.now(timezone.utc).isoformat()
-            if existing.get("priority") == TaskPriority.CRITICAL:
-                critical_task_started = existing
-
-    result = await db.tasks.update_one(
-        {"id": task_id, "assigned_to": current_user["id"]},
-        {"$set": update_data}
-    )
-
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    if critical_task_started:
-        await db.notifications.insert_one({
-            "id": str(uuid.uuid4()),
-            "user_id": critical_task_started["created_by"],
-            "company_id": current_user["company_id"],
-            "type": "critical_task_started",
-            "title": "بدأ الموظف العمل على المهمة العاجلة",
-            "message": f"بدأ الموظف {current_user['name']} العمل على المهمة العاجلة: {critical_task_started['title']}",
-            "read_status": False,
-            "created_at": datetime.now(timezone.utc).isoformat()
-        })
-
-    return {"message": "Task status updated successfully"}
+    return await tasks_service.update_task_status(pg, current_user, current_user["company_id"], task_id, status_data)
 
 @api_router.post("/employee/tasks/{task_id}/receive")
-async def receive_critical_task(task_id: str, current_user: dict = Depends(get_current_user)):
+async def receive_critical_task(task_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     """Critical Task Alert 'Receive Task' action - acknowledges the
     full-screen alert without starting work yet. Dedicated endpoint
     (rather than the generic status one) because it's specific to the
     critical-task workflow and has its own validation/notification."""
     if current_user["role"] != UserRole.EMPLOYEE:
         raise HTTPException(status_code=403, detail="Access denied")
-
-    task = await db.tasks.find_one({"id": task_id, "assigned_to": current_user["id"]}, {"_id": 0})
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    if task.get("priority") != TaskPriority.CRITICAL:
-        raise HTTPException(status_code=400, detail="Only urgent tasks use the receive workflow")
-    if task.get("status") not in (TaskStatus.NEW, TaskStatus.SEEN):
-        raise HTTPException(status_code=400, detail=f"Task cannot be received from status {task.get('status')}")
-
-    received_at = datetime.now(timezone.utc).isoformat()
-    await db.tasks.update_one(
-        {"id": task_id},
-        {"$set": {"status": TaskStatus.RECEIVED, "received_at": received_at}}
-    )
-
-    await db.notifications.insert_one({
-        "id": str(uuid.uuid4()),
-        "user_id": task["created_by"],
-        "company_id": current_user["company_id"],
-        "type": "critical_task_received",
-        "title": "تم استلام المهمة العاجلة",
-        "message": f"قام الموظف {current_user['name']} باستلام المهمة العاجلة: {task['title']}",
-        "read_status": False,
-        "created_at": received_at
-    })
-
-    return {"message": "Task received successfully", "received_at": received_at}
+    return await tasks_service.receive_critical_task(pg, current_user, current_user["company_id"], task_id)
 
 @api_router.post("/employee/tasks/{task_id}/proof")
-async def upload_task_proof(task_id: str, proof: dict, current_user: dict = Depends(get_current_user)):
+async def upload_task_proof(task_id: str, proof: dict, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     if current_user["role"] != UserRole.EMPLOYEE:
         raise HTTPException(status_code=403, detail="Access denied")
-
-    result = await db.tasks.update_one(
-        {"id": task_id, "assigned_to": current_user["id"]},
-        {"$push": {"proof_files": proof.get("file_url")}}
-    )
-
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    return {"message": "Proof uploaded successfully"}
+    return await tasks_service.upload_task_proof(pg, current_user["id"], task_id, proof)
 
 @api_router.post("/employee/tasks/{task_id}/start")
-async def start_task(task_id: str, current_user: dict = Depends(get_current_user)):
+async def start_task(task_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     if current_user["role"] != UserRole.EMPLOYEE:
         raise HTTPException(status_code=403, detail="Access denied")
-
-    task = await db.tasks.find_one({"id": task_id, "assigned_to": current_user["id"]}, {"_id": 0})
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    if task.get("status") not in (TaskStatus.NEW, TaskStatus.SEEN):
-        raise HTTPException(status_code=400, detail=f"Task cannot be started from status {task.get('status')}")
-
-    started_at = datetime.now(timezone.utc).isoformat()
-    await db.tasks.update_one({"id": task_id}, {"$set": {"status": TaskStatus.IN_PROGRESS, "started_at": started_at}})
-    return {"message": "Task started successfully", "started_at": started_at}
+    return await tasks_service.start_task(pg, current_user["id"], task_id)
 
 @api_router.post("/employee/tasks/{task_id}/complete")
-async def complete_task(task_id: str, current_user: dict = Depends(get_current_user)):
+async def complete_task(task_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     if current_user["role"] != UserRole.EMPLOYEE:
         raise HTTPException(status_code=403, detail="Access denied")
-
-    task = await db.tasks.find_one({"id": task_id, "assigned_to": current_user["id"]}, {"_id": 0})
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    if task.get("status") != TaskStatus.IN_PROGRESS:
-        raise HTTPException(status_code=400, detail=f"Task cannot be completed from status {task.get('status')}")
-    if task.get("requires_proof") and not task.get("proof_files"):
-        raise HTTPException(status_code=400, detail="Photo proof is required before this task can be completed")
-
-    completed_at = datetime.now(timezone.utc).isoformat()
-    await db.tasks.update_one(
-        {"id": task_id},
-        {"$set": {"status": TaskStatus.COMPLETED, "completed_at": completed_at, "completed_by": current_user["id"]}}
-    )
-    return {"message": "Task completed successfully", "completed_at": completed_at}
+    return await tasks_service.complete_task(pg, current_user["id"], task_id)
 
 @api_router.post("/employee/attendance/check-in")
 async def check_in(data: AttendanceCheckIn, current_user: dict = Depends(get_current_user)):
