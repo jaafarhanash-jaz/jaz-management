@@ -2,9 +2,6 @@ from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
-from pymongo import ReturnDocument
-from pymongo.errors import PyMongoError, ServerSelectionTimeoutError
 from fastapi.responses import JSONResponse
 from dateutil.relativedelta import relativedelta
 import os
@@ -21,7 +18,7 @@ from io import BytesIO
 import base64
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database import get_db
+from database import engine, get_db
 import repositories.companies as companies_repo
 import repositories.users as users_repo
 import services.admin as admin_service
@@ -43,15 +40,6 @@ from services.admin import parse_uuid
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# MongoDB connection
-# serverSelectionTimeoutMS=5000: when MongoDB is unreachable, fail in ~5s
-# instead of the driver default of 30s. A 30s hang made every request (login
-# included) block for half a minute before erroring - a fast failure surfaces
-# "database unavailable" quickly instead of looking like the app is frozen.
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url, serverSelectionTimeoutMS=5000)
-db = client[os.environ['DB_NAME']]
-
 # Security
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
@@ -61,19 +49,6 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours
 
 # Create the main app
 app = FastAPI()
-
-# When MongoDB is unreachable, Motor raises ServerSelectionTimeoutError, which
-# FastAPI would otherwise surface as a generic 500 "Internal Server Error" -
-# indistinguishable from any other bug and, on the login page, mislabeled as
-# "invalid password". This handler exposes the real cause: a clear 503 telling
-# the client the database is unavailable, for EVERY endpoint (not just login).
-@app.exception_handler(ServerSelectionTimeoutError)
-async def _db_unavailable_handler(request: Request, exc: ServerSelectionTimeoutError):
-    logging.error(f"MongoDB unavailable handling {request.method} {request.url.path}: {exc}")
-    return JSONResponse(
-        status_code=503,
-        content={"detail": "قاعدة البيانات غير متاحة حالياً. يرجى المحاولة لاحقاً. (Database temporarily unavailable)"},
-    )
 
 api_router = APIRouter(prefix="/api")
 
@@ -1486,4 +1461,4 @@ logger = logging.getLogger(__name__)
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
-    client.close()
+    await engine.dispose()

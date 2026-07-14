@@ -43,6 +43,10 @@ dist
 # backend/docs/BACKUP_RESTORE.md and the migration plan for provenance.
 postgres-portable/
 minio-portable/
+backend/backups/
+# Historical MongoDB corruption-recovery artifacts (repair attempts, binary
+# download) from before MongoDB was abandoned this session - kept on disk
+# for reference, never tracked.
 mongodb-backups/
 
 # Logs and debug files
