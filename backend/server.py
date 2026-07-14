@@ -27,6 +27,8 @@ from database import get_db
 import repositories.users as users_repo
 import services.admin as admin_service
 import services.auth as auth_service
+import services.departments as departments_service
+import services.employees as employees_service
 import services.heartbeat as heartbeat_service
 import services.seed as seed_service
 
@@ -2068,98 +2070,28 @@ async def get_owner_analytics(current_user: dict = Depends(get_current_user)):
     }
 
 @api_router.get("/owner/employees", response_model=List[UserResponse])
-async def get_employees(current_user: dict = Depends(get_current_user)):
+async def get_employees(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     if current_user["role"] != UserRole.COMPANY_OWNER:
         raise HTTPException(status_code=403, detail="Access denied")
-    
-    employees = await db.users.find(
-        {"company_id": current_user["company_id"], "role": UserRole.EMPLOYEE},
-        {"_id": 0, "password": 0}
-    ).to_list(1000)
-    
-    return employees
+    return await employees_service.list_employees(pg, current_user["company_id"])
 
 @api_router.post("/owner/employees", response_model=UserResponse)
-async def create_employee(employee: UserCreate, current_user: dict = Depends(get_current_user)):
+async def create_employee(employee: UserCreate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     if current_user["role"] != UserRole.COMPANY_OWNER:
         raise HTTPException(status_code=403, detail="Access denied")
-    
-    # Check if email already exists
-    existing = await db.users.find_one({"email": employee.email})
-    if existing:
-        raise HTTPException(status_code=400, detail="Email already registered")
-
-    # Enforce the company's max_employees limit (from its subscription plan).
-    # Companies without a max_employees value (e.g. legacy companies with no
-    # plan assigned yet) are treated as unlimited.
-    company = await db.companies.find_one({"id": current_user["company_id"]}, {"_id": 0})
-    max_employees = company.get("max_employees") if company else None
-    if max_employees:
-        current_employee_count = await db.users.count_documents({
-            "company_id": current_user["company_id"],
-            "role": UserRole.EMPLOYEE
-        })
-        if current_employee_count >= max_employees:
-            raise HTTPException(
-                status_code=400,
-                detail="Employee limit reached. Please upgrade your subscription plan to add more employees."
-            )
-
-    employee_doc = {
-        "id": str(uuid.uuid4()),
-        "email": employee.email,
-        "phone": employee.phone,
-        "password": hash_password(employee.password),
-        "name": employee.name,
-        "role": UserRole.EMPLOYEE,
-        "company_id": current_user["company_id"],
-        "department": employee.department,
-        "position": employee.position,
-        "status": "active",
-        "created_at": datetime.now(timezone.utc).isoformat()
-    }
-    await db.users.insert_one(employee_doc)
-    
-    return UserResponse(**{k: v for k, v in employee_doc.items() if k != "password"})
+    return await employees_service.create_employee(pg, current_user["company_id"], employee)
 
 @api_router.put("/owner/employees/{employee_id}")
-async def update_employee(employee_id: str, updates: dict, current_user: dict = Depends(get_current_user)):
+async def update_employee(employee_id: str, updates: dict, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     if current_user["role"] != UserRole.COMPANY_OWNER:
         raise HTTPException(status_code=403, detail="Access denied")
-    
-    # Whitelist allowed fields to prevent tampering
-    allowed_fields = ["name", "phone", "department", "position", "status", "avatar"]
-    safe_updates = {k: v for k, v in updates.items() if k in allowed_fields}
-    if "password" in updates and updates["password"]:
-        safe_updates["password"] = hash_password(updates["password"])
-    
-    if not safe_updates:
-        raise HTTPException(status_code=400, detail="No valid fields to update")
-    
-    # Ensure can only update employees from same company
-    result = await db.users.update_one(
-        {"id": employee_id, "company_id": current_user["company_id"], "role": UserRole.EMPLOYEE},
-        {"$set": safe_updates}
-    )
-    
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Employee not found")
-    
-    return {"message": "Employee updated successfully"}
+    return await employees_service.update_employee(pg, current_user["company_id"], employee_id, updates)
 
 @api_router.delete("/owner/employees/{employee_id}")
-async def delete_employee(employee_id: str, current_user: dict = Depends(get_current_user)):
+async def delete_employee(employee_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     if current_user["role"] != UserRole.COMPANY_OWNER:
         raise HTTPException(status_code=403, detail="Access denied")
-    
-    result = await db.users.delete_one(
-        {"id": employee_id, "company_id": current_user["company_id"], "role": UserRole.EMPLOYEE}
-    )
-    
-    if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Employee not found")
-    
-    return {"message": "Employee deleted successfully"}
+    return await employees_service.delete_employee(pg, current_user["company_id"], employee_id)
 
 @api_router.get("/owner/tasks", response_model=List[TaskResponse])
 async def get_tasks(current_user: dict = Depends(get_current_user)):
@@ -2835,45 +2767,16 @@ async def get_reports(current_user: dict = Depends(get_current_user)):
     return reports
 
 @api_router.get("/owner/departments", response_model=List[DepartmentResponse])
-async def get_departments(current_user: dict = Depends(get_current_user)):
+async def get_departments(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     if current_user["role"] != UserRole.COMPANY_OWNER:
         raise HTTPException(status_code=403, detail="Access denied")
-    
-    departments = await db.departments.find(
-        {"company_id": current_user["company_id"]},
-        {"_id": 0}
-    ).to_list(100)
-    
-    # Add head names
-    for dept in departments:
-        if dept.get("head_id"):
-            head = await db.users.find_one({"id": dept["head_id"]}, {"_id": 0})
-            if head:
-                dept["head_name"] = head["name"]
-    
-    return departments
+    return await departments_service.list_departments(pg, current_user["company_id"])
 
 @api_router.post("/owner/departments", response_model=DepartmentResponse)
-async def create_department(department: DepartmentCreate, current_user: dict = Depends(get_current_user)):
+async def create_department(department: DepartmentCreate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     if current_user["role"] != UserRole.COMPANY_OWNER:
         raise HTTPException(status_code=403, detail="Access denied")
-    
-    dept_doc = {
-        "id": str(uuid.uuid4()),
-        "company_id": current_user["company_id"],
-        "name": department.name,
-        "head_id": department.head_id,
-        "created_at": datetime.now(timezone.utc).isoformat()
-    }
-    await db.departments.insert_one(dept_doc)
-    
-    # Add head name if exists
-    if dept_doc.get("head_id"):
-        head = await db.users.find_one({"id": dept_doc["head_id"]}, {"_id": 0})
-        if head:
-            dept_doc["head_name"] = head["name"]
-    
-    return DepartmentResponse(**dept_doc)
+    return await departments_service.create_department(pg, current_user["company_id"], department)
 
 # ============ Employee Routes ============
 
@@ -3311,23 +3214,13 @@ async def create_report(report: ReportCreate, current_user: dict = Depends(get_c
     return ReportResponse(**report_doc)
 
 @api_router.put("/employee/profile")
-async def update_profile(updates: dict, current_user: dict = Depends(get_current_user)):
-    # Only allow updating certain fields
-    allowed_fields = ["name", "phone", "avatar"]
-    filtered_updates = {k: v for k, v in updates.items() if k in allowed_fields}
-    
-    if not filtered_updates:
-        raise HTTPException(status_code=400, detail="No valid fields to update")
-    
-    result = await db.users.update_one(
-        {"id": current_user["id"]},
-        {"$set": filtered_updates}
-    )
-    
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="User not found")
-    
-    return {"message": "Profile updated successfully"}
+async def update_profile(updates: dict, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    # NOTE: no role check here, same as the pre-migration implementation -
+    # this is a pre-existing gap (any authenticated user, not just
+    # employees, can call this), already flagged in the migration plan as
+    # not-DB-related and intentionally left unchanged. See Module 3's
+    # progress report.
+    return await employees_service.update_own_profile(pg, current_user["id"], updates)
 
 # ============ Common Routes ============
 

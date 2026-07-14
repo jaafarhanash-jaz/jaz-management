@@ -109,3 +109,29 @@ async def phone_taken(db: AsyncSession, phone: str, exclude_id=None) -> bool:
         query = query.where(User.id != exclude_id)
     result = await db.execute(query)
     return result.scalar_one() > 0
+
+
+async def list_employees_by_company(db: AsyncSession, company_id) -> List[User]:
+    result = await db.execute(
+        select(User).where(User.company_id == company_id, User.role == "employee", User.deleted_at.is_(None))
+    )
+    return list(result.scalars().all())
+
+
+async def count_employees_by_company(db: AsyncSession, company_id) -> int:
+    result = await db.execute(
+        select(func.count()).select_from(User).where(
+            User.company_id == company_id, User.role == "employee", User.deleted_at.is_(None)
+        )
+    )
+    return result.scalar_one()
+
+
+async def get_employee_in_company(db: AsyncSession, employee_id, company_id) -> Optional[User]:
+    result = await db.execute(
+        select(User).where(
+            User.id == employee_id, User.company_id == company_id,
+            User.role == "employee", User.deleted_at.is_(None),
+        )
+    )
+    return result.scalar_one_or_none()
