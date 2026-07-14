@@ -47,6 +47,17 @@ async def detach_plan_from_deleted_companies(db: AsyncSession, plan_id) -> None:
     )
 
 
+async def get_working_hours(db: AsyncSession, company_id) -> dict:
+    company = await get_by_id(db, company_id)
+    if not company:
+        return {"working_days": [0, 1, 2, 3, 4], "start_time": "08:00", "end_time": "17:00"}
+    return {
+        "working_days": list(company.working_days),
+        "start_time": company.working_hours_start_time,
+        "end_time": company.working_hours_end_time,
+    }
+
+
 async def soft_delete_cascade(db: AsyncSession, company_id, deleted_at) -> None:
     """Company deletion = one transaction stamping deleted_at on the company
     and every soft-deletable child (users, tasks, departments). Rows without

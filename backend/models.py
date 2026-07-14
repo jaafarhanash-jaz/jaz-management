@@ -268,11 +268,17 @@ class Attendance(Base, TimestampMixin):
     date: Mapped[str] = mapped_column(Date, nullable=False)
     check_in_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     check_out_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    # check_in_location / check_out_location, flattened (small fixed 2-field shape, same rationale as decision #5)
+    # check_in_location / check_out_location, flattened (small fixed shape,
+    # same rationale as decision #5). accuracy is optional in the request
+    # (AttendanceCheckIn/CheckOut.accuracy) and, when present, part of the
+    # nested location dict in AttendanceResponse - must be stored to
+    # reconstruct that dict on read.
     check_in_latitude: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     check_in_longitude: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    check_in_accuracy: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     check_out_latitude: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     check_out_longitude: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    check_out_accuracy: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     distance_from_company_meters: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     check_out_distance_meters: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     working_duration_minutes: Mapped[Optional[float]] = mapped_column(Float, nullable=True)

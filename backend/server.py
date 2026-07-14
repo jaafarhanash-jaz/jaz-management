@@ -9,7 +9,6 @@ from fastapi.responses import JSONResponse
 from dateutil.relativedelta import relativedelta
 import os
 import logging
-import math
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict, EmailStr
 from typing import List, Optional, Dict, Any
@@ -24,14 +23,17 @@ from emergentintegrations.payments.stripe.checkout import StripeCheckout, Checko
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
+import repositories.companies as companies_repo
 import repositories.users as users_repo
 import services.admin as admin_service
+import services.attendance as attendance_service
 import services.auth as auth_service
 import services.departments as departments_service
 import services.employees as employees_service
 import services.heartbeat as heartbeat_service
 import services.seed as seed_service
 import services.tasks as tasks_service
+from services.admin import parse_uuid
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -741,136 +743,9 @@ def generate_qr_code(data: str) -> str:
 # Per-company overrides live in companies.attendance_settings, stored as a
 # nested object (not flat company columns) so a future `branches` collection
 # can carry this same shape per-branch without a schema redesign.
-DEFAULT_ATTENDANCE_RADIUS_METERS = 50.0
-# Above this implied speed between two consecutive attendance points the
-# movement is physically impossible for a commuting employee. Generous enough
-# that normal GPS jitter or a fast highway drive never triggers it.
-IMPOSSIBLE_TRAVEL_SPEED_KMH = 200.0
-# Real GPS fixes essentially never report sub-1-meter accuracy; spoofing apps
-# commonly report 0 or 1. Only ever used combined with the repeated-identical-
-# coordinates signal - never rejects on its own.
-SUSPICIOUS_GPS_ACCURACY_METERS = 1.0
-REPEATED_COORDS_MIN_DAYS = 3
+# Smart QR Attendance helpers moved to services/attendance.py (Postgres-backed).
 
-def haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    rlat1, rlon1, rlat2, rlon2 = map(math.radians, (lat1, lon1, lat2, lon2))
-    a = math.sin((rlat2 - rlat1) / 2) ** 2 + math.cos(rlat1) * math.cos(rlat2) * math.sin((rlon2 - rlon1) / 2) ** 2
-    return 6371000.0 * 2 * math.asin(math.sqrt(a))
-
-def attendance_settings_for(company: dict) -> dict:
-    """Attendance settings with backward-compatible defaults: QR attendance
-    stays enabled and a missing location means radius validation is skipped,
-    so companies created before this feature keep working unchanged until
-    their owner configures a location."""
-    stored = company.get("attendance_settings") or {}
-    return {
-        "latitude": stored.get("latitude"),
-        "longitude": stored.get("longitude"),
-        "radius_meters": stored.get("radius_meters", DEFAULT_ATTENDANCE_RADIUS_METERS),
-        "qr_enabled": stored.get("qr_enabled", True),
-        "updated_at": stored.get("updated_at"),
-        "updated_by": stored.get("updated_by"),
-        "updated_by_name": stored.get("updated_by_name"),
-    }
-
-async def ensure_qr_token(company: dict) -> str:
-    """Self-heal on read (same pattern as subscription-expiry resolution): a
-    company whose printed QR predates this feature - when the QR embedded the
-    raw company id - gets an opaque random token and a regenerated QR image
-    the first time its QR is needed. The QR encodes only this token, never
-    any company data."""
-    token = company.get("qr_token")
-    if not token:
-        token = uuid.uuid4().hex
-        company["qr_token"] = token
-        company["qr_code"] = generate_qr_code(token)
-        await db.companies.update_one(
-            {"id": company["id"]},
-            {"$set": {"qr_token": token, "qr_code": company["qr_code"]}}
-        )
-    return token
-
-async def detect_fake_gps(employee_id: str, latitude: float, longitude: float, accuracy: Optional[float]) -> Optional[str]:
-    """Best-effort server-side spoofing heuristics for a browser client (the
-    web platform exposes no native mock-location flag). Only high-confidence
-    combinations reject, so normal GPS inaccuracy never blocks a real
-    employee: an impossible travel speed against the employee's own previous
-    attendance point is decisive alone; suspiciously perfect accuracy and
-    pin-identical coordinates across several days must BOTH be present."""
-    now = datetime.now(timezone.utc)
-    records = await db.attendance.find(
-        {"employee_id": employee_id}, {"_id": 0}
-    ).sort("date", -1).limit(10).to_list(10)
-
-    events = []
-    for record in records:
-        for time_field, loc_field in (("check_in_time", "check_in_location"), ("check_out_time", "check_out_location")):
-            loc = record.get(loc_field)
-            if record.get(time_field) and loc and loc.get("latitude") is not None:
-                events.append((record[time_field], loc))
-    if events:
-        last_time_iso, last_loc = max(events, key=lambda e: e[0])
-        elapsed_hours = None
-        try:
-            elapsed_hours = (now - datetime.fromisoformat(last_time_iso)).total_seconds() / 3600
-        except (ValueError, TypeError):
-            pass
-        if elapsed_hours and elapsed_hours > 0:
-            distance_km = haversine_meters(latitude, longitude, last_loc["latitude"], last_loc["longitude"]) / 1000
-            # Sub-500m jumps are ignored entirely: GPS jitter can never look
-            # like teleporting at that scale, whatever the time delta.
-            if distance_km > 0.5 and (distance_km / elapsed_hours) > IMPOSSIBLE_TRAVEL_SPEED_KMH:
-                return "تم رفض تسجيل الحضور: تم اكتشاف موقع GPS غير موثوق (سرعة انتقال غير ممكنة)."
-
-    if accuracy is not None and accuracy <= SUSPICIOUS_GPS_ACCURACY_METERS:
-        identical_days = {
-            r["date"] for r in records
-            if (r.get("check_in_location") or {}).get("latitude") == latitude
-            and (r.get("check_in_location") or {}).get("longitude") == longitude
-        }
-        if len(identical_days) >= REPEATED_COORDS_MIN_DAYS:
-            return "تم رفض تسجيل الحضور: تم اكتشاف موقع GPS غير موثوق (إحداثيات متطابقة بدقة مشبوهة)."
-
-    return None
-
-async def validate_qr_attendance(current_user: dict, qr_code: Optional[str], latitude: Optional[float], longitude: Optional[float], accuracy: Optional[float]):
-    """Shared server-side gate for check-in AND check-out. Returns
-    (company, settings, distance_from_company_meters); raises a clear,
-    user-legible 400 on any failure. A valid QR alone is never sufficient -
-    GPS is always required, and the radius is enforced as soon as a company
-    location exists (unless the owner disabled QR attendance entirely)."""
-    if current_user["role"] != UserRole.EMPLOYEE:
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    company = await db.companies.find_one({"id": current_user["company_id"]}, {"_id": 0})
-    if not company:
-        raise HTTPException(status_code=404, detail="Company not found")
-
-    settings = attendance_settings_for(company)
-    if not settings["qr_enabled"]:
-        raise HTTPException(status_code=400, detail="تسجيل الحضور عبر QR معطل حالياً من قبل إدارة الشركة.")
-
-    token = await ensure_qr_token(company)
-    if qr_code != token:
-        raise HTTPException(status_code=400, detail="رمز QR غير صالح. يرجى مسح رمز الشركة الصحيح.")
-
-    if latitude is None or longitude is None:
-        raise HTTPException(status_code=400, detail="خدمة الموقع (GPS) مطلوبة لتسجيل الحضور. يرجى السماح بالوصول إلى موقعك والمحاولة مجدداً.")
-
-    rejection = await detect_fake_gps(current_user["id"], latitude, longitude, accuracy)
-    if rejection:
-        raise HTTPException(status_code=400, detail=rejection)
-
-    distance = None
-    if settings["latitude"] is not None and settings["longitude"] is not None:
-        distance = round(haversine_meters(latitude, longitude, settings["latitude"], settings["longitude"]), 1)
-        if distance > settings["radius_meters"]:
-            raise HTTPException(
-                status_code=400,
-                detail=f"أنت خارج النطاق المسموح للشركة (المسافة الحالية {int(distance)} متر والمسموح {int(settings['radius_meters'])} متر)."
-            )
-
-    return company, settings, distance
+# validate_qr_attendance moved to services/attendance.py (Postgres-backed).
 
 # ---- Work Messaging helpers ----
 
@@ -1539,23 +1414,6 @@ async def filter_out_holiday_attendance(company_id: str, records: List[dict]) ->
         return records
     return [r for r in records if r.get("date") not in off_dates]
 
-async def annotate_holiday_dates(company_id: str, records: List[dict]) -> None:
-    """Mutates records in place, adding is_holiday/holiday_type/holiday_title
-    so Reports can show 'Official Company Holiday' or 'Weekly Holiday'
-    instead of the normal status label on non-working dates - never changes
-    the underlying stored status."""
-    dates = {r["date"] for r in records if r.get("date")}
-    off_by_date = {}
-    for d in dates:
-        info = await get_day_off_info(company_id, d)
-        if info:
-            off_by_date[d] = info
-    for r in records:
-        info = off_by_date.get(r.get("date"))
-        r["is_holiday"] = info is not None
-        r["holiday_type"] = info["type"] if info else None
-        r["holiday_title"] = info["title"] if info else None
-
 async def deliver_due_calendar_reminders(user_id: str):
     """Same self-heal-on-read pattern as message reminders, deliberately a
     separate function/collection - folded into the same GET /notifications
@@ -2141,6 +1999,7 @@ async def create_urgent_task(task: UrgentTaskCreate, current_user: dict = Depend
 @api_router.get("/owner/attendance", response_model=List[AttendanceResponse])
 async def get_attendance(
     current_user: dict = Depends(get_current_user),
+    pg: AsyncSession = Depends(get_db),
     date: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
@@ -2151,382 +2010,51 @@ async def get_attendance(
 ):
     if current_user["role"] != UserRole.COMPANY_OWNER:
         raise HTTPException(status_code=403, detail="Access denied")
-
-    query = {"company_id": current_user["company_id"]}
-    if date_from or date_to:
-        date_query = {}
-        if date_from:
-            date_query["$gte"] = date_from
-        if date_to:
-            date_query["$lte"] = date_to
-        query["date"] = date_query
-    elif date:
-        query["date"] = date
-    else:
-        query["date"] = datetime.now(timezone.utc).date().isoformat()
-
-    if employee_id:
-        query["employee_id"] = employee_id
-    # "checked_out" is a derived state (a set check_out_time), not a stored
-    # status value like present/late.
-    if status == "checked_out":
-        query["check_out_time"] = {"$ne": None}
-    elif status:
-        query["status"] = status
-
-    attendance = await db.attendance.find(query, {"_id": 0}).sort([("date", -1), ("check_in_time", -1)]).to_list(2000)
-
-    employees = await db.users.find(
-        {"company_id": current_user["company_id"]},
-        {"_id": 0, "id": 1, "name": 1, "department": 1}
-    ).to_list(1000)
-    employee_map = {e["id"]: e for e in employees}
-
-    results = []
-    for record in attendance:
-        employee = employee_map.get(record["employee_id"])
-        if employee:
-            record["employee_name"] = employee["name"]
-        # Records that predate the department snapshot fall back to the
-        # employee's current department for display only - stored data is
-        # never touched.
-        if record.get("employee_department") is None and employee:
-            record["employee_department"] = employee.get("department")
-        if record.get("working_duration_minutes") is None:
-            record["working_duration_minutes"] = _duration_minutes(record.get("check_in_time"), record.get("check_out_time"))
-        if department and record.get("employee_department") != department:
-            continue
-        if search and search.strip().lower() not in (record.get("employee_name") or "").lower():
-            continue
-        results.append(record)
-
-    await annotate_holiday_dates(current_user["company_id"], results)
-    return results
-
-@api_router.get("/owner/attendance/settings")
-async def get_attendance_settings(current_user: dict = Depends(get_current_user)):
-    if current_user["role"] != UserRole.COMPANY_OWNER:
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    company = await db.companies.find_one({"id": current_user["company_id"]}, {"_id": 0})
-    if not company:
-        raise HTTPException(status_code=404, detail="Company not found")
-
-    await ensure_qr_token(company)
-    settings = attendance_settings_for(company)
-    return {
-        "settings": settings,
-        "location_configured": settings["latitude"] is not None and settings["longitude"] is not None,
-        "qr_code": company["qr_code"],
-        # The owner already holds the token (it's what their QR image encodes);
-        # exposing it here is owner-scoped and enables API-level testing.
-        "qr_token": company["qr_token"],
-        "company_name": company["name"],
-    }
-
-@api_router.put("/owner/attendance/settings")
-async def update_attendance_settings(updates: AttendanceSettingsUpdate, current_user: dict = Depends(get_current_user)):
-    if current_user["role"] != UserRole.COMPANY_OWNER:
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    provided = updates.model_dump(exclude_none=True)
-    if not provided:
-        raise HTTPException(status_code=400, detail="No valid fields to update")
-    if ("latitude" in provided) != ("longitude" in provided):
-        raise HTTPException(status_code=400, detail="يجب تحديد خط العرض وخط الطول معاً.")
-
-    # updated_at/updated_by/updated_by_name are always derived from the
-    # authenticated session here, never accepted from the request body -
-    # AttendanceSettingsUpdate has no fields for them.
-    provided["updated_at"] = datetime.now(timezone.utc).isoformat()
-    provided["updated_by"] = current_user["id"]
-    provided["updated_by_name"] = current_user.get("name")
-
-    await db.companies.update_one(
-        {"id": current_user["company_id"]},
-        {"$set": {f"attendance_settings.{key}": value for key, value in provided.items()}}
+    return await attendance_service.list_attendance_for_owner(
+        pg, current_user["company_id"], date=date, date_from=date_from, date_to=date_to,
+        employee_id=employee_id, department=department, status=status, search=search,
     )
 
-    company = await db.companies.find_one({"id": current_user["company_id"]}, {"_id": 0})
-    settings = attendance_settings_for(company)
-    return {
-        "message": "Attendance settings updated",
-        "settings": settings,
-        "location_configured": settings["latitude"] is not None and settings["longitude"] is not None,
-    }
+@api_router.get("/owner/attendance/settings")
+async def get_attendance_settings(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    company = await companies_repo.get_by_id(pg, parse_uuid(current_user["company_id"]))
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+    return await attendance_service.get_attendance_settings(pg, company)
+
+@api_router.put("/owner/attendance/settings")
+async def update_attendance_settings(updates: AttendanceSettingsUpdate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await attendance_service.update_attendance_settings(pg, current_user, updates)
 
 @api_router.get("/owner/attendance/analytics")
 async def get_attendance_analytics(
     current_user: dict = Depends(get_current_user),
+    pg: AsyncSession = Depends(get_db),
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
 ):
     if current_user["role"] != UserRole.COMPANY_OWNER:
         raise HTTPException(status_code=403, detail="Access denied")
-
-    company_id = current_user["company_id"]
-    today = datetime.now(timezone.utc).date()
-    end_date = min(date_to or today.isoformat(), today.isoformat())
-    start_date = date_from or (today - timedelta(days=29)).isoformat()
-
-    records = await db.attendance.find(
-        {"company_id": company_id, "date": {"$gte": start_date, "$lte": end_date}},
-        {"_id": 0}
-    ).to_list(10000)
-
-    employees = await db.users.find(
-        {"company_id": company_id, "role": UserRole.EMPLOYEE},
-        {"_id": 0, "id": 1, "name": 1, "department": 1}
-    ).to_list(1000)
-    total_employees = len(employees)
-
-    def time_of_day_minutes(iso: Optional[str]) -> Optional[float]:
-        if not iso:
-            return None
-        try:
-            parsed = datetime.fromisoformat(iso)
-        except ValueError:
-            return None
-        return parsed.hour * 60 + parsed.minute + parsed.second / 60
-
-    def format_clock(minutes_list: list) -> Optional[str]:
-        if not minutes_list:
-            return None
-        avg = sum(minutes_list) / len(minutes_list)
-        return f"{int(avg // 60):02d}:{int(avg % 60):02d}"
-
-    check_in_minutes = []
-    check_out_minutes = []
-    durations = []
-    for record in records:
-        m_in = time_of_day_minutes(record.get("check_in_time"))
-        if m_in is not None:
-            check_in_minutes.append(m_in)
-        m_out = time_of_day_minutes(record.get("check_out_time"))
-        if m_out is not None:
-            check_out_minutes.append(m_out)
-        duration = record.get("working_duration_minutes")
-        if duration is None:
-            duration = _duration_minutes(record.get("check_in_time"), record.get("check_out_time"))
-        if duration is not None:
-            durations.append(duration)
-
-    try:
-        day_count = (datetime.fromisoformat(end_date).date() - datetime.fromisoformat(start_date).date()).days + 1
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid date range")
-    if day_count < 1:
-        raise HTTPException(status_code=400, detail="Invalid date range")
-    day_count = min(day_count, 366)
-
-    attended_records = [r for r in records if r.get("check_in_time")]
-    late_count = sum(1 for r in records if r.get("status") == AttendanceStatus.LATE)
-    expected_attendance = total_employees * day_count
-    # Absence is derived (expected minus attended), never stored - consistent
-    # with how the owner dashboard already computes absent_today.
-    absence_count = max(0, expected_attendance - len(attended_records))
-    attendance_percentage = round(len(attended_records) / expected_attendance * 100, 1) if expected_attendance > 0 else 0
-    # Same denominator as attendance_percentage, so the two read consistently
-    # together (e.g. "92% present, 15% of which were late").
-    late_percentage = round(late_count / expected_attendance * 100, 1) if expected_attendance > 0 else 0
-
-    distances = [r["distance_from_company_meters"] for r in records if r.get("distance_from_company_meters") is not None]
-    average_distance_meters = round(sum(distances) / len(distances), 1) if distances else None
-
-    by_date = {}
-    for record in records:
-        by_date.setdefault(record["date"], []).append(record)
-
-    attendance_trend = []
-    late_trend = []
-    working_hours_trend = []
-    for offset in range(day_count):
-        day = (datetime.fromisoformat(start_date).date() + timedelta(days=offset)).isoformat()
-        day_records = by_date.get(day, [])
-        day_attended = sum(1 for r in day_records if r.get("check_in_time"))
-        day_late = sum(1 for r in day_records if r.get("status") == AttendanceStatus.LATE)
-        day_durations = []
-        for r in day_records:
-            d = r.get("working_duration_minutes")
-            if d is None:
-                d = _duration_minutes(r.get("check_in_time"), r.get("check_out_time"))
-            if d is not None:
-                day_durations.append(d)
-        rate = round(day_attended / total_employees * 100, 1) if total_employees > 0 else 0
-        attendance_trend.append({"date": day, "rate": rate})
-        late_trend.append({"date": day, "count": day_late})
-        working_hours_trend.append({
-            "date": day,
-            "hours": round(sum(day_durations) / len(day_durations) / 60, 2) if day_durations else 0
-        })
-
-    per_employee = {
-        e["id"]: {
-            "employee_id": e["id"],
-            "name": e["name"],
-            "department": e.get("department"),
-            "days_attended": 0,
-            "late_count": 0,
-            "total_minutes": 0.0,
-            "duration_days": 0,
-        }
-        for e in employees
-    }
-    for record in records:
-        stats = per_employee.get(record["employee_id"])
-        if not stats:
-            continue
-        if record.get("check_in_time"):
-            stats["days_attended"] += 1
-        if record.get("status") == AttendanceStatus.LATE:
-            stats["late_count"] += 1
-        duration = record.get("working_duration_minutes")
-        if duration is None:
-            duration = _duration_minutes(record.get("check_in_time"), record.get("check_out_time"))
-        if duration is not None:
-            stats["total_minutes"] += duration
-            stats["duration_days"] += 1
-
-    # Department Attendance: same expected/attended ratio as
-    # attendance_percentage, scoped to employees in each department. Employees
-    # without a department (free-text field, may be unset) are excluded here,
-    # matching how the Records tab's department filter already only lists
-    # non-empty department values.
-    department_totals = {}
-    for stats in per_employee.values():
-        department = stats["department"]
-        if not department:
-            continue
-        bucket = department_totals.setdefault(department, {"attended": 0, "employee_count": 0})
-        bucket["attended"] += stats["days_attended"]
-        bucket["employee_count"] += 1
-    department_attendance = [
-        {
-            "department": department,
-            "attendance_rate": round(bucket["attended"] / (bucket["employee_count"] * day_count) * 100, 1)
-            if bucket["employee_count"] > 0 else 0,
-        }
-        for department, bucket in sorted(department_totals.items())
-    ]
-
-    ranking = []
-    for stats in per_employee.values():
-        attendance_rate = stats["days_attended"] / day_count * 100
-        on_time_rate = ((stats["days_attended"] - stats["late_count"]) / stats["days_attended"] * 100) if stats["days_attended"] > 0 else 0
-        score = round(attendance_rate * 0.7 + on_time_rate * 0.3, 1)
-        ranking.append({
-            "employee_id": stats["employee_id"],
-            "name": stats["name"],
-            "department": stats["department"],
-            "days_attended": stats["days_attended"],
-            "late_count": stats["late_count"],
-            "avg_working_hours": round(stats["total_minutes"] / stats["duration_days"] / 60, 1) if stats["duration_days"] > 0 else 0,
-            "attendance_rate": round(attendance_rate, 1),
-            "score": score,
-        })
-    ranking.sort(key=lambda item: item["score"], reverse=True)
-    for index, item in enumerate(ranking):
-        item["rank"] = index + 1
-
-    return {
-        "date_from": start_date,
-        "date_to": end_date,
-        "total_employees": total_employees,
-        # Averages are computed in UTC, consistent with the existing
-        # late-after-9-UTC rule used at check-in.
-        "average_check_in_time": format_clock(check_in_minutes),
-        "average_check_out_time": format_clock(check_out_minutes),
-        "average_working_hours": round(sum(durations) / len(durations) / 60, 1) if durations else 0,
-        "attendance_percentage": attendance_percentage,
-        "late_count": late_count,
-        "late_percentage": late_percentage,
-        "absence_count": absence_count,
-        "average_distance_meters": average_distance_meters,
-        "department_attendance": department_attendance,
-        "employee_ranking": ranking,
-        "charts": {
-            "attendance_trend": attendance_trend,
-            "late_trend": late_trend,
-            "working_hours_trend": working_hours_trend,
-        },
-    }
-
-ATTENDANCE_EDITABLE_FIELDS = ["check_in_time", "check_out_time", "status"]
+    return await attendance_service.get_attendance_analytics(pg, current_user["company_id"], date_from, date_to)
 
 @api_router.patch("/owner/attendance/{attendance_id}")
-async def edit_attendance(attendance_id: str, updates: AttendanceManualEdit, current_user: dict = Depends(get_current_user)):
+async def edit_attendance(attendance_id: str, updates: AttendanceManualEdit, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     if current_user["role"] != UserRole.COMPANY_OWNER:
         raise HTTPException(status_code=403, detail="Access denied")
-
-    record = await db.attendance.find_one(
-        {"id": attendance_id, "company_id": current_user["company_id"]}, {"_id": 0}
-    )
-    if not record:
-        raise HTTPException(status_code=404, detail="Attendance record not found")
-
-    provided = updates.model_dump(exclude_none=True)
-    changes = {k: v for k, v in provided.items() if k in ATTENDANCE_EDITABLE_FIELDS and record.get(k) != v}
-    if not changes:
-        raise HTTPException(status_code=400, detail="No valid fields to update")
-
-    if "status" in changes and changes["status"] not in (AttendanceStatus.PRESENT, AttendanceStatus.LATE, AttendanceStatus.ABSENT):
-        raise HTTPException(status_code=400, detail="Invalid status value")
-
-    now = datetime.now(timezone.utc).isoformat()
-    # Append-only audit trail: one entry per changed field. No update/delete
-    # path exists for this collection anywhere in the API - audit history is
-    # immutable by construction.
-    audit_entries = [{
-        "id": str(uuid.uuid4()),
-        "attendance_id": attendance_id,
-        "company_id": current_user["company_id"],
-        "edited_by": current_user["id"],
-        "edited_by_name": current_user.get("name"),
-        "edited_at": now,
-        "field": field,
-        "old_value": record.get(field),
-        "new_value": value,
-    } for field, value in changes.items()]
-
-    new_check_in = changes.get("check_in_time", record.get("check_in_time"))
-    new_check_out = changes.get("check_out_time", record.get("check_out_time"))
-    changes["working_duration_minutes"] = _duration_minutes(new_check_in, new_check_out)
-
-    await db.attendance.update_one({"id": attendance_id}, {"$set": changes})
-    await db.attendance_audit_log.insert_many(audit_entries)
-
-    return {"message": "Attendance record updated", "audit_entries": len(audit_entries)}
+    return await attendance_service.edit_attendance(pg, current_user, attendance_id, updates)
 
 @api_router.get("/owner/attendance/audit-log")
-async def get_attendance_audit_log(current_user: dict = Depends(get_current_user)):
-    """Read-only view of attendance_audit_log, written by edit_attendance
-    above. No update/delete route exists for this collection anywhere -
-    history is immutable by construction, matching the append-only pattern
-    already used for the audit trail itself."""
+async def get_attendance_audit_log(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    """Read-only view of the unified audit_logs table, filtered to
+    entity_type='attendance'. No update/delete route exists for this
+    collection anywhere - history is immutable by construction."""
     if current_user["role"] != UserRole.COMPANY_OWNER:
         raise HTTPException(status_code=403, detail="Access denied")
-
-    entries = await db.attendance_audit_log.find(
-        {"company_id": current_user["company_id"]}, {"_id": 0}
-    ).sort("edited_at", -1).limit(200).to_list(200)
-
-    attendance_ids = list({e["attendance_id"] for e in entries})
-    records = await db.attendance.find(
-        {"id": {"$in": attendance_ids}}, {"_id": 0, "id": 1, "employee_id": 1, "date": 1}
-    ).to_list(len(attendance_ids)) if attendance_ids else []
-    record_map = {r["id"]: r for r in records}
-    employee_ids = list({r["employee_id"] for r in records})
-    employees = await db.users.find(
-        {"id": {"$in": employee_ids}}, {"_id": 0, "id": 1, "name": 1}
-    ).to_list(len(employee_ids)) if employee_ids else []
-    employee_names = {e["id"]: e["name"] for e in employees}
-
-    for entry in entries:
-        record = record_map.get(entry["attendance_id"])
-        entry["employee_name"] = employee_names.get(record["employee_id"]) if record else None
-        entry["attendance_date"] = record["date"] if record else None
-
-    return entries
+    return await attendance_service.get_attendance_audit_log(pg, parse_uuid(current_user["company_id"]))
 
 @api_router.get("/owner/reports", response_model=List[ReportResponse])
 async def get_reports(current_user: dict = Depends(get_current_user)):
@@ -2652,114 +2180,18 @@ async def complete_task(task_id: str, current_user: dict = Depends(get_current_u
     return await tasks_service.complete_task(pg, current_user["id"], task_id)
 
 @api_router.post("/employee/attendance/check-in")
-async def check_in(data: AttendanceCheckIn, current_user: dict = Depends(get_current_user)):
-    company, settings, distance = await validate_qr_attendance(
-        current_user, data.qr_code, data.latitude, data.longitude, data.accuracy
-    )
-
-    today = datetime.now(timezone.utc).date().isoformat()
-    now = datetime.now(timezone.utc)
-
-    # Check if already checked in
-    existing = await db.attendance.find_one({
-        "employee_id": current_user["id"],
-        "date": today
-    })
-
-    if existing and existing.get("check_in_time"):
-        raise HTTPException(status_code=400, detail="Already checked in today")
-
-    # Determine status (late if after 9 AM)
-    hour = now.hour
-    attendance_status = AttendanceStatus.LATE if hour >= 9 else AttendanceStatus.PRESENT
-
-    location = {"latitude": data.latitude, "longitude": data.longitude}
-    if data.accuracy is not None:
-        location["accuracy"] = data.accuracy
-
-    # check_in_time is the attendance event itself; created_at is when the
-    # record reached the server. Identical today, but kept separate so a
-    # future offline-sync client can submit past events without a schema
-    # change. employee_department is snapshotted at creation: history must
-    # not follow the employee if they later move to another department.
-    attendance_doc = {
-        "id": str(uuid.uuid4()),
-        "employee_id": current_user["id"],
-        "employee_department": current_user.get("department"),
-        "company_id": current_user["company_id"],
-        "date": today,
-        "check_in_time": now.isoformat(),
-        "check_out_time": None,
-        "check_in_location": location,
-        "check_out_location": None,
-        "distance_from_company_meters": distance,
-        "device_info": data.device_info,
-        "created_at": now.isoformat(),
-        "status": attendance_status
-    }
-
-    if existing:
-        await db.attendance.update_one(
-            {"id": existing["id"]},
-            {"$set": attendance_doc}
-        )
-    else:
-        await db.attendance.insert_one(attendance_doc)
-
-    return {"message": "Checked in successfully", "status": attendance_status}
+async def check_in(data: AttendanceCheckIn, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await attendance_service.check_in(pg, current_user, data)
 
 @api_router.post("/employee/attendance/check-out")
-async def check_out(data: AttendanceCheckOut, current_user: dict = Depends(get_current_user)):
-    company, settings, distance = await validate_qr_attendance(
-        current_user, data.qr_code, data.latitude, data.longitude, data.accuracy
-    )
-
-    today = datetime.now(timezone.utc).date().isoformat()
-    now = datetime.now(timezone.utc)
-
-    # Check if checked in
-    attendance = await db.attendance.find_one({
-        "employee_id": current_user["id"],
-        "date": today
-    })
-
-    if not attendance or not attendance.get("check_in_time"):
-        raise HTTPException(status_code=400, detail="Not checked in yet")
-
-    if attendance.get("check_out_time"):
-        raise HTTPException(status_code=400, detail="Already checked out")
-
-    location = {"latitude": data.latitude, "longitude": data.longitude}
-    if data.accuracy is not None:
-        location["accuracy"] = data.accuracy
-
-    check_out_time = now.isoformat()
-    await db.attendance.update_one(
-        {"id": attendance["id"]},
-        {"$set": {
-            "check_out_time": check_out_time,
-            "check_out_location": location,
-            "check_out_distance_meters": distance,
-            "working_duration_minutes": _duration_minutes(attendance["check_in_time"], check_out_time)
-        }}
-    )
-
-    return {"message": "Checked out successfully"}
+async def check_out(data: AttendanceCheckOut, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await attendance_service.check_out(pg, current_user, data)
 
 @api_router.get("/employee/attendance/history", response_model=List[AttendanceResponse])
-async def get_attendance_history(current_user: dict = Depends(get_current_user)):
+async def get_attendance_history(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     if current_user["role"] != UserRole.EMPLOYEE:
         raise HTTPException(status_code=403, detail="Access denied")
-    
-    attendance = await db.attendance.find(
-        {"employee_id": current_user["id"]},
-        {"_id": 0}
-    ).sort("date", -1).limit(30).to_list(30)
-    
-    for record in attendance:
-        record["employee_name"] = current_user["name"]
-    
-    return attendance
+    return await attendance_service.get_attendance_history(pg, current_user)
 
 @api_router.get("/employee/performance")
 async def get_employee_performance(current_user: dict = Depends(get_current_user)):
@@ -2867,23 +2299,11 @@ async def mark_notification_read(notification_id: str, current_user: dict = Depe
     return {"message": "Notification marked as read"}
 
 @api_router.get("/company/{company_id}/qr")
-async def get_company_qr(company_id: str, current_user: dict = Depends(get_current_user)):
+async def get_company_qr(company_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     # Previously unauthenticated. The QR now encodes the attendance token, so
     # it must not be publicly harvestable - only the company's own owner (or
     # the platform super admin) may fetch it.
-    is_own_company_owner = (
-        current_user["role"] == UserRole.COMPANY_OWNER
-        and current_user.get("company_id") == company_id
-    )
-    if current_user["role"] != UserRole.SUPER_ADMIN and not is_own_company_owner:
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    company = await db.companies.find_one({"id": company_id}, {"_id": 0})
-    if not company:
-        raise HTTPException(status_code=404, detail="Company not found")
-
-    await ensure_qr_token(company)
-    return {"qr_code": company["qr_code"]}
+    return await attendance_service.get_company_qr(pg, current_user, company_id)
 
 # ============ Work Messaging Routes ============
 # Shared between Company Owner and Employee (both are valid senders/
