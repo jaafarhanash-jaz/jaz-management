@@ -19,7 +19,7 @@ from sqlalchemy import (
     func,
 )
 from sqlalchemy import text
-from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
+from sqlalchemy.dialects.postgresql import ARRAY as PG_ARRAY, JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from database import Base
@@ -337,12 +337,21 @@ class Message(Base, TimestampMixin):
     body: Mapped[str] = mapped_column(Text, nullable=False)
     priority: Mapped[str] = mapped_column(String, nullable=False, server_default="normal")
     confidentiality: Mapped[str] = mapped_column(String, nullable=False, server_default="internal")
-    tags: Mapped[List[str]] = mapped_column(ARRAY(String), nullable=False, server_default="{}")
+    # PG_ARRAY (not generic ARRAY) - the postgres-specific overlap()/contains()
+    # comparators used by MessageQuery.tags_overlap() only exist on this type.
+    tags: Mapped[List[str]] = mapped_column(PG_ARRAY(String), nullable=False, server_default="{}")
     requires_acknowledgement: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     completion_required: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     recipient_type: Mapped[str] = mapped_column(String, nullable=False)
-    recipient_ids: Mapped[Optional[List[uuid.UUID]]] = mapped_column(ARRAY(PG_UUID(as_uuid=True)), nullable=True)
+    # Polymorphic by design (matches the original request contract): a list
+    # of employee-id strings when recipient_type='employee', but a single
+    # department NAME string when recipient_type='department' - send_draft
+    # re-resolves recipients from this later using recipient_type as the
+    # discriminator. A UUID-typed array (the original decision here) cannot
+    # hold a department name, so this is a plain string array - the request/
+    # response contract never exposes this field directly either way.
+    recipient_ids: Mapped[Optional[List[str]]] = mapped_column(ARRAY(String), nullable=True)
     recipient_department: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     is_draft: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     is_forward: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")

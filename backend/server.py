@@ -31,6 +31,7 @@ import services.auth as auth_service
 import services.departments as departments_service
 import services.employees as employees_service
 import services.heartbeat as heartbeat_service
+import services.messages as messages_service
 import services.notifications as notifications_service
 import services.reports as reports_service
 import services.seed as seed_service
@@ -750,18 +751,8 @@ def generate_qr_code(data: str) -> str:
 # validate_qr_attendance moved to services/attendance.py (Postgres-backed).
 
 # ---- Work Messaging helpers ----
-
-async def next_reference_number(company_id: str) -> str:
-    """Atomic per-company sequence (MSG-000001, MSG-000002...) via the
-    standard Mongo find-and-increment pattern - avoids duplicate numbers
-    under concurrent sends without needing a separate locking mechanism."""
-    counter = await db.counters.find_one_and_update(
-        {"id": f"message_seq:{company_id}"},
-        {"$inc": {"value": 1}},
-        upsert=True,
-        return_document=ReturnDocument.AFTER,
-    )
-    return f"MSG-{counter['value']:06d}"
+# next_reference_number (MSG-###### counter) moved to
+# repositories/counters.py + services/messages.py (Postgres-backed).
 
 def classify_attachment_type(mime_type: str) -> str:
     mime_type = (mime_type or "").lower()
@@ -783,238 +774,11 @@ def classify_attachment_type(mime_type: str) -> str:
         return AttachmentType.VIDEO
     return AttachmentType.OTHER
 
-async def resolve_recipients(company_id: str, recipient_type: str, recipient_ids: List[str]) -> tuple:
-    """Fan-out resolution at send time (same approach already used for
-    urgent-task assignment): 'department' expands to whoever currently
-    belongs to that department, captured as a snapshot - matches the
-    department-snapshot convention already established on attendance
-    records. Returns (list of real employee ids, department label or None)."""
-    if recipient_type == MessageRecipientType.DEPARTMENT:
-        if not recipient_ids:
-            raise HTTPException(status_code=400, detail="Department is required")
-        department = recipient_ids[0]
-        employees = await db.users.find(
-            {"company_id": company_id, "role": UserRole.EMPLOYEE, "department": department},
-            {"_id": 0, "id": 1}
-        ).to_list(1000)
-        if not employees:
-            raise HTTPException(status_code=400, detail="No employees found in this department")
-        return [e["id"] for e in employees], department
-
-    if not recipient_ids:
-        raise HTTPException(status_code=400, detail="At least one recipient is required")
-    valid_count = await db.users.count_documents({
-        "id": {"$in": recipient_ids}, "company_id": company_id
-    })
-    if valid_count != len(set(recipient_ids)):
-        raise HTTPException(status_code=400, detail="One or more recipients do not belong to your company")
-    return list(set(recipient_ids)), None
-
-async def write_message_activity(company_id: str, message_id: str, actor: dict, verb: str, subject: str):
-    """Event-only log - never stores message body, per the explicit
-    'do not duplicate message content' requirement. Append-only: no
-    update/delete route exists anywhere against this collection."""
-    await db.message_activity_log.insert_one({
-        "id": str(uuid.uuid4()),
-        "company_id": company_id,
-        "message_id": message_id,
-        "actor_id": actor["id"],
-        "actor_name": actor.get("name"),
-        "verb": verb,
-        "message_subject": subject,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    })
-
-async def compute_delivery_progress(thread_id: str) -> Dict[str, Any]:
-    """Computed on read from message_recipients - never stored redundantly,
-    consistent with how absence/attendance-rate are already derived rather
-    than cached elsewhere in this codebase. One row per (thread, participant)
-    - the sender's own row is excluded so '12/20' reflects real recipients,
-    not the sender counted as a phantom recipient of their own message."""
-    recipients = await db.message_recipients.find(
-        {"thread_id": thread_id, "role": "recipient"}, {"_id": 0, "status": 1}
-    ).to_list(10000)
-    total = len(recipients)
-    reached = lambda *statuses: sum(1 for r in recipients if r["status"] in statuses)
-    return {
-        "total": total,
-        "delivered": total,  # delivery is immediate/automatic on send
-        "seen": reached(MessageRecipientStatus.SEEN, MessageRecipientStatus.ACCEPTED,
-                         MessageRecipientStatus.COMPLETED, MessageRecipientStatus.ARCHIVED),
-        "accepted": reached(MessageRecipientStatus.ACCEPTED, MessageRecipientStatus.COMPLETED,
-                             MessageRecipientStatus.ARCHIVED),
-        "completed": reached(MessageRecipientStatus.COMPLETED, MessageRecipientStatus.ARCHIVED),
-    }
-
-async def get_accessible_message(message_id: str, current_user: dict) -> dict:
-    """Shared access check reused by every single-message endpoint below -
-    sender, an actual participant of the thread (checked by thread_id, so
-    this resolves correctly whether message_id points at the root or at one
-    specific reply), or that company's owner. Super Admin is never granted a
-    path here, satisfying 'must not read company messages' by omission."""
-    message = await db.messages.find_one({"id": message_id}, {"_id": 0})
-    if not message or message["company_id"] != current_user.get("company_id"):
-        raise HTTPException(status_code=404, detail="Message not found")
-
-    is_sender = message["sender_id"] == current_user["id"]
-    is_owner = current_user["role"] == UserRole.COMPANY_OWNER
-    participant_row = await db.message_recipients.find_one(
-        {"thread_id": message["thread_id"], "recipient_id": current_user["id"]}, {"_id": 0}
-    )
-    if not (is_sender or is_owner or participant_row):
-        raise HTTPException(status_code=404, detail="Message not found")
-
-    return message
-
-REMINDER_PRESETS = {"30m": timedelta(minutes=30), "1h": timedelta(hours=1), "tomorrow": timedelta(days=1)}
-
-# deliver_due_reminders moved to services/notifications.py (Postgres-backed).
-
-async def deliver_message(message: dict, employee_ids: List[str]):
-    """Creates a brand-new thread's participant rows - one per (thread,
-    participant), including the sender - plus one notification per real
-    recipient and one 'sent' activity entry. Reused by immediate send,
-    draft->send, and forward (each of which starts a fresh thread_id).
-    Exactly one message_recipients row exists per participant per thread,
-    never per individual message-in-thread - this is what makes 'one row
-    per thread' in Inbox/Sent naturally correct rather than something the
-    list endpoints have to fake by de-duplicating replies afterward."""
-    now = datetime.now(timezone.utc).isoformat()
-
-    await db.message_recipients.insert_one({
-        "id": str(uuid.uuid4()),
-        "thread_id": message["thread_id"],
-        "company_id": message["company_id"],
-        "recipient_id": message["sender_id"],
-        "recipient_name": message.get("sender_name"),
-        "role": "sender",
-        "status": MessageRecipientStatus.DELIVERED,
-        "is_unread": False,
-        "is_starred": False,
-        "delivered_at": now,
-        "seen_at": None, "accepted_at": None, "completed_at": None, "archived_at": None,
-    })
-
-    for employee_id in employee_ids:
-        recipient = await db.users.find_one({"id": employee_id}, {"_id": 0, "name": 1})
-        await db.message_recipients.insert_one({
-            "id": str(uuid.uuid4()),
-            "thread_id": message["thread_id"],
-            "company_id": message["company_id"],
-            "recipient_id": employee_id,
-            "recipient_name": recipient["name"] if recipient else None,
-            "role": "recipient",
-            "status": MessageRecipientStatus.DELIVERED,
-            "is_unread": True,
-            "is_starred": False,
-            "delivered_at": now,
-            "seen_at": None, "accepted_at": None, "completed_at": None, "archived_at": None,
-        })
-        await db.notifications.insert_one({
-            "id": str(uuid.uuid4()),
-            "user_id": employee_id,
-            "company_id": message["company_id"],
-            "type": "work_message",
-            "title": "رسالة عمل جديدة",
-            "message": message["subject"],
-            "read_status": False,
-            "created_at": now,
-        })
-
-    await write_message_activity(
-        message["company_id"], message["id"],
-        {"id": message["sender_id"], "name": message.get("sender_name")},
-        "sent", message["subject"],
-    )
-
-async def notify_reply_participants(reply: dict, thread_id: str, participant_ids: List[str]):
-    """A reply does NOT create new message_recipients rows - it re-opens the
-    existing thread-level row for every other participant (bumping it back
-    to unread) and notifies them. This is what keeps a thread as exactly one
-    row in Inbox/Sent even after replies arrive, per 'do not create
-    independent reply messages / keep one conversation thread'."""
-    now = datetime.now(timezone.utc).isoformat()
-    for participant_id in participant_ids:
-        await db.message_recipients.update_one(
-            {"thread_id": thread_id, "recipient_id": participant_id},
-            {"$set": {"is_unread": True}}
-        )
-        await db.notifications.insert_one({
-            "id": str(uuid.uuid4()),
-            "user_id": participant_id,
-            "company_id": reply["company_id"],
-            "type": "message_reply",
-            "title": "رد على رسالة",
-            "message": reply["subject"],
-            "read_status": False,
-            "created_at": now,
-        })
-    await write_message_activity(
-        reply["company_id"], reply["id"],
-        {"id": reply["sender_id"], "name": reply.get("sender_name")},
-        "replied", reply["subject"],
-    )
-
-async def enrich_messages(messages: List[dict], current_user: dict) -> List[dict]:
-    """Batches every join a message list needs into one query per collection
-    (never N+1), and never selects message_attachments.data - list views
-    must stay cheap regardless of how large an attachment payload is
-    (lazy-loaded separately only when a message is actually opened). Callers
-    always pass root messages (id == thread_id), so grouping by thread_id
-    below is equivalent to grouping by the message's own id, but also
-    correctly aggregates attachments/replies that live on replies within
-    the same thread."""
-    if not messages:
-        return []
-    thread_ids = list({m["thread_id"] for m in messages})
-
-    all_recipients = await db.message_recipients.find(
-        {"thread_id": {"$in": thread_ids}}, {"_id": 0}
-    ).to_list(10000)
-    recipients_by_thread: Dict[str, list] = {}
-    for r in all_recipients:
-        recipients_by_thread.setdefault(r["thread_id"], []).append(r)
-
-    attachments = await db.message_attachments.find(
-        {"thread_id": {"$in": thread_ids}}, {"_id": 0, "thread_id": 1}
-    ).to_list(10000)
-    attachment_counts: Dict[str, int] = {}
-    for a in attachments:
-        attachment_counts[a["thread_id"]] = attachment_counts.get(a["thread_id"], 0) + 1
-
-    reply_counts_raw = await db.messages.find(
-        {"thread_id": {"$in": thread_ids}}, {"_id": 0, "id": 1, "thread_id": 1}
-    ).to_list(10000)
-    reply_counts: Dict[str, int] = {}
-    for m in reply_counts_raw:
-        reply_counts[m["thread_id"]] = reply_counts.get(m["thread_id"], 0) + 1
-
-    now_iso = datetime.now(timezone.utc).isoformat()
-    enriched = []
-    for m in messages:
-        participants = recipients_by_thread.get(m["thread_id"], [])
-        recips_only = [p for p in participants if p.get("role") == "recipient"]
-        mine = next((p for p in participants if p["recipient_id"] == current_user["id"]), None)
-        total = len(recips_only)
-        reached = lambda *statuses: sum(1 for r in recips_only if r["status"] in statuses)
-        m["recipient_names"] = [r["recipient_name"] for r in recips_only if r["recipient_name"]]
-        m["attachment_count"] = attachment_counts.get(m["thread_id"], 0)
-        m["reply_count"] = max(reply_counts.get(m["thread_id"], 1) - 1, 0)
-        m["delivery_progress"] = {
-            "total": total,
-            "delivered": total,
-            "seen": reached(MessageRecipientStatus.SEEN, MessageRecipientStatus.ACCEPTED,
-                             MessageRecipientStatus.COMPLETED, MessageRecipientStatus.ARCHIVED),
-            "accepted": reached(MessageRecipientStatus.ACCEPTED, MessageRecipientStatus.COMPLETED,
-                                 MessageRecipientStatus.ARCHIVED),
-            "completed": reached(MessageRecipientStatus.COMPLETED, MessageRecipientStatus.ARCHIVED),
-        }
-        m["my_status"] = mine["status"] if mine else None
-        m["my_is_unread"] = mine["is_unread"] if mine else None
-        m["my_is_starred"] = mine["is_starred"] if mine else None
-        m["is_expired"] = bool(m.get("expires_at")) and m["expires_at"] < now_iso
-        enriched.append(m)
-    return enriched
+# Work Messaging helpers (resolve_recipients, write_message_activity,
+# compute_delivery_progress, get_accessible_message, deliver_message,
+# notify_reply_participants, enrich_messages) moved to services/messages.py
+# (Postgres-backed) and repositories/{messages,message_recipients,
+# message_attachments,counters}.py.
 
 # ---- Calendar helpers ----
 # Deliberately independent of every Work Messaging helper above (own
@@ -2227,606 +1991,134 @@ async def get_company_qr(company_id: str, current_user: dict = Depends(get_curre
 # recipients of internal work messages); Super Admin has no route in here at
 # all, so "must not read company messages" holds by simple omission.
 
-def require_company_member(current_user: dict):
-    if current_user["role"] not in (UserRole.COMPANY_OWNER, UserRole.EMPLOYEE):
-        raise HTTPException(status_code=403, detail="Access denied")
-
-def paginate_params(page: int, page_size: int) -> tuple:
-    page = max(page, 1)
-    page_size = min(max(page_size, 1), 100)
-    return page, page_size
-
 @api_router.post("/messages", response_model=MessageResponse)
-async def create_message(data: MessageCreate, current_user: dict = Depends(get_current_user)):
-    require_company_member(current_user)
-    if data.priority not in (MessagePriority.NORMAL, MessagePriority.IMPORTANT, MessagePriority.URGENT):
-        raise HTTPException(status_code=400, detail="Invalid priority")
-    if data.confidentiality not in (
-        MessageConfidentiality.PUBLIC, MessageConfidentiality.INTERNAL,
-        MessageConfidentiality.CONFIDENTIAL, MessageConfidentiality.HIGHLY_CONFIDENTIAL
-    ):
-        raise HTTPException(status_code=400, detail="Invalid confidentiality level")
-
-    company_id = current_user["company_id"]
-    message_id = str(uuid.uuid4())
-    now = datetime.now(timezone.utc).isoformat()
-
-    department_label = None
-    employee_ids: List[str] = []
-    if not data.is_draft:
-        if data.recipient_type not in (MessageRecipientType.EMPLOYEE, MessageRecipientType.DEPARTMENT):
-            raise HTTPException(status_code=400, detail="Invalid recipient type")
-        employee_ids, department_label = await resolve_recipients(company_id, data.recipient_type, data.recipient_ids)
-
-    message_doc = {
-        "id": message_id,
-        "reference_number": await next_reference_number(company_id),
-        "company_id": company_id,
-        "thread_id": message_id,
-        "parent_message_id": None,
-        "sender_id": current_user["id"],
-        "sender_name": current_user.get("name"),
-        "subject": data.subject,
-        "body": data.body,
-        "priority": data.priority,
-        "confidentiality": data.confidentiality,
-        "tags": data.tags,
-        "requires_acknowledgement": data.requires_acknowledgement,
-        "completion_required": data.completion_required,
-        "expires_at": data.expires_at,
-        "recipient_type": data.recipient_type,
-        "recipient_ids": data.recipient_ids,
-        "recipient_department": department_label,
-        "is_draft": data.is_draft,
-        "is_forward": False,
-        "forwarded_from_id": None,
-        "is_pinned": False,
-        "closed_at": None,
-        "created_at": now,
-        "updated_at": now,
-    }
-    await db.messages.insert_one(message_doc)
-
-    if not data.is_draft:
-        await deliver_message(message_doc, employee_ids)
-
-    result = (await enrich_messages([message_doc], current_user))[0]
-    return MessageResponse(**{k: v for k, v in result.items() if k != "recipient_ids"})
+async def create_message(data: MessageCreate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    result = await messages_service.create_message(pg, current_user, data)
+    return MessageResponse(**result)
 
 @api_router.patch("/messages/{message_id}", response_model=MessageResponse)
-async def update_message(message_id: str, updates: MessageUpdate, current_user: dict = Depends(get_current_user)):
-    require_company_member(current_user)
-    message = await db.messages.find_one({"id": message_id, "company_id": current_user["company_id"]}, {"_id": 0})
-    if not message or message["sender_id"] != current_user["id"]:
-        raise HTTPException(status_code=404, detail="Message not found")
-
-    # "Sender may edit only before any recipient has Seen it" - checked
-    # directly against seen_at rather than the status enum, matching the
-    # spec's literal wording. role="recipient" excludes the sender's own
-    # row (their own delivered_at/seen_at reflect nothing meaningful here).
-    seen_exists = await db.message_recipients.find_one(
-        {"thread_id": message["thread_id"], "role": "recipient", "seen_at": {"$ne": None}}, {"_id": 0, "id": 1}
-    )
-    if seen_exists:
-        raise HTTPException(status_code=400, detail="لا يمكن تعديل الرسالة بعد أن شاهدها أحد المستلمين.")
-
-    changes = updates.model_dump(exclude_none=True)
-    if not changes:
-        raise HTTPException(status_code=400, detail="No valid fields to update")
-    changes["updated_at"] = datetime.now(timezone.utc).isoformat()
-    await db.messages.update_one({"id": message_id}, {"$set": changes})
-
-    updated = await db.messages.find_one({"id": message_id}, {"_id": 0})
-    result = (await enrich_messages([updated], current_user))[0]
-    return MessageResponse(**{k: v for k, v in result.items() if k != "recipient_ids"})
+async def update_message(message_id: str, updates: MessageUpdate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    result = await messages_service.update_message(pg, current_user, message_id, updates)
+    return MessageResponse(**result)
 
 @api_router.post("/messages/{message_id}/send", response_model=MessageResponse)
-async def send_draft(message_id: str, current_user: dict = Depends(get_current_user)):
-    require_company_member(current_user)
-    message = await db.messages.find_one({"id": message_id, "company_id": current_user["company_id"]}, {"_id": 0})
-    if not message or message["sender_id"] != current_user["id"]:
-        raise HTTPException(status_code=404, detail="Message not found")
-    if not message.get("is_draft"):
-        raise HTTPException(status_code=400, detail="Message has already been sent")
-
-    employee_ids, department_label = await resolve_recipients(
-        message["company_id"], message["recipient_type"], message["recipient_ids"]
-    )
-    now = datetime.now(timezone.utc).isoformat()
-    await db.messages.update_one(
-        {"id": message_id},
-        {"$set": {"is_draft": False, "recipient_department": department_label, "updated_at": now}}
-    )
-    message["is_draft"] = False
-    await deliver_message(message, employee_ids)
-
-    updated = await db.messages.find_one({"id": message_id}, {"_id": 0})
-    result = (await enrich_messages([updated], current_user))[0]
-    return MessageResponse(**{k: v for k, v in result.items() if k != "recipient_ids"})
+async def send_draft(message_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    result = await messages_service.send_draft(pg, current_user, message_id)
+    return MessageResponse(**result)
 
 @api_router.post("/messages/{message_id}/reply", response_model=MessageResponse)
-async def reply_to_message(message_id: str, data: MessageReply, current_user: dict = Depends(get_current_user)):
-    require_company_member(current_user)
-    root_or_reply = await get_accessible_message(message_id, current_user)
-    thread_id = root_or_reply["thread_id"]
-
-    # Reply-all within the thread: every existing participant row except the
-    # person replying. A structured work thread, not a 1:1 DM. Participant
-    # rows already cover the original sender too (deliver_message creates a
-    # role="sender" row), so this is a single query, not a sender+recipient
-    # union like it would need to be if the sender had no row of their own.
-    participant_rows = await db.message_recipients.find(
-        {"thread_id": thread_id}, {"_id": 0, "recipient_id": 1}
-    ).to_list(10000)
-    participant_ids = {r["recipient_id"] for r in participant_rows}
-    participant_ids.discard(current_user["id"])
-    if not participant_ids:
-        raise HTTPException(status_code=400, detail="No other participants in this thread")
-
-    root = await db.messages.find_one({"id": thread_id}, {"_id": 0})
-    subject = root["subject"] if root else root_or_reply["subject"]
-    reply_id = str(uuid.uuid4())
-    now = datetime.now(timezone.utc).isoformat()
-    reply_doc = {
-        "id": reply_id,
-        "reference_number": await next_reference_number(current_user["company_id"]),
-        "company_id": current_user["company_id"],
-        "thread_id": thread_id,
-        "parent_message_id": message_id,
-        "sender_id": current_user["id"],
-        "sender_name": current_user.get("name"),
-        "subject": subject if subject.startswith("Re: ") else f"Re: {subject}",
-        "body": data.body,
-        "priority": MessagePriority.NORMAL,
-        "confidentiality": root_or_reply.get("confidentiality", MessageConfidentiality.INTERNAL),
-        "tags": [],
-        "requires_acknowledgement": False,
-        "completion_required": False,
-        "expires_at": None,
-        "recipient_type": MessageRecipientType.EMPLOYEE,
-        "recipient_ids": list(participant_ids),
-        "recipient_department": None,
-        "is_draft": False,
-        "is_forward": False,
-        "forwarded_from_id": None,
-        "is_pinned": False,
-        "closed_at": None,
-        "created_at": now,
-        "updated_at": now,
-    }
-    await db.messages.insert_one(reply_doc)
-    await notify_reply_participants(reply_doc, thread_id, list(participant_ids))
-
-    result = (await enrich_messages([root or root_or_reply], current_user))[0]
-    return MessageResponse(**{k: v for k, v in result.items() if k != "recipient_ids"})
+async def reply_to_message(message_id: str, data: MessageReply, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    result = await messages_service.reply_to_message(pg, current_user, message_id, data)
+    return MessageResponse(**result)
 
 @api_router.post("/messages/{message_id}/forward", response_model=MessageResponse)
-async def forward_message(message_id: str, data: MessageCreate, current_user: dict = Depends(get_current_user)):
-    require_company_member(current_user)
-    original = await get_accessible_message(message_id, current_user)
-    if data.recipient_type not in (MessageRecipientType.EMPLOYEE, MessageRecipientType.DEPARTMENT):
-        raise HTTPException(status_code=400, detail="Invalid recipient type")
-
-    employee_ids, department_label = await resolve_recipients(
-        current_user["company_id"], data.recipient_type, data.recipient_ids
-    )
-    forward_id = str(uuid.uuid4())
-    now = datetime.now(timezone.utc).isoformat()
-    forward_doc = {
-        "id": forward_id,
-        "reference_number": await next_reference_number(current_user["company_id"]),
-        "company_id": current_user["company_id"],
-        "thread_id": forward_id,
-        "parent_message_id": None,
-        "sender_id": current_user["id"],
-        "sender_name": current_user.get("name"),
-        "subject": original["subject"] if original["subject"].startswith("Fwd: ") else f"Fwd: {original['subject']}",
-        "body": f"{data.body}\n\n---\n{original['body']}" if data.body else original["body"],
-        "priority": data.priority,
-        "confidentiality": original.get("confidentiality", MessageConfidentiality.INTERNAL),
-        "tags": original.get("tags", []),
-        "requires_acknowledgement": data.requires_acknowledgement,
-        "completion_required": data.completion_required,
-        "expires_at": data.expires_at,
-        "recipient_type": data.recipient_type,
-        "recipient_ids": data.recipient_ids,
-        "recipient_department": department_label,
-        "is_draft": False,
-        "is_forward": True,
-        "forwarded_from_id": message_id,
-        "is_pinned": False,
-        "closed_at": None,
-        "created_at": now,
-        "updated_at": now,
-    }
-    await db.messages.insert_one(forward_doc)
-
-    # Copy attachment metadata+data onto the new message so its access-control
-    # boundary (get_accessible_message on forward_id) stays simple - avoids a
-    # many-to-many attachment-ownership model for what should stay lightweight.
-    original_attachments = await db.message_attachments.find({"message_id": message_id}, {"_id": 0}).to_list(50)
-    for att in original_attachments:
-        await db.message_attachments.insert_one({
-            **att, "id": str(uuid.uuid4()), "message_id": forward_id, "thread_id": forward_id, "uploaded_at": now
-        })
-
-    await deliver_message(forward_doc, employee_ids)
-
-    result = (await enrich_messages([forward_doc], current_user))[0]
-    return MessageResponse(**{k: v for k, v in result.items() if k != "recipient_ids"})
-
-async def _list_messages(query: dict, current_user: dict, page: int, page_size: int, sort_field: str = "created_at"):
-    page, page_size = paginate_params(page, page_size)
-    total = await db.messages.count_documents(query)
-    docs = await db.messages.find(query, {"_id": 0}).sort([
-        ("is_pinned", -1), (sort_field, -1)
-    ]).skip((page - 1) * page_size).limit(page_size).to_list(page_size)
-    enriched = await enrich_messages(docs, current_user)
-    items = [MessageResponse(**{k: v for k, v in m.items() if k != "recipient_ids"}) for m in enriched]
-    return {"items": items, "total": total, "page": page, "page_size": page_size}
-
-def apply_common_filters(query: dict, subject: Optional[str], priority: Optional[str],
-                          tags: Optional[str], date_from: Optional[str], date_to: Optional[str]):
-    if subject:
-        query["subject"] = {"$regex": subject, "$options": "i"}
-    if priority:
-        query["priority"] = priority
-    if tags:
-        query["tags"] = {"$in": [t.strip() for t in tags.split(",") if t.strip()]}
-    if date_from or date_to:
-        date_query = {}
-        if date_from:
-            date_query["$gte"] = date_from
-        if date_to:
-            date_query["$lte"] = date_to + "T23:59:59"
-        query["created_at"] = date_query
+async def forward_message(message_id: str, data: MessageCreate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    result = await messages_service.forward_message(pg, current_user, message_id, data)
+    return MessageResponse(**result)
 
 @api_router.get("/messages/recipients")
-async def get_message_recipients(current_user: dict = Depends(get_current_user)):
+async def get_message_recipients(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     """Company-scoped directory for the Work Messages recipient picker,
-    accessible to BOTH owners and employees. The compose picker previously
-    loaded recipients from the owner-only /owner/employees endpoint, so an
-    employee's request 403'd and both the "Specific Employee" and
-    "Department" dropdowns rendered empty. This endpoint returns the same
-    company's employees plus the distinct department names among them.
-    Company isolation is enforced by the company_id filter; the id/department
-    values returned are exactly what resolve_recipients accepts at send time."""
-    require_company_member(current_user)
-    employees = await db.users.find(
-        {"company_id": current_user["company_id"], "role": UserRole.EMPLOYEE},
-        {"_id": 0, "id": 1, "name": 1, "department": 1, "position": 1}
-    ).to_list(1000)
-    departments = sorted({e["department"] for e in employees if e.get("department")})
-    return {"employees": employees, "departments": departments}
+    accessible to BOTH owners and employees."""
+    return await messages_service.get_message_recipients(pg, current_user)
 
 @api_router.get("/messages/inbox")
 async def get_inbox(
-    current_user: dict = Depends(get_current_user), page: int = 1, page_size: int = 20,
+    current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db),
+    page: int = 1, page_size: int = 20,
     subject: Optional[str] = None, priority: Optional[str] = None, tags: Optional[str] = None,
     status: Optional[str] = None, sender: Optional[str] = None,
     date_from: Optional[str] = None, date_to: Optional[str] = None, unread_only: bool = False,
 ):
-    """One row per thread, never per reply - resolved via the participant's
-    own thread-level message_recipients row, then the corresponding root
-    message (whose id always equals its own thread_id). Normal folder view
-    is scoped to role="recipient" (correct Inbox semantics - Sent items
-    don't belong here). unread_only powers the sidebar badge count instead
-    (?unread_only=true&page_size=1, reading just `total`) and deliberately
-    drops that role filter, since a new reply on a thread you SENT also
-    flips your own (role="sender") row back to unread - the badge should
-    reflect that too, not just newly-received messages."""
-    require_company_member(current_user)
-    recipient_query = {
-        "recipient_id": current_user["id"],
-        "status": {"$ne": MessageRecipientStatus.ARCHIVED},
-    }
-    if unread_only:
-        recipient_query["is_unread"] = True
-    else:
-        recipient_query["role"] = "recipient"
-    if status:
-        recipient_query["status"] = status
-    recipient_rows = await db.message_recipients.find(recipient_query, {"_id": 0, "thread_id": 1}).to_list(10000)
-    thread_ids = [r["thread_id"] for r in recipient_rows]
-    query = {"id": {"$in": thread_ids}, "company_id": current_user["company_id"]}
-    if sender:
-        query["sender_name"] = {"$regex": sender, "$options": "i"}
-    apply_common_filters(query, subject, priority, tags, date_from, date_to)
-    return await _list_messages(query, current_user, page, page_size)
+    """One row per thread, never per reply. unread_only powers the sidebar
+    badge count (?unread_only=true&page_size=1, reading just `total`) and
+    deliberately drops the role="recipient" filter, since a new reply on a
+    thread you SENT also flips your own (role="sender") row back to unread."""
+    return await messages_service.get_inbox(
+        pg, current_user, page=page, page_size=page_size, subject=subject, priority=priority, tags=tags,
+        status=status, sender=sender, date_from=date_from, date_to=date_to, unread_only=unread_only,
+    )
 
 @api_router.get("/messages/sent")
 async def get_sent(
-    current_user: dict = Depends(get_current_user), page: int = 1, page_size: int = 20,
+    current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db),
+    page: int = 1, page_size: int = 20,
     subject: Optional[str] = None, priority: Optional[str] = None, tags: Optional[str] = None,
     date_from: Optional[str] = None, date_to: Optional[str] = None,
 ):
-    require_company_member(current_user)
-    query = {"sender_id": current_user["id"], "company_id": current_user["company_id"],
-              "is_draft": False, "parent_message_id": None}
-    apply_common_filters(query, subject, priority, tags, date_from, date_to)
-    return await _list_messages(query, current_user, page, page_size)
+    return await messages_service.get_sent(
+        pg, current_user, page=page, page_size=page_size, subject=subject, priority=priority, tags=tags,
+        date_from=date_from, date_to=date_to,
+    )
 
 @api_router.get("/messages/drafts")
-async def get_drafts(current_user: dict = Depends(get_current_user), page: int = 1, page_size: int = 20):
-    require_company_member(current_user)
-    query = {"sender_id": current_user["id"], "company_id": current_user["company_id"], "is_draft": True}
-    return await _list_messages(query, current_user, page, page_size, sort_field="updated_at")
+async def get_drafts(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db), page: int = 1, page_size: int = 20):
+    return await messages_service.get_drafts(pg, current_user, page=page, page_size=page_size)
 
 @api_router.get("/messages/starred")
-async def get_starred(current_user: dict = Depends(get_current_user), page: int = 1, page_size: int = 20):
-    require_company_member(current_user)
-    recipient_rows = await db.message_recipients.find(
-        {"recipient_id": current_user["id"], "is_starred": True}, {"_id": 0, "thread_id": 1}
-    ).to_list(10000)
-    query = {"id": {"$in": [r["thread_id"] for r in recipient_rows]}, "company_id": current_user["company_id"]}
-    return await _list_messages(query, current_user, page, page_size)
+async def get_starred(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db), page: int = 1, page_size: int = 20):
+    return await messages_service.get_starred(pg, current_user, page=page, page_size=page_size)
 
 @api_router.get("/messages/archived")
-async def get_archived(current_user: dict = Depends(get_current_user), page: int = 1, page_size: int = 20):
-    require_company_member(current_user)
-    recipient_rows = await db.message_recipients.find(
-        {"recipient_id": current_user["id"], "status": MessageRecipientStatus.ARCHIVED}, {"_id": 0, "thread_id": 1}
-    ).to_list(10000)
-    query = {"id": {"$in": [r["thread_id"] for r in recipient_rows]}, "company_id": current_user["company_id"]}
-    return await _list_messages(query, current_user, page, page_size, sort_field="created_at")
+async def get_archived(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db), page: int = 1, page_size: int = 20):
+    return await messages_service.get_archived(pg, current_user, page=page, page_size=page_size)
 
 @api_router.get("/messages/{message_id}")
-async def get_message_thread(message_id: str, current_user: dict = Depends(get_current_user)):
+async def get_message_thread(message_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     """Read-only: does NOT mark as seen. The frontend calls POST .../open
     right after fetching - opening is a distinct, auditable action, not a
     side effect of a GET, matching this codebase's dedicated-action-endpoint
     convention for anything workflow-meaningful."""
-    require_company_member(current_user)
-    message = await get_accessible_message(message_id, current_user)
-    thread_id = message["thread_id"]
-
-    thread_messages = await db.messages.find({"thread_id": thread_id}, {"_id": 0}).sort("created_at", 1).to_list(1000)
-    enriched = await enrich_messages(thread_messages, current_user)
-
-    attachments = await db.message_attachments.find(
-        {"thread_id": thread_id}, {"_id": 0, "data": 0}
-    ).to_list(200)
-    attachments_by_message: Dict[str, list] = {}
-    for a in attachments:
-        attachments_by_message.setdefault(a["message_id"], []).append(a)
-
-    activity = await db.message_activity_log.find({"message_id": {"$in": [m["id"] for m in thread_messages]}}, {"_id": 0}) \
-        .sort("created_at", 1).to_list(500)
-
-    thread = [{
-        **{k: v for k, v in m.items() if k != "recipient_ids"},
-        "attachments": attachments_by_message.get(m["id"], []),
-    } for m in enriched]
-
-    return {"thread_id": thread_id, "messages": thread, "activity": activity}
+    return await messages_service.get_message_thread(pg, current_user, message_id)
 
 @api_router.post("/messages/{message_id}/open")
-async def open_message(message_id: str, current_user: dict = Depends(get_current_user)):
-    require_company_member(current_user)
-    message = await get_accessible_message(message_id, current_user)
-    recipient = await db.message_recipients.find_one(
-        {"thread_id": message["thread_id"], "recipient_id": current_user["id"]}, {"_id": 0}
-    )
-    if not recipient:
-        return {"message": "Opened"}  # should not happen given get_accessible_message already required a row
-
-    updates = {"is_unread": False}
-    if recipient["status"] == MessageRecipientStatus.DELIVERED:
-        updates["status"] = MessageRecipientStatus.SEEN
-        updates["seen_at"] = datetime.now(timezone.utc).isoformat()
-    await db.message_recipients.update_one({"id": recipient["id"]}, {"$set": updates})
-
-    if "seen_at" in updates and recipient["role"] == "recipient":
-        await write_message_activity(current_user["company_id"], message_id, current_user, "opened", message["subject"])
-    return {"message": "Opened"}
+async def open_message(message_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await messages_service.open_message(pg, current_user, message_id)
 
 @api_router.post("/messages/{message_id}/accept")
-async def accept_message(message_id: str, current_user: dict = Depends(get_current_user)):
-    require_company_member(current_user)
-    message = await get_accessible_message(message_id, current_user)
-    if message["sender_id"] == current_user["id"]:
-        raise HTTPException(status_code=400, detail="A sender cannot accept their own message")
-    if not message.get("requires_acknowledgement"):
-        raise HTTPException(status_code=400, detail="This message does not require acknowledgement")
-    recipient = await db.message_recipients.find_one(
-        {"thread_id": message["thread_id"], "recipient_id": current_user["id"], "role": "recipient"}, {"_id": 0}
-    )
-    if not recipient:
-        raise HTTPException(status_code=404, detail="Message not found")
-    if recipient["status"] not in (MessageRecipientStatus.DELIVERED, MessageRecipientStatus.SEEN):
-        raise HTTPException(status_code=400, detail="Message already acknowledged or beyond that stage")
-
-    now = datetime.now(timezone.utc).isoformat()
-    await db.message_recipients.update_one(
-        {"id": recipient["id"]},
-        {"$set": {"status": MessageRecipientStatus.ACCEPTED, "accepted_at": now,
-                   "seen_at": recipient["seen_at"] or now, "is_unread": False}}
-    )
-    await write_message_activity(current_user["company_id"], message_id, current_user, "accepted", message["subject"])
-    return {"message": "Accepted"}
+async def accept_message(message_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await messages_service.accept_message(pg, current_user, message_id)
 
 @api_router.post("/messages/{message_id}/complete")
-async def complete_message(message_id: str, current_user: dict = Depends(get_current_user)):
-    require_company_member(current_user)
-    message = await get_accessible_message(message_id, current_user)
-    if message["sender_id"] == current_user["id"]:
-        raise HTTPException(status_code=400, detail="A sender cannot complete their own message")
-    if not message.get("completion_required"):
-        raise HTTPException(status_code=400, detail="This message does not require completion")
-    recipient = await db.message_recipients.find_one(
-        {"thread_id": message["thread_id"], "recipient_id": current_user["id"], "role": "recipient"}, {"_id": 0}
-    )
-    if not recipient:
-        raise HTTPException(status_code=404, detail="Message not found")
-    if recipient["status"] == MessageRecipientStatus.COMPLETED:
-        raise HTTPException(status_code=400, detail="Already completed")
-    if message.get("requires_acknowledgement") and recipient["status"] not in (
-        MessageRecipientStatus.ACCEPTED, MessageRecipientStatus.COMPLETED
-    ):
-        raise HTTPException(status_code=400, detail="This message must be accepted before it can be completed")
-
-    now = datetime.now(timezone.utc).isoformat()
-    await db.message_recipients.update_one(
-        {"id": recipient["id"]},
-        {"$set": {"status": MessageRecipientStatus.COMPLETED, "completed_at": now,
-                   "seen_at": recipient["seen_at"] or now, "is_unread": False}}
-    )
-    await write_message_activity(current_user["company_id"], message_id, current_user, "completed", message["subject"])
-    return {"message": "Completed"}
+async def complete_message(message_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await messages_service.complete_message(pg, current_user, message_id)
 
 @api_router.post("/messages/{message_id}/archive")
-async def archive_message(message_id: str, current_user: dict = Depends(get_current_user)):
-    require_company_member(current_user)
-    message = await get_accessible_message(message_id, current_user)
-    recipient = await db.message_recipients.find_one(
-        {"thread_id": message["thread_id"], "recipient_id": current_user["id"]}, {"_id": 0}
-    )
-    if not recipient:
-        raise HTTPException(status_code=404, detail="Message not found")
-
-    # Archive is a personal-view state, never a deletion - the row (and every
-    # timestamp on it) is preserved permanently, satisfying "not even by
-    # Company Owner" since no delete path exists anywhere for this collection.
-    # Works for the sender's own row too, so a sent thread can be archived
-    # from Sent exactly like a recipient archives it from Inbox.
-    await db.message_recipients.update_one(
-        {"id": recipient["id"]},
-        {"$set": {"status": MessageRecipientStatus.ARCHIVED, "archived_at": datetime.now(timezone.utc).isoformat()}}
-    )
-    await write_message_activity(current_user["company_id"], message_id, current_user, "archived", message["subject"])
-    return {"message": "Archived"}
+async def archive_message(message_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await messages_service.archive_message(pg, current_user, message_id)
 
 @api_router.post("/messages/{message_id}/unread")
-async def mark_message_unread(message_id: str, current_user: dict = Depends(get_current_user)):
-    require_company_member(current_user)
-    message = await get_accessible_message(message_id, current_user)
-    result = await db.message_recipients.update_one(
-        {"thread_id": message["thread_id"], "recipient_id": current_user["id"]},
-        {"$set": {"is_unread": True}}
-    )
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Message not found")
-    return {"message": "Marked as unread"}
+async def mark_message_unread(message_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await messages_service.mark_message_unread(pg, current_user, message_id)
 
 @api_router.post("/messages/{message_id}/star")
-async def toggle_star_message(message_id: str, current_user: dict = Depends(get_current_user)):
-    require_company_member(current_user)
-    message = await get_accessible_message(message_id, current_user)
-    recipient = await db.message_recipients.find_one(
-        {"thread_id": message["thread_id"], "recipient_id": current_user["id"]}, {"_id": 0}
-    )
-    if not recipient:
-        raise HTTPException(status_code=404, detail="Message not found")
-    new_value = not recipient.get("is_starred", False)
-    await db.message_recipients.update_one({"id": recipient["id"]}, {"$set": {"is_starred": new_value}})
-    return {"message": "Starred" if new_value else "Unstarred", "is_starred": new_value}
+async def toggle_star_message(message_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await messages_service.toggle_star_message(pg, current_user, message_id)
 
 @api_router.post("/messages/{message_id}/close")
-async def close_message(message_id: str, current_user: dict = Depends(get_current_user)):
-    require_company_member(current_user)
-    message = await db.messages.find_one({"id": message_id, "company_id": current_user["company_id"]}, {"_id": 0})
-    if not message or message["sender_id"] != current_user["id"]:
-        raise HTTPException(status_code=404, detail="Message not found")
-    if message.get("closed_at"):
-        raise HTTPException(status_code=400, detail="Thread already closed")
-
-    now = datetime.now(timezone.utc).isoformat()
-    await db.messages.update_one({"id": message_id}, {"$set": {"closed_at": now, "updated_at": now}})
-    await write_message_activity(current_user["company_id"], message_id, current_user, "closed", message["subject"])
-    return {"message": "Thread closed"}
+async def close_message(message_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await messages_service.close_message(pg, current_user, message_id)
 
 @api_router.post("/owner/messages/{message_id}/pin")
-async def toggle_pin_message(message_id: str, current_user: dict = Depends(get_current_user)):
-    if current_user["role"] != UserRole.COMPANY_OWNER:
-        raise HTTPException(status_code=403, detail="Access denied")
-    message = await db.messages.find_one({"id": message_id, "company_id": current_user["company_id"]}, {"_id": 0})
-    if not message:
-        raise HTTPException(status_code=404, detail="Message not found")
-
-    new_value = not message.get("is_pinned", False)
-    await db.messages.update_one({"id": message_id}, {"$set": {"is_pinned": new_value}})
-    return {"message": "Pinned" if new_value else "Unpinned", "is_pinned": new_value}
+async def toggle_pin_message(message_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await messages_service.toggle_pin_message(pg, current_user, message_id)
 
 @api_router.post("/messages/{message_id}/attachments")
-async def upload_message_attachment(message_id: str, data: AttachmentUpload, current_user: dict = Depends(get_current_user)):
-    require_company_member(current_user)
-    message = await db.messages.find_one({"id": message_id, "company_id": current_user["company_id"]}, {"_id": 0})
-    if not message or message["sender_id"] != current_user["id"]:
-        raise HTTPException(status_code=404, detail="Message not found")
-
-    # Same client-side-base64-encode contract as task proof_files (the only
-    # upload mechanism this codebase has) - just stored as its own document
-    # instead of inline on the parent, so listing messages never has to pull
-    # attachment payloads across the wire.
-    raw = data.data.split(",", 1)[-1] if data.data.startswith("data:") else data.data
-    try:
-        decoded_size = len(base64.b64decode(raw, validate=False))
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid file data")
-    if decoded_size > MAX_ATTACHMENT_BYTES:
-        raise HTTPException(status_code=400, detail=f"File exceeds the {MAX_ATTACHMENT_BYTES // (1024*1024)}MB limit")
-
-    attachment_id = str(uuid.uuid4())
-    await db.message_attachments.insert_one({
-        "id": attachment_id,
-        "message_id": message_id,
-        "thread_id": message["thread_id"],
-        "company_id": current_user["company_id"],
-        "filename": data.filename,
-        "mime_type": data.mime_type,
-        "attachment_type": classify_attachment_type(data.mime_type),
-        "data": data.data,
-        "size_bytes": decoded_size,
-        "uploaded_at": datetime.now(timezone.utc).isoformat(),
-    })
-    return {"id": attachment_id, "filename": data.filename, "attachment_type": classify_attachment_type(data.mime_type), "size_bytes": decoded_size}
+async def upload_message_attachment(message_id: str, data: AttachmentUpload, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await messages_service.upload_message_attachment(pg, current_user, message_id, data)
 
 @api_router.get("/message-attachments/{attachment_id}")
-async def get_message_attachment(attachment_id: str, current_user: dict = Depends(get_current_user)):
-    require_company_member(current_user)
-    attachment = await db.message_attachments.find_one({"id": attachment_id}, {"_id": 0})
-    if not attachment or attachment["company_id"] != current_user["company_id"]:
-        raise HTTPException(status_code=404, detail="Attachment not found")
-    # Lazy-load boundary: the actual base64 payload is only ever returned
-    # from this one dedicated endpoint, never from any list/thread response.
-    await get_accessible_message(attachment["message_id"], current_user)
-    return attachment
+async def get_message_attachment(attachment_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await messages_service.get_message_attachment(pg, current_user, attachment_id)
 
 @api_router.post("/messages/{message_id}/reminder")
-async def create_reminder(message_id: str, data: ReminderCreate, current_user: dict = Depends(get_current_user)):
-    require_company_member(current_user)
-    await get_accessible_message(message_id, current_user)
-
-    if data.preset:
-        if data.preset not in REMINDER_PRESETS:
-            raise HTTPException(status_code=400, detail="Invalid reminder preset")
-        if data.preset == "tomorrow":
-            tomorrow = datetime.now(timezone.utc) + timedelta(days=1)
-            remind_at = tomorrow.replace(hour=9, minute=0, second=0, microsecond=0).isoformat()
-        else:
-            remind_at = (datetime.now(timezone.utc) + REMINDER_PRESETS[data.preset]).isoformat()
-    elif data.remind_at:
-        remind_at = data.remind_at
-    else:
-        raise HTTPException(status_code=400, detail="Provide a preset or an explicit remind_at")
-
-    reminder_id = str(uuid.uuid4())
-    await db.message_reminders.insert_one({
-        "id": reminder_id,
-        "message_id": message_id,
-        "user_id": current_user["id"],
-        "company_id": current_user["company_id"],
-        "remind_at": remind_at,
-        "notified_at": None,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    })
-    # Reminders notify only the requesting user - never inserted for anyone
-    # else, satisfying "reminder only notifies the current user" by construction.
-    return {"id": reminder_id, "remind_at": remind_at}
+async def create_reminder(message_id: str, data: ReminderCreate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await messages_service.create_reminder(pg, current_user, message_id, data)
 
 @api_router.get("/owner/messages/communication-center")
 async def get_communication_center(
-    current_user: dict = Depends(get_current_user), page: int = 1, page_size: int = 20,
+    current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db),
+    page: int = 1, page_size: int = 20,
     reference_number: Optional[str] = None, subject: Optional[str] = None, sender: Optional[str] = None,
     recipient: Optional[str] = None, department: Optional[str] = None, tags: Optional[str] = None,
     priority: Optional[str] = None, status: Optional[str] = None, attachment_type: Optional[str] = None,
@@ -2836,82 +2128,15 @@ async def get_communication_center(
     Part 'Search & Filters' plus 'Owner Visibility'. Confidentiality is
     stored/displayed but does not restrict this view, matching the explicit
     'for future permission expansion' scope."""
-    if current_user["role"] != UserRole.COMPANY_OWNER:
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    # Root threads only - a reply never appears as its own row here, matching
-    # every other list view. "Replies" is instead the reply_count column.
-    query = {"company_id": current_user["company_id"], "parent_message_id": None}
-    if reference_number:
-        query["reference_number"] = {"$regex": reference_number, "$options": "i"}
-    if department:
-        query["recipient_department"] = department
-    apply_common_filters(query, subject, priority, tags, date_from, date_to)
-
-    if sender:
-        query["sender_name"] = {"$regex": sender, "$options": "i"}
-
-    def intersect_ids(existing_query: dict, candidate_ids: set):
-        if "id" in existing_query:
-            existing_query["id"]["$in"] = [i for i in existing_query["id"]["$in"] if i in candidate_ids]
-        else:
-            existing_query["id"] = {"$in": list(candidate_ids)}
-
-    status_filters_recipients = bool(status) and status != "closed"
-    if recipient or status_filters_recipients:
-        recipient_query = {"company_id": current_user["company_id"], "role": "recipient"}
-        if recipient:
-            recipient_query["recipient_name"] = {"$regex": recipient, "$options": "i"}
-        if status_filters_recipients:
-            recipient_query["status"] = status
-        matching_rows = await db.message_recipients.find(recipient_query, {"_id": 0, "thread_id": 1}).to_list(10000)
-        intersect_ids(query, {r["thread_id"] for r in matching_rows})
-
-    if status == "closed":
-        query["closed_at"] = {"$ne": None}
-
-    if attachment_type:
-        matching_attachments = await db.message_attachments.find(
-            {"company_id": current_user["company_id"], "attachment_type": attachment_type}, {"_id": 0, "thread_id": 1}
-        ).to_list(10000)
-        intersect_ids(query, {a["thread_id"] for a in matching_attachments})
-
-    return await _list_messages(query, current_user, page, page_size)
+    return await messages_service.get_communication_center(
+        pg, current_user, page=page, page_size=page_size, reference_number=reference_number, subject=subject,
+        sender=sender, recipient=recipient, department=department, tags=tags, priority=priority, status=status,
+        attachment_type=attachment_type, date_from=date_from, date_to=date_to,
+    )
 
 @api_router.get("/owner/messages/{message_id}/timeline")
-async def get_message_timeline(message_id: str, current_user: dict = Depends(get_current_user)):
-    if current_user["role"] != UserRole.COMPANY_OWNER:
-        raise HTTPException(status_code=403, detail="Access denied")
-    message = await db.messages.find_one({"id": message_id, "company_id": current_user["company_id"]}, {"_id": 0})
-    if not message:
-        raise HTTPException(status_code=404, detail="Message not found")
-
-    thread_message_ids = await db.messages.find(
-        {"thread_id": message["thread_id"]}, {"_id": 0, "id": 1}
-    ).to_list(1000)
-    activity = await db.message_activity_log.find(
-        {"message_id": {"$in": [m["id"] for m in thread_message_ids]}}, {"_id": 0}
-    ).to_list(500)
-    events = [{"timestamp": a["created_at"], "label": a["verb"], "actor_name": a["actor_name"]} for a in activity]
-
-    # "Delivered" is synthesized from message_recipients rather than logged as
-    # its own activity entry per recipient - delivery is immediate/automatic
-    # today, so this avoids storing a redundant row for every send. The
-    # sender's own row is excluded (it isn't a "delivery" to anyone).
-    recipients = await db.message_recipients.find(
-        {"thread_id": message["thread_id"], "role": "recipient"}, {"_id": 0}
-    ).to_list(1000)
-    for r in recipients:
-        if r.get("delivered_at"):
-            events.append({"timestamp": r["delivered_at"], "label": "delivered", "actor_name": r["recipient_name"]})
-
-    events.sort(key=lambda e: e["timestamp"])
-    return {
-        "message_id": message_id,
-        "reference_number": message["reference_number"],
-        "delivery_progress": await compute_delivery_progress(message["thread_id"]),
-        "events": events,
-    }
+async def get_message_timeline(message_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await messages_service.get_message_timeline(pg, current_user, message_id)
 
 # ============ Calendar Routes ============
 # Fully independent of Work Messaging Routes above - own collections, own
@@ -3499,10 +2724,14 @@ async def open_conversation(event_id: str, current_user: dict = Depends(get_curr
         recipient_type=MessageRecipientType.EMPLOYEE,
         recipient_ids=other_ids,
     )
-    # Direct function call into the existing, unmodified Work Messages
-    # handler - current_user's own role (owner or employee) already
-    # satisfies its own require_company_member check. Returns a
-    # MessageResponse Pydantic instance, same as calling the route over HTTP.
+    # Direct function call into the Work Messages route handler. Unreachable
+    # today: this whole endpoint is still Mongo-backed above this point and
+    # already 503s at get_accessible_calendar_event before reaching here
+    # (MongoDB has no live instance). create_message's signature now also
+    # requires an injected `pg` session (Module 8/Messaging migrated to
+    # Postgres) that a direct call like this can't supply - must be fixed to
+    # call messages_service.create_message(pg, ...) directly when Calendar
+    # migrates (Module 9).
     created = await create_message(message, current_user)
     thread_id = created.thread_id
 

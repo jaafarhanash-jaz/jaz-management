@@ -1,9 +1,18 @@
+import uuid
 from typing import List
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import Message, MessageReminder
+
+
+async def create(db: AsyncSession, **fields) -> MessageReminder:
+    fields.setdefault("id", uuid.uuid4())
+    reminder = MessageReminder(**fields)
+    db.add(reminder)
+    await db.flush()
+    return reminder
 
 
 async def list_due(db: AsyncSession, user_id, now) -> List[MessageReminder]:

@@ -135,3 +135,24 @@ async def get_employee_in_company(db: AsyncSession, employee_id, company_id) -> 
         )
     )
     return result.scalar_one_or_none()
+
+
+async def list_employees_by_company_and_department(db: AsyncSession, company_id, department: str) -> List[User]:
+    result = await db.execute(
+        select(User).where(
+            User.company_id == company_id, User.role == "employee",
+            User.department == department, User.deleted_at.is_(None),
+        )
+    )
+    return list(result.scalars().all())
+
+
+async def count_matching_ids_in_company(db: AsyncSession, ids, company_id) -> int:
+    """No role filter, matching the old Mongo membership check exactly -
+    any user (owner or employee) belonging to the company counts."""
+    if not ids:
+        return 0
+    result = await db.execute(
+        select(func.count()).select_from(User).where(User.id.in_(list(ids)), User.company_id == company_id)
+    )
+    return result.scalar_one()
