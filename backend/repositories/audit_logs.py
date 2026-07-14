@@ -25,6 +25,19 @@ async def list_for_company(db: AsyncSession, company_id, entity_type: str, limit
     return list(result.scalars().all())
 
 
+async def list_for_entity_desc(db: AsyncSession, entity_type: str, entity_id, limit: int = 200) -> List[AuditLog]:
+    """Most-recent-first activity for a single entity - e.g. one calendar
+    event's activity log page, matching the old per-collection descending
+    sort order."""
+    result = await db.execute(
+        select(AuditLog)
+        .where(AuditLog.entity_type == entity_type, AuditLog.entity_id == entity_id)
+        .order_by(AuditLog.created_at.desc())
+        .limit(limit)
+    )
+    return list(result.scalars().all())
+
+
 async def list_for_entities(db: AsyncSession, entity_type: str, entity_ids, limit: int = 500) -> List[AuditLog]:
     """Chronological (oldest first) activity for a specific set of entities
     - e.g. every message id in one thread - matching the old activity-log

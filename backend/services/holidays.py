@@ -1,17 +1,30 @@
-from datetime import date as date_type
+from datetime import date as date_type, datetime, timezone
 from typing import List, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import repositories.calendar_events as calendar_events_repo
 import repositories.companies as companies_repo
+from services.calendar_occurrences import expand_event_occurrences
 
 
 async def is_company_holiday(db: AsyncSession, company_id, date_: date_type) -> Optional[dict]:
-    holidays = await calendar_events_repo.list_company_holidays_covering(db, company_id, date_)
-    if not holidays:
+    """Broad DB pre-filter (list_active_holiday_candidates_covering), then a
+    precise per-date check via expand_event_occurrences - recurring holidays
+    (e.g. a permanent weekly Friday holiday) only match candidate rows whose
+    base start_date is on/before date_, so this correctly evaluates every
+    later occurrence of the series, not just its first."""
+    candidates = await calendar_events_repo.list_active_holiday_candidates_covering(db, company_id, date_)
+    if not candidates:
         return None
-    return {"id": str(holidays[0].id), "title": holidays[0].title}
+    day_start = datetime.combine(date_, datetime.min.time(), tzinfo=timezone.utc)
+    day_end = datetime.combine(date_, datetime.max.time(), tzinfo=timezone.utc)
+    date_str = date_.isoformat()
+    for holiday in candidates:
+        for occ in await expand_event_occurrences(db, holiday, day_start, day_end):
+            if occ["occurrence_date"] == date_str:
+                return {"id": str(holiday.id), "title": holiday.title}
+    return None
 
 
 async def is_weekly_holiday(db: AsyncSession, company_id, date_: date_type) -> bool:

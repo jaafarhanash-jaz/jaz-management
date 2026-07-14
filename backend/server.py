@@ -28,6 +28,7 @@ import repositories.users as users_repo
 import services.admin as admin_service
 import services.attendance as attendance_service
 import services.auth as auth_service
+import services.calendar as calendar_service
 import services.departments as departments_service
 import services.employees as employees_service
 import services.heartbeat as heartbeat_service
@@ -149,19 +150,6 @@ class MessageRecipientStatus:
     COMPLETED = "completed"
     ARCHIVED = "archived"
 
-class AttachmentType:
-    IMAGE = "image"
-    PDF = "pdf"
-    WORD = "word"
-    EXCEL = "excel"
-    POWERPOINT = "powerpoint"
-    ZIP = "zip"
-    AUDIO = "audio"
-    VIDEO = "video"
-    OTHER = "other"
-
-MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024  # 10MB decoded size cap
-
 class EventCategory:
     MEETING = "meeting"
     COMPANY_HOLIDAY = "company_holiday"
@@ -245,13 +233,6 @@ class EventEditScope:
     THIS_EVENT_ONLY = "this_event_only"
     THIS_AND_FUTURE = "this_and_future"
     ENTIRE_SERIES = "entire_series"
-
-CALENDAR_REMINDER_PRESETS = {
-    "5m": timedelta(minutes=5), "15m": timedelta(minutes=15), "30m": timedelta(minutes=30),
-    "1h": timedelta(hours=1), "6h": timedelta(hours=6), "1d": timedelta(days=1),
-    "3d": timedelta(days=3), "1w": timedelta(weeks=1),
-}
-CALENDAR_CONFLICT_LOOKAHEAD_DAYS = 90  # bounded recurrence expansion for conflict checks
 
 # ============ Request/Response Models ============
 
@@ -781,24 +762,11 @@ def classify_attachment_type(mime_type: str) -> str:
 # message_attachments,counters}.py.
 
 # ---- Calendar helpers ----
-# Deliberately independent of every Work Messaging helper above (own
-# collections, own counter namespace, own attachment collection) even where
-# the shape is identical - Work Messages is on the do-not-modify list, so
-# nothing here calls into or alters it. classify_attachment_type and
-# MAX_ATTACHMENT_BYTES are reused as-is (pure, unmodified, side-effect-free)
-# since reusing a pure function isn't modifying the feature that also uses it.
-
-async def next_calendar_reference_number(company_id: str) -> str:
-    """Same atomic find-and-increment pattern as messaging's reference
-    numbers, deliberately reimplemented (not called) to avoid touching
-    Work Messages' next_reference_number - own counter key, own prefix."""
-    counter = await db.counters.find_one_and_update(
-        {"id": f"calendar_seq:{company_id}"},
-        {"$inc": {"value": 1}},
-        upsert=True,
-        return_document=ReturnDocument.AFTER,
-    )
-    return f"CAL-{counter['value']:06d}"
+# create/update/cancel/notify/access-check/conflict-check moved to
+# services/calendar.py (Postgres-backed). combine_event_datetime,
+# get_working_hours, step_occurrence, expand_event_occurrences, and the
+# holiday-check chain below stay here - the not-yet-migrated owner/employee
+# dashboard and analytics routes still call into them directly.
 
 def combine_event_datetime(date_str: str, time_str: Optional[str], all_day: bool, is_end: bool) -> datetime:
     if all_day:
@@ -818,42 +786,6 @@ async def get_working_hours(company_id: str) -> dict:
         "end_time": stored.get("end_time", "17:00"),
     }
 
-async def resolve_calendar_recipients(company_id: str, recipient_type: str, recipient_ids: List[str], owner_id: Optional[str]) -> List[str]:
-    """Fan-out at creation time, same snapshot-at-send convention already
-    used everywhere else in this codebase. 'company' (every employee) and
-    multi-department are both real, working options now - not just
-    architecture placeholders - since Company Holidays require them."""
-    if recipient_type == EventRecipientType.OWNER:
-        return [owner_id] if owner_id else []
-    if recipient_type == EventRecipientType.COMPANY:
-        employees = await db.users.find({"company_id": company_id, "role": UserRole.EMPLOYEE}, {"_id": 0, "id": 1}).to_list(10000)
-        ids = [e["id"] for e in employees]
-        return ids + ([owner_id] if owner_id else [])
-    if recipient_type == EventRecipientType.DEPARTMENT:
-        if not recipient_ids:
-            raise HTTPException(status_code=400, detail="At least one department is required")
-        employees = await db.users.find(
-            {"company_id": company_id, "role": UserRole.EMPLOYEE, "department": {"$in": recipient_ids}},
-            {"_id": 0, "id": 1}
-        ).to_list(10000)
-        if not employees:
-            raise HTTPException(status_code=400, detail="No employees found in the selected department(s)")
-        return [e["id"] for e in employees]
-    if recipient_type == EventRecipientType.OWNER_PLUS_EMPLOYEES:
-        if not recipient_ids:
-            raise HTTPException(status_code=400, detail="At least one employee is required")
-        valid = await db.users.count_documents({"id": {"$in": recipient_ids}, "company_id": company_id})
-        if valid != len(set(recipient_ids)):
-            raise HTTPException(status_code=400, detail="One or more participants do not belong to your company")
-        return list(set(recipient_ids)) + ([owner_id] if owner_id else [])
-    # EMPLOYEE (single or multiple)
-    if not recipient_ids:
-        raise HTTPException(status_code=400, detail="At least one participant is required")
-    valid = await db.users.count_documents({"id": {"$in": recipient_ids}, "company_id": company_id})
-    if valid != len(set(recipient_ids)):
-        raise HTTPException(status_code=400, detail="One or more participants do not belong to your company")
-    return list(set(recipient_ids))
-
 def step_occurrence(dt: datetime, recurrence_type: str, interval: int) -> datetime:
     interval = max(interval, 1)
     if recurrence_type == RecurrenceType.DAILY or recurrence_type == RecurrenceType.CUSTOM:
@@ -870,24 +802,6 @@ def step_occurrence(dt: datetime, recurrence_type: str, interval: int) -> dateti
 # never a runaway loop, and consistent with "never load an entire year":
 # expansion itself never generates more than this many candidate occurrences.
 MAX_OCCURRENCE_ITERATIONS = 3660
-
-def count_raw_occurrences_before(event: dict, cutoff: datetime) -> int:
-    """Counts scheduled recurrence SLOTS before cutoff, ignoring exceptions -
-    used only for this_and_future's after_count budget split. A cancelled
-    occurrence still consumed one of the original N slots; it must not free
-    up budget for an extra occurrence the series was never meant to have.
-    (expand_event_occurrences is exception-aware and would undercount here.)"""
-    base_start = combine_event_datetime(event["start_date"], event.get("start_time"), event["all_day"], False)
-    if event.get("recurrence_type", RecurrenceType.NONE) == RecurrenceType.NONE:
-        return 1 if base_start < cutoff else 0
-    cursor = base_start
-    count = 0
-    iterations = 0
-    while cursor < cutoff and iterations < MAX_OCCURRENCE_ITERATIONS:
-        iterations += 1
-        count += 1
-        cursor = step_occurrence(cursor, event["recurrence_type"], event.get("recurrence_interval", 1))
-    return count
 
 async def expand_event_occurrences(event: dict, range_start: datetime, range_end: datetime) -> List[dict]:
     """Occurrences are computed on read for the requested window only -
@@ -938,162 +852,6 @@ async def expand_event_occurrences(event: dict, range_start: datetime, range_end
         merged["has_exception"] = exception is not None
         result.append(merged)
     return result
-
-async def write_calendar_activity(company_id: str, event_id: str, actor: dict, verb: str, event_title: str):
-    """Own collection, append-only, event-only (never description/attachments/
-    notes) - same convention as message_activity_log, deliberately not
-    shared with it."""
-    await db.calendar_activity_log.insert_one({
-        "id": str(uuid.uuid4()),
-        "company_id": company_id,
-        "event_id": event_id,
-        "actor_id": actor.get("id"),
-        "actor_name": actor.get("name"),
-        "verb": verb,
-        "event_title": event_title,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    })
-
-CALENDAR_NOTIFICATION_COPY = {
-    "created": ("موعد جديد", "تمت دعوتك إلى: {title}"),
-    "updated": ("تحديث موعد", "تم تحديث: {title}"),
-    "time_changed": ("تغيير موعد", "تم تغيير وقت: {title}"),
-    "location_changed": ("تغيير مكان", "تم تغيير مكان: {title}"),
-    "cancelled": ("إلغاء موعد", "تم إلغاء: {title}"),
-    "attachment_added": ("مرفق جديد", "تمت إضافة مرفق إلى: {title}"),
-    "reminder": ("تذكير بموعد", "تذكير: {title}"),
-    "owner_created": ("موعد جديد بواسطة موظف", "تم إنشاء موعد يتضمنك: {title}"),
-    "accepted": ("تم القبول", "قَبِل {actor_name} دعوة: {title}"),
-    "declined": ("تم الرفض", "رفض {actor_name} دعوة: {title}"),
-    "tentative": ("رد مبدئي", "رد {actor_name} بشكل مبدئي على: {title}"),
-    "all_responded": ("اكتمال الردود", "استجاب جميع المدعوين إلى: {title}"),
-}
-
-async def notify_for_calendar_event(event: dict, verb: str, participant_ids: List[str], actor: Optional[dict] = None, notify_owner_too: bool = False):
-    """Single dispatch point for every calendar notification - the seam
-    where a future email/push channel would plug in without touching any
-    caller. Deduplicates recipients (never double-notifies the Owner if
-    they're also a participant) and never reaches outside company_id."""
-    title_template, message_template = CALENDAR_NOTIFICATION_COPY.get(verb, ("تحديث موعد", "{title}"))
-    recipients = set(participant_ids)
-    if notify_owner_too:
-        company = await db.companies.find_one({"id": event["company_id"]}, {"_id": 0, "owner_id": 1})
-        if company:
-            recipients.add(company["owner_id"])
-    recipients.discard((actor or {}).get("id"))  # never notify the person who caused their own event
-
-    now = datetime.now(timezone.utc).isoformat()
-    for user_id in recipients:
-        await db.notifications.insert_one({
-            "id": str(uuid.uuid4()),
-            "user_id": user_id,
-            "company_id": event["company_id"],
-            "type": f"calendar_{verb}",
-            "title": title_template,
-            "message": message_template.format(title=event.get("title", ""), actor_name=(actor or {}).get("name", "")),
-            "read_status": False,
-            "created_at": now,
-        })
-
-async def get_accessible_calendar_event(event_id: str, current_user: dict) -> dict:
-    """Read access: creator, an actual participant, the company Owner
-    (always - matches the 'Owner sees everything' oversight model already
-    established for Communication Center), or anyone the event's own
-    visibility level opens it to."""
-    event = await db.calendar_events.find_one({"id": event_id}, {"_id": 0})
-    if not event or event["company_id"] != current_user.get("company_id"):
-        raise HTTPException(status_code=404, detail="Event not found")
-
-    if current_user["role"] == UserRole.COMPANY_OWNER:
-        return event
-    if event["created_by"] == current_user["id"]:
-        return event
-    participant = await db.calendar_event_participants.find_one(
-        {"event_id": event_id, "participant_id": current_user["id"]}, {"_id": 0, "id": 1}
-    )
-    if participant:
-        return event
-
-    visibility = event.get("visibility", EventVisibility.COMPANY)
-    if visibility == EventVisibility.COMPANY:
-        return event
-    if visibility == EventVisibility.DEPARTMENT:
-        participant_depts = {p["department"] for p in await db.calendar_event_participants.find(
-            {"event_id": event_id}, {"_id": 0, "department": 1}
-        ).to_list(1000) if p.get("department")}
-        if current_user.get("department") in participant_depts:
-            return event
-
-    raise HTTPException(status_code=404, detail="Event not found")
-
-async def check_calendar_conflicts(company_id: str, participant_ids: List[str], start_dt: datetime, end_dt: datetime,
-                                    all_day: bool, exclude_event_id: Optional[str] = None) -> List[dict]:
-    """Bounded 90-day lookahead, never a full-collection scan. All-day events
-    only conflict with other all-day events, per spec."""
-    window_end = min(end_dt, start_dt + timedelta(days=CALENDAR_CONFLICT_LOOKAHEAD_DAYS))
-    candidate_query = {
-        "company_id": company_id,
-        "status": {"$ne": "cancelled"},
-        "start_date": {"$lte": window_end.date().isoformat()},
-        "end_date": {"$gte": start_dt.date().isoformat()},
-    }
-    if exclude_event_id:
-        candidate_query["id"] = {"$ne": exclude_event_id}
-    if all_day:
-        candidate_query["all_day"] = True
-
-    candidates = await db.calendar_events.find(candidate_query, {"_id": 0}).to_list(500)
-    if not candidates:
-        return []
-
-    candidate_ids = [c["id"] for c in candidates]
-    participant_rows = await db.calendar_event_participants.find(
-        {"event_id": {"$in": candidate_ids}, "participant_id": {"$in": participant_ids}}, {"_id": 0}
-    ).to_list(5000)
-    rows_by_event: Dict[str, list] = {}
-    for r in participant_rows:
-        rows_by_event.setdefault(r["event_id"], []).append(r)
-
-    conflicts = []
-    for candidate in candidates:
-        involved = rows_by_event.get(candidate["id"], [])
-        if candidate.get("created_by") in participant_ids:
-            involved = involved or [{"participant_name": candidate.get("created_by_name")}]
-        if not involved:
-            continue
-        for occ in await expand_event_occurrences(candidate, start_dt, window_end):
-            occ_start, occ_end = datetime.fromisoformat(occ["occurrence_start"]), datetime.fromisoformat(occ["occurrence_end"])
-            if occ_start < end_dt and occ_end > start_dt:
-                conflicts.append({
-                    "event_id": candidate["id"], "title": candidate["title"],
-                    "occurrence_date": occ["occurrence_date"],
-                    "participants": [p.get("participant_name") for p in involved if p.get("participant_name")],
-                })
-                break
-    return conflicts
-
-async def check_holiday_conflict(company_id: str, start_dt: datetime, end_dt: datetime) -> Optional[dict]:
-    holidays = await db.calendar_events.find({
-        "company_id": company_id, "category": EventCategory.COMPANY_HOLIDAY, "status": {"$ne": "cancelled"},
-        "start_date": {"$lte": end_dt.date().isoformat()}, "end_date": {"$gte": start_dt.date().isoformat()},
-    }, {"_id": 0}).to_list(50)
-    for holiday in holidays:
-        for occ in await expand_event_occurrences(holiday, start_dt, end_dt):
-            occ_start, occ_end = datetime.fromisoformat(occ["occurrence_start"]), datetime.fromisoformat(occ["occurrence_end"])
-            if occ_start < end_dt and occ_end > start_dt:
-                return {"event_id": holiday["id"], "title": holiday["title"], "occurrence_date": occ["occurrence_date"]}
-    return None
-
-def next_date_for_weekday(target_weekday_sunday0: int, from_date: Optional[date] = None) -> str:
-    """target_weekday_sunday0: 0=Sunday..6=Saturday, same convention as
-    working_hours.working_days. Returns the next date on/after from_date
-    (default today) that falls on that weekday, as YYYY-MM-DD - used to seed
-    a weekly-recurring holiday's start_date so the existing recurrence
-    machinery (step_occurrence) naturally repeats on the right day."""
-    anchor = from_date or datetime.now(timezone.utc).date()
-    anchor_sunday0 = (anchor.weekday() + 1) % 7  # date.weekday(): Mon=0..Sun=6
-    days_ahead = (target_weekday_sunday0 - anchor_sunday0) % 7
-    return (anchor + timedelta(days=days_ahead)).isoformat()
 
 async def is_company_holiday(company_id: str, date_str: str) -> Optional[dict]:
     """Returns {"id", "title"} if date_str (YYYY-MM-DD) falls on an active,
@@ -2139,151 +1897,19 @@ async def get_message_timeline(message_id: str, current_user: dict = Depends(get
     return await messages_service.get_message_timeline(pg, current_user, message_id)
 
 # ============ Calendar Routes ============
-# Fully independent of Work Messaging Routes above - own collections, own
-# helpers (duplicated rather than reused where reuse would mean touching
-# messaging code), same conventions (dedicated action endpoints, range-bounded
-# queries, company isolation, append-only activity log).
-
-def require_calendar_access(current_user: dict):
-    if current_user["role"] not in (UserRole.COMPANY_OWNER, UserRole.EMPLOYEE):
-        raise HTTPException(status_code=403, detail="Access denied")
-
-def calendar_paginate(page: int, page_size: int) -> tuple:
-    return max(page, 1), min(max(page_size, 1), 200)
-
-COMPLETABLE_CATEGORIES = {
-    EventCategory.MEETING, EventCategory.TRAINING, EventCategory.TASK_DEADLINE,
-    EventCategory.MAINTENANCE, EventCategory.BUSINESS_TRIP,
-}
-VALID_CATEGORIES = set(EVENT_CATEGORY_DEFAULT_COLORS.keys())
-VALID_PRIORITIES = {EventPriority.LOW, EventPriority.NORMAL, EventPriority.HIGH, EventPriority.CRITICAL}
-VALID_VISIBILITIES = {EventVisibility.PRIVATE, EventVisibility.DEPARTMENT, EventVisibility.COMPANY, EventVisibility.OWNER_ONLY}
-VALID_RECIPIENT_TYPES = {EventRecipientType.OWNER, EventRecipientType.EMPLOYEE, EventRecipientType.DEPARTMENT,
-                          EventRecipientType.OWNER_PLUS_EMPLOYEES, EventRecipientType.COMPANY}
-VALID_LOCATION_TYPES = {EventLocationType.OFFICE, EventLocationType.CLIENT_SITE, EventLocationType.ONLINE, EventLocationType.OTHER, None}
-
-def compute_display_status(event: dict, occurrence_start: datetime, occurrence_end: datetime) -> str:
-    if event.get("status") == "cancelled":
-        return "cancelled"
-    now = datetime.now(timezone.utc)
-    if now < occurrence_start:
-        return "scheduled"
-    if occurrence_start <= now <= occurrence_end:
-        return "in_progress"
-    return "completed" if event["category"] in COMPLETABLE_CATEGORIES else "expired"
-
-def validate_event_fields(category: str, priority: str, visibility: str, recipient_type: str, location_type: Optional[str]):
-    if category not in VALID_CATEGORIES:
-        raise HTTPException(status_code=400, detail="Invalid category")
-    if priority not in VALID_PRIORITIES:
-        raise HTTPException(status_code=400, detail="Invalid priority")
-    if visibility not in VALID_VISIBILITIES:
-        raise HTTPException(status_code=400, detail="Invalid visibility")
-    if recipient_type not in VALID_RECIPIENT_TYPES:
-        raise HTTPException(status_code=400, detail="Invalid recipient type")
-    if location_type not in VALID_LOCATION_TYPES:
-        raise HTTPException(status_code=400, detail="Invalid location type")
-
-async def build_event_detail(event: dict, current_user: dict) -> dict:
-    participants = await db.calendar_event_participants.find({"event_id": event["id"]}, {"_id": 0}).to_list(1000)
-    attachment_count = await db.calendar_attachments.count_documents({"event_id": event["id"]})
-    occ_start = combine_event_datetime(event["start_date"], event.get("start_time"), event["all_day"], False)
-    occ_end = combine_event_datetime(event["end_date"], event.get("end_time"), event["all_day"], True)
-    mine = next((p for p in participants if p["participant_id"] == current_user["id"]), None)
-    responded = [p for p in participants if p["attendance_status"] != AttendanceResponseStatus.NO_RESPONSE]
-    return {
-        **event,
-        "display_status": compute_display_status(event, occ_start, occ_end),
-        "color": event.get("custom_color") or event.get("default_color"),
-        "participants": participants,
-        "response_progress": {"total": len(participants), "responded": len(responded)},
-        "attachment_count": attachment_count,
-        "my_attendance_status": mine["attendance_status"] if mine else None,
-        "is_participant": mine is not None,
-    }
+# All business logic lives in services/calendar.py (Postgres-backed).
 
 @api_router.post("/calendar/events")
-async def create_calendar_event(data: CalendarEventCreate, current_user: dict = Depends(get_current_user)):
-    require_calendar_access(current_user)
-    validate_event_fields(data.category, data.priority, data.visibility, data.recipient_type, data.location_type)
-
-    company_id = current_user["company_id"]
-    start_dt = combine_event_datetime(data.start_date, data.start_time, data.all_day, False)
-    end_dt = combine_event_datetime(data.end_date, data.end_time, data.all_day, True)
-    if end_dt < start_dt:
-        raise HTTPException(status_code=400, detail="End must be on or after start")
-
-    company = await db.companies.find_one({"id": company_id}, {"_id": 0, "owner_id": 1})
-    owner_id = company["owner_id"] if company else None
-    participant_ids = await resolve_calendar_recipients(company_id, data.recipient_type, data.recipient_ids, owner_id)
-
-    conflicts = await check_calendar_conflicts(company_id, participant_ids, start_dt, end_dt, data.all_day)
-    holiday_conflict = None
-    if data.category != EventCategory.COMPANY_HOLIDAY:
-        holiday_conflict = await check_holiday_conflict(company_id, start_dt, end_dt)
-    if (conflicts or holiday_conflict) and not data.override_conflicts:
-        raise HTTPException(status_code=409, detail={"message": "Conflict detected", "conflicts": conflicts, "holiday_conflict": holiday_conflict})
-
-    event_id = str(uuid.uuid4())
-    now = datetime.now(timezone.utc).isoformat()
-    event_doc = {
-        "id": event_id,
-        "reference_number": await next_calendar_reference_number(company_id),
-        "company_id": company_id,
-        "series_id": event_id,
-        "title": data.title, "description": data.description, "category": data.category,
-        "default_color": EVENT_CATEGORY_DEFAULT_COLORS.get(data.category, "#A1A1AA"),
-        "custom_color": data.custom_color, "priority": data.priority,
-        "start_date": data.start_date, "start_time": data.start_time,
-        "end_date": data.end_date, "end_time": data.end_time, "all_day": data.all_day,
-        "location_type": data.location_type, "location": data.location, "online_link": data.online_link,
-        "visibility": data.visibility, "recipient_type": data.recipient_type, "recipient_ids": data.recipient_ids,
-        "recurrence_type": data.recurrence_type, "recurrence_interval": data.recurrence_interval,
-        "recurrence_end_type": data.recurrence_end_type, "recurrence_end_value": data.recurrence_end_value,
-        "status": None,
-        "linked_thread_id": None,  # set lazily by /open-conversation, never on create
-        "meeting_notes": {"summary": "", "decisions": "", "action_items": ""},
-        # Enable/disable toggle - only meaningful for category=company_holiday
-        # (see /calendar/events/{id}/deactivate|reactivate) but set on every
-        # event for schema consistency, mirroring daily_tasks.is_active.
-        "is_active": True,
-        "created_by": current_user["id"], "created_by_name": current_user.get("name"),
-        "created_at": now, "updated_at": now, "updated_by": current_user["id"], "updated_by_name": current_user.get("name"),
-    }
-    await db.calendar_events.insert_one(event_doc)
-    event_doc.pop("_id", None)  # insert_one mutates the dict in place with a non-serializable ObjectId
-
-    for pid in participant_ids:
-        p_user = await db.users.find_one({"id": pid}, {"_id": 0, "name": 1, "department": 1})
-        await db.calendar_event_participants.insert_one({
-            "id": str(uuid.uuid4()), "event_id": event_id, "company_id": company_id,
-            "participant_id": pid, "participant_name": p_user["name"] if p_user else None,
-            "department": p_user.get("department") if p_user else None,
-            "attendance_status": AttendanceResponseStatus.NO_RESPONSE, "responded_at": None,
-            # Separate from the pre-meeting RSVP above - set only after the
-            # meeting actually happens, via POST .../participants/{id}/attendance.
-            "final_attendance": None, "attendance_marked_at": None,
-        })
-
-    await write_calendar_activity(company_id, event_id, current_user, "created", data.title)
-    # An employee-created event that includes the Owner as a participant
-    # gets the Owner notified immediately - the "Secretary/Employee creates
-    # a meeting for the Owner" rule. Owner-created events only notify
-    # participants (dedup already strips the actor from the recipient set).
-    owner_should_be_notified = current_user["role"] == UserRole.EMPLOYEE and owner_id in participant_ids
-    await notify_for_calendar_event(
-        event_doc, "owner_created" if owner_should_be_notified else "created",
-        participant_ids, actor=current_user,
-    )
-
-    return await build_event_detail(event_doc, current_user)
+async def create_calendar_event(data: CalendarEventCreate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await calendar_service.create_calendar_event(pg, current_user, data)
 
 # Registered before /calendar/events/{event_id} - FastAPI matches routes in
 # registration order, so this static path must come first or "search" would
 # be swallowed by the {event_id} path parameter.
 @api_router.get("/calendar/events/search")
 async def search_calendar_events(
-    current_user: dict = Depends(get_current_user), page: int = 1, page_size: int = 20,
+    current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db),
+    page: int = 1, page_size: int = 20,
     reference_number: Optional[str] = None, title: Optional[str] = None, participant: Optional[str] = None,
     department: Optional[str] = None, category: Optional[str] = None, priority: Optional[str] = None,
     created_by: Optional[str] = None, status: Optional[str] = None,
@@ -2292,68 +1918,20 @@ async def search_calendar_events(
     """Search still respects the range-bounded philosophy: defaults to a
     120-day window around today when no explicit range is given, rather
     than ever scanning the full history."""
-    require_calendar_access(current_user)
-    page, page_size = calendar_paginate(page, page_size)
-    today = datetime.now(timezone.utc).date()
-    range_from = date_from or (today - timedelta(days=30)).isoformat()
-    range_to = date_to or (today + timedelta(days=90)).isoformat()
-
-    query = {"company_id": current_user["company_id"], "start_date": {"$lte": range_to}, "end_date": {"$gte": range_from}}
-    if reference_number:
-        query["reference_number"] = {"$regex": reference_number, "$options": "i"}
-    if title:
-        query["title"] = {"$regex": title, "$options": "i"}
-    if category:
-        query["category"] = category
-    if priority:
-        query["priority"] = priority
-    if created_by:
-        query["created_by_name"] = {"$regex": created_by, "$options": "i"}
-
-    if participant or department:
-        p_query = {"company_id": current_user["company_id"]}
-        if participant:
-            p_query["participant_name"] = {"$regex": participant, "$options": "i"}
-        if department:
-            p_query["department"] = department
-        rows = await db.calendar_event_participants.find(p_query, {"_id": 0, "event_id": 1}).to_list(10000)
-        query["id"] = {"$in": list({r["event_id"] for r in rows})}
-
-    candidates = await db.calendar_events.find(query, {"_id": 0}).to_list(2000)
-
-    is_owner = current_user["role"] == UserRole.COMPANY_OWNER
-    results = []
-    for event in candidates:
-        if not is_owner and event["created_by"] != current_user["id"]:
-            accessible = await db.calendar_event_participants.find_one(
-                {"event_id": event["id"], "participant_id": current_user["id"]}, {"_id": 0, "id": 1}
-            )
-            visibility = event.get("visibility", EventVisibility.COMPANY)
-            if not accessible and visibility not in (EventVisibility.COMPANY,) and not (
-                visibility == EventVisibility.DEPARTMENT and event.get("department") == current_user.get("department")
-            ):
-                continue
-        occ_start = combine_event_datetime(event["start_date"], event.get("start_time"), event["all_day"], False)
-        occ_end = combine_event_datetime(event["end_date"], event.get("end_time"), event["all_day"], True)
-        display_status = compute_display_status(event, occ_start, occ_end)
-        if status and status != display_status:
-            continue
-        results.append({**event, "display_status": display_status, "color": event.get("custom_color") or event.get("default_color")})
-
-    results.sort(key=lambda e: e["start_date"], reverse=True)
-    total = len(results)
-    start_idx = (page - 1) * page_size
-    return {"items": results[start_idx:start_idx + page_size], "total": total, "page": page, "page_size": page_size}
+    return await calendar_service.search_calendar_events(
+        pg, current_user, page=page, page_size=page_size, reference_number=reference_number, title=title,
+        participant=participant, department=department, category=category, priority=priority,
+        created_by=created_by, status=status, date_from=date_from, date_to=date_to,
+    )
 
 @api_router.get("/calendar/events/{event_id}")
-async def get_calendar_event(event_id: str, current_user: dict = Depends(get_current_user)):
-    require_calendar_access(current_user)
-    event = await get_accessible_calendar_event(event_id, current_user)
-    return await build_event_detail(event, current_user)
+async def get_calendar_event(event_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    event = await calendar_service.get_accessible_calendar_event(pg, event_id, current_user)
+    return await calendar_service.build_event_detail(pg, event, current_user)
 
 @api_router.get("/calendar/events")
 async def list_calendar_events(
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db),
     view_start: str = None, view_end: str = None, page: int = 1, page_size: int = 200,
 ):
     """The one range query every calendar view (Month/Week/Day/Agenda) uses -
@@ -2361,224 +1939,18 @@ async def list_calendar_events(
     recurring events are expanded on the fly for this window only, so a
     yearly series created 5 years ago costs nothing extra to display this
     month."""
-    require_calendar_access(current_user)
-    if not view_start or not view_end:
-        raise HTTPException(status_code=400, detail="view_start and view_end are required")
-    page, page_size = calendar_paginate(page, page_size)
-    range_start = datetime.fromisoformat(f"{view_start}T00:00:00+00:00")
-    range_end = datetime.fromisoformat(f"{view_end}T23:59:59+00:00")
-
-    company_id = current_user["company_id"]
-    candidate_query = {
-        "company_id": company_id,
-        "start_date": {"$lte": view_end},
-        "$or": [{"recurrence_end_type": {"$ne": RecurrenceEndType.ON_DATE}}, {"recurrence_end_value": {"$gte": view_start}}, {"recurrence_end_value": None}],
-    }
-    candidates = await db.calendar_events.find(candidate_query, {"_id": 0}).to_list(2000)
-
-    # Visibility + participation filter, then occurrence expansion per event.
-    is_owner = current_user["role"] == UserRole.COMPANY_OWNER
-    accessible = []
-    if candidates:
-        candidate_ids = [c["id"] for c in candidates]
-        my_rows = await db.calendar_event_participants.find(
-            {"event_id": {"$in": candidate_ids}, "participant_id": current_user["id"]}, {"_id": 0, "event_id": 1}
-        ).to_list(2000)
-        my_event_ids = {r["event_id"] for r in my_rows}
-        my_department = current_user.get("department")
-        dept_rows = await db.calendar_event_participants.find(
-            {"event_id": {"$in": candidate_ids}, "department": my_department}, {"_id": 0, "event_id": 1}
-        ).to_list(2000) if my_department else []
-        dept_event_ids = {r["event_id"] for r in dept_rows}
-
-        for c in candidates:
-            if is_owner or c["created_by"] == current_user["id"] or c["id"] in my_event_ids:
-                accessible.append(c)
-                continue
-            visibility = c.get("visibility", EventVisibility.COMPANY)
-            if visibility == EventVisibility.COMPANY:
-                accessible.append(c)
-            elif visibility == EventVisibility.DEPARTMENT and c["id"] in dept_event_ids:
-                accessible.append(c)
-
-    all_occurrences = []
-    for event in accessible:
-        for occ in await expand_event_occurrences(event, range_start, range_end):
-            # occ already carries event fields merged with any exception's
-            # override_fields (see expand_event_occurrences) - spreading the
-            # original `event` here instead would silently discard "This
-            # Event Only" overrides (title/time/etc for just this occurrence).
-            all_occurrences.append({
-                **{k: v for k, v in occ.items() if k != "recipient_ids"},
-                "color": occ.get("custom_color") or occ.get("default_color"),
-                "display_status": compute_display_status(occ, datetime.fromisoformat(occ["occurrence_start"]), datetime.fromisoformat(occ["occurrence_end"])),
-            })
-    all_occurrences.sort(key=lambda o: o["occurrence_start"])
-
-    total = len(all_occurrences)
-    start_idx = (page - 1) * page_size
-    page_items = all_occurrences[start_idx:start_idx + page_size]
-    working_hours = await get_working_hours(company_id)
-    return {"items": page_items, "total": total, "page": page, "page_size": page_size, "working_hours": working_hours}
-
-async def get_event_for_edit(event_id: str, current_user: dict) -> dict:
-    event = await db.calendar_events.find_one({"id": event_id, "company_id": current_user["company_id"]}, {"_id": 0})
-    if not event or (event["created_by"] != current_user["id"] and current_user["role"] != UserRole.COMPANY_OWNER):
-        raise HTTPException(status_code=404, detail="Event not found")
-    return event
-
-async def participant_ids_for_event(event_id: str) -> List[str]:
-    rows = await db.calendar_event_participants.find({"event_id": event_id}, {"_id": 0, "participant_id": 1}).to_list(10000)
-    return [r["participant_id"] for r in rows]
+    return await calendar_service.list_calendar_events(pg, current_user, view_start, view_end, page, page_size)
 
 @api_router.patch("/calendar/events/{event_id}")
 async def update_calendar_event(
-    event_id: str, updates: CalendarEventUpdate, current_user: dict = Depends(get_current_user),
+    event_id: str, updates: CalendarEventUpdate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db),
     scope: str = EventEditScope.ENTIRE_SERIES, occurrence_date: Optional[str] = None,
 ):
-    require_calendar_access(current_user)
-    event = await get_event_for_edit(event_id, current_user)
-    changes = updates.model_dump(exclude_none=True, exclude={"override_conflicts"})
-    if not changes:
-        raise HTTPException(status_code=400, detail="No valid fields to update")
-    for field in ("category", "priority", "visibility", "location_type"):
-        if field in changes and changes[field] not in (VALID_CATEGORIES if field == "category" else
-                                                          VALID_PRIORITIES if field == "priority" else
-                                                          VALID_VISIBILITIES if field == "visibility" else VALID_LOCATION_TYPES):
-            raise HTTPException(status_code=400, detail=f"Invalid {field}")
-    if "category" in changes:
-        changes["default_color"] = EVENT_CATEGORY_DEFAULT_COLORS.get(changes["category"], "#A1A1AA")
-
-    time_fields_changed = bool({"start_date", "start_time", "end_date", "end_time", "all_day"} & changes.keys())
-    location_changed = bool({"location", "location_type", "online_link"} & changes.keys())
-
-    # Re-check conflicts whenever timing changes, using the merged
-    # would-be event so participants/other fields already reflect the edit.
-    # For this_event_only/this_and_future, the relevant date is the edited
-    # occurrence's own date, not the original series' start_date - checking
-    # against the original date would flag (or miss) conflicts that have
-    # nothing to do with what's actually being scheduled.
-    merged_preview = {**event, **changes}
-    if scope in (EventEditScope.THIS_EVENT_ONLY, EventEditScope.THIS_AND_FUTURE) and occurrence_date and "start_date" not in changes:
-        merged_preview["start_date"] = occurrence_date
-        if "end_date" not in changes:
-            try:
-                span_days = (date.fromisoformat(event["end_date"]) - date.fromisoformat(event["start_date"])).days
-            except ValueError:
-                span_days = 0
-            merged_preview["end_date"] = (date.fromisoformat(occurrence_date) + timedelta(days=span_days)).isoformat()
-    if time_fields_changed:
-        start_dt = combine_event_datetime(merged_preview["start_date"], merged_preview.get("start_time"), merged_preview["all_day"], False)
-        end_dt = combine_event_datetime(merged_preview["end_date"], merged_preview.get("end_time"), merged_preview["all_day"], True)
-        if end_dt < start_dt:
-            raise HTTPException(status_code=400, detail="End must be on or after start")
-        participant_ids = await participant_ids_for_event(event_id)
-        conflicts = await check_calendar_conflicts(event["company_id"], participant_ids, start_dt, end_dt, merged_preview["all_day"], exclude_event_id=event_id)
-        holiday_conflict = None
-        if merged_preview["category"] != EventCategory.COMPANY_HOLIDAY:
-            holiday_conflict = await check_holiday_conflict(event["company_id"], start_dt, end_dt)
-        if (conflicts or holiday_conflict) and not updates.override_conflicts:
-            raise HTTPException(status_code=409, detail={"message": "Conflict detected", "conflicts": conflicts, "holiday_conflict": holiday_conflict})
-
-    now = datetime.now(timezone.utc).isoformat()
-
-    if scope == EventEditScope.THIS_EVENT_ONLY:
-        if not occurrence_date:
-            raise HTTPException(status_code=400, detail="occurrence_date is required for this_event_only edits")
-        existing = await db.calendar_event_exceptions.find_one({"event_id": event_id, "occurrence_date": occurrence_date}, {"_id": 0, "id": 1})
-        if existing:
-            await db.calendar_event_exceptions.update_one({"id": existing["id"]}, {"$set": {"override_fields": changes, "is_cancelled": False}})
-        else:
-            await db.calendar_event_exceptions.insert_one({
-                "id": str(uuid.uuid4()), "event_id": event_id, "occurrence_date": occurrence_date,
-                "is_cancelled": False, "override_fields": changes, "created_at": now,
-            })
-        target_event = event
-
-    elif scope == EventEditScope.THIS_AND_FUTURE:
-        if not occurrence_date:
-            raise HTTPException(status_code=400, detail="occurrence_date is required for this_and_future edits")
-        day_before = (datetime.fromisoformat(f"{occurrence_date}T00:00:00+00:00") - timedelta(days=1)).date().isoformat()
-        await db.calendar_events.update_one(
-            {"id": event_id},
-            {"$set": {"recurrence_end_type": RecurrenceEndType.ON_DATE, "recurrence_end_value": day_before, "updated_at": now}}
-        )
-        # Preserve the original event's day-span when the edit didn't
-        # explicitly move the dates.
-        try:
-            span_days = (date.fromisoformat(event["end_date"]) - date.fromisoformat(event["start_date"])).days
-        except ValueError:
-            span_days = 0
-        new_start = changes.get("start_date", occurrence_date)
-        new_end = changes.get("end_date", (date.fromisoformat(new_start) + timedelta(days=span_days)).isoformat())
-
-        new_recurrence_end_type = event.get("recurrence_end_type", RecurrenceEndType.NEVER)
-        new_recurrence_end_value = event.get("recurrence_end_value")
-        if new_recurrence_end_type == RecurrenceEndType.AFTER_COUNT and new_recurrence_end_value:
-            # The new series continues the SAME overall count budget, not a
-            # fresh one - otherwise splitting at the last occurrence of a
-            # 4-occurrence series would let the new series run forever
-            # (re-granted 4 more from its own start), silently extending a
-            # series beyond what was ever actually scheduled.
-            cutoff = datetime.fromisoformat(f"{occurrence_date}T00:00:00+00:00")
-            occurrences_before = count_raw_occurrences_before(event, cutoff)
-            remaining = max(int(new_recurrence_end_value) - occurrences_before, 1)
-            new_recurrence_end_value = str(remaining)
-
-        new_event_id = str(uuid.uuid4())
-        new_doc = {
-            **event, **changes,
-            "id": new_event_id,
-            "reference_number": await next_calendar_reference_number(event["company_id"]),
-            "series_id": event.get("series_id", event_id),
-            "start_date": new_start, "end_date": new_end,
-            "recurrence_end_type": new_recurrence_end_type,
-            "recurrence_end_value": new_recurrence_end_value,
-            "status": None,
-            # A new series starting from here is a materially different set
-            # of future occurrences - it doesn't inherit the old series'
-            # conversation link or meeting notes, both of which were about
-            # the OLD schedule.
-            "linked_thread_id": None,
-            "meeting_notes": {"summary": "", "decisions": "", "action_items": ""},
-            "created_at": now, "updated_at": now,
-            "updated_by": current_user["id"], "updated_by_name": current_user.get("name"),
-        }
-        await db.calendar_events.insert_one(new_doc)
-        new_doc.pop("_id", None)  # insert_one mutates the dict in place with a non-serializable ObjectId
-        # The new series document gets its own fresh participant rows
-        # (copied from the original, response state reset) rather than
-        # migrating the old rows, since attendance responses to the old
-        # series shouldn't silently apply to a materially different future.
-        for pid in await participant_ids_for_event(event_id):
-            p_user = await db.users.find_one({"id": pid}, {"_id": 0, "name": 1, "department": 1})
-            await db.calendar_event_participants.insert_one({
-                "id": str(uuid.uuid4()), "event_id": new_event_id, "company_id": event["company_id"],
-                "participant_id": pid, "participant_name": p_user["name"] if p_user else None,
-                "department": p_user.get("department") if p_user else None,
-                "attendance_status": AttendanceResponseStatus.NO_RESPONSE, "responded_at": None,
-                "final_attendance": None, "attendance_marked_at": None,
-            })
-        target_event = new_doc
-
-    else:  # ENTIRE_SERIES
-        changes["updated_at"] = now
-        changes["updated_by"] = current_user["id"]
-        changes["updated_by_name"] = current_user.get("name")
-        await db.calendar_events.update_one({"id": event_id}, {"$set": changes})
-        target_event = {**event, **changes}
-
-    verb = "time_changed" if time_fields_changed else "location_changed" if location_changed else "updated"
-    await write_calendar_activity(event["company_id"], event_id, current_user, verb, event["title"])
-    participant_ids = await participant_ids_for_event(event_id)
-    if participant_ids:
-        await notify_for_calendar_event(target_event, verb, participant_ids, actor=current_user)
-
-    return await build_event_detail(target_event, current_user)
+    return await calendar_service.update_calendar_event(pg, current_user, event_id, updates, scope, occurrence_date)
 
 @api_router.post("/calendar/events/{event_id}/cancel")
 async def cancel_calendar_event(
-    event_id: str, current_user: dict = Depends(get_current_user),
+    event_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db),
     scope: str = EventEditScope.ENTIRE_SERIES, occurrence_date: Optional[str] = None,
 ):
     """Soft cancel only - status flips to 'cancelled' (entire series) or a
@@ -2587,326 +1959,89 @@ async def cancel_calendar_event(
     deliberately binary (This Event Only / Entire Series) - unlike editing,
     'this_and_future' is not a meaningful cancellation scope and is rejected
     explicitly rather than silently falling through to a full-series cancel."""
-    require_calendar_access(current_user)
-    if scope not in (EventEditScope.THIS_EVENT_ONLY, EventEditScope.ENTIRE_SERIES):
-        raise HTTPException(status_code=400, detail="scope must be this_event_only or entire_series")
-    event = await get_event_for_edit(event_id, current_user)
-
-    if scope == EventEditScope.THIS_EVENT_ONLY:
-        if not occurrence_date:
-            raise HTTPException(status_code=400, detail="occurrence_date is required")
-        existing = await db.calendar_event_exceptions.find_one({"event_id": event_id, "occurrence_date": occurrence_date}, {"_id": 0, "id": 1})
-        if existing:
-            await db.calendar_event_exceptions.update_one({"id": existing["id"]}, {"$set": {"is_cancelled": True}})
-        else:
-            await db.calendar_event_exceptions.insert_one({
-                "id": str(uuid.uuid4()), "event_id": event_id, "occurrence_date": occurrence_date,
-                "is_cancelled": True, "override_fields": None, "created_at": datetime.now(timezone.utc).isoformat(),
-            })
-    else:
-        await db.calendar_events.update_one({"id": event_id}, {"$set": {"status": "cancelled", "updated_at": datetime.now(timezone.utc).isoformat()}})
-
-    await write_calendar_activity(event["company_id"], event_id, current_user, "cancelled", event["title"])
-    participant_ids = await participant_ids_for_event(event_id)
-    if participant_ids:
-        await notify_for_calendar_event(event, "cancelled", participant_ids, actor=current_user)
-    return {"message": "Event cancelled"}
+    return await calendar_service.cancel_calendar_event(pg, current_user, event_id, scope, occurrence_date)
 
 @api_router.post("/calendar/events/{event_id}/participants/add")
-async def add_calendar_participants(event_id: str, body: ParticipantIdsBody, current_user: dict = Depends(get_current_user)):
-    require_calendar_access(current_user)
-    event = await get_event_for_edit(event_id, current_user)
-    existing_ids = set(await participant_ids_for_event(event_id))
-    new_ids = [pid for pid in set(body.participant_ids) if pid not in existing_ids]
-    if not new_ids:
-        raise HTTPException(status_code=400, detail="No new participants to add")
-    valid = await db.users.count_documents({"id": {"$in": new_ids}, "company_id": event["company_id"]})
-    if valid != len(new_ids):
-        raise HTTPException(status_code=400, detail="One or more participants do not belong to your company")
-
-    for pid in new_ids:
-        p_user = await db.users.find_one({"id": pid}, {"_id": 0, "name": 1, "department": 1})
-        await db.calendar_event_participants.insert_one({
-            "id": str(uuid.uuid4()), "event_id": event_id, "company_id": event["company_id"],
-            "participant_id": pid, "participant_name": p_user["name"] if p_user else None,
-            "department": p_user.get("department") if p_user else None,
-            "attendance_status": AttendanceResponseStatus.NO_RESPONSE, "responded_at": None,
-            "final_attendance": None, "attendance_marked_at": None,
-        })
-    await write_calendar_activity(event["company_id"], event_id, current_user, "participant_added", event["title"])
-    await notify_for_calendar_event(event, "created", new_ids, actor=current_user)
-    return {"message": "Participants added", "added": new_ids}
+async def add_calendar_participants(event_id: str, body: ParticipantIdsBody, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await calendar_service.add_calendar_participants(pg, current_user, event_id, body.participant_ids)
 
 @api_router.post("/calendar/events/{event_id}/participants/remove")
-async def remove_calendar_participants(event_id: str, body: ParticipantIdsBody, current_user: dict = Depends(get_current_user)):
-    require_calendar_access(current_user)
-    event = await get_event_for_edit(event_id, current_user)
-    result = await db.calendar_event_participants.delete_many({"event_id": event_id, "participant_id": {"$in": body.participant_ids}})
-    if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="No matching participants found")
-    await write_calendar_activity(event["company_id"], event_id, current_user, "participant_removed", event["title"])
-    await notify_for_calendar_event(event, "cancelled", body.participant_ids, actor=current_user)
-    return {"message": "Participants removed"}
+async def remove_calendar_participants(event_id: str, body: ParticipantIdsBody, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await calendar_service.remove_calendar_participants(pg, current_user, event_id, body.participant_ids)
 
 @api_router.post("/calendar/events/{event_id}/participants/{participant_id}/attendance")
-async def mark_final_attendance(event_id: str, participant_id: str, data: FinalAttendanceUpdate, current_user: dict = Depends(get_current_user)):
+async def mark_final_attendance(event_id: str, participant_id: str, data: FinalAttendanceUpdate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     """Post-meeting record (Attended/Absent) - independent of the pre-meeting
     RSVP (Accepted/Declined/Tentative) tracked by attendance_status. Owner or
     the event's creator only, and only once the meeting has actually
     finished, per 'After a meeting finishes'."""
-    require_calendar_access(current_user)
-    if data.status not in (FinalAttendanceStatus.ATTENDED, FinalAttendanceStatus.ABSENT):
-        raise HTTPException(status_code=400, detail="Invalid attendance status")
-    event = await get_event_for_edit(event_id, current_user)
-
-    occ_end = combine_event_datetime(event["end_date"], event.get("end_time"), event["all_day"], True)
-    if datetime.now(timezone.utc) < occ_end:
-        raise HTTPException(status_code=400, detail="Cannot mark attendance before the meeting has finished")
-
-    participant = await db.calendar_event_participants.find_one(
-        {"event_id": event_id, "participant_id": participant_id}, {"_id": 0, "id": 1}
-    )
-    if not participant:
-        raise HTTPException(status_code=404, detail="Participant not found on this event")
-
-    now = datetime.now(timezone.utc).isoformat()
-    await db.calendar_event_participants.update_one(
-        {"id": participant["id"]},
-        {"$set": {"final_attendance": data.status, "attendance_marked_at": now}}
-    )
-    verb = "marked_attended" if data.status == FinalAttendanceStatus.ATTENDED else "marked_absent"
-    await write_calendar_activity(event["company_id"], event_id, current_user, verb, event["title"])
-    # No notification - this is an internal record-keeping action, not
-    # something the marked participant needs to be alerted about.
-    return {"message": "Attendance recorded", "status": data.status}
+    return await calendar_service.mark_final_attendance(pg, current_user, event_id, participant_id, data.status)
 
 @api_router.put("/calendar/events/{event_id}/notes")
-async def update_meeting_notes(event_id: str, data: MeetingNotesUpdate, current_user: dict = Depends(get_current_user)):
+async def update_meeting_notes(event_id: str, data: MeetingNotesUpdate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     """Meeting Notes (Summary/Decisions/Action Items) live only on the event
     itself - never referenced from anywhere else, and this endpoint never
     calls notify_for_calendar_event. The activity log entry is reference-only
     (records that notes were updated, never the note content itself)."""
-    require_calendar_access(current_user)
-    event = await get_event_for_edit(event_id, current_user)
-
-    notes = {"summary": data.summary, "decisions": data.decisions, "action_items": data.action_items}
-    await db.calendar_events.update_one(
-        {"id": event_id},
-        {"$set": {"meeting_notes": notes, "updated_at": datetime.now(timezone.utc).isoformat()}}
-    )
-    await write_calendar_activity(event["company_id"], event_id, current_user, "notes_updated", event["title"])
-    return {"message": "Meeting notes updated", "meeting_notes": notes}
+    return await calendar_service.update_meeting_notes(pg, current_user, event_id, data)
 
 @api_router.post("/calendar/events/{event_id}/open-conversation")
-async def open_conversation(event_id: str, current_user: dict = Depends(get_current_user)):
-    """Links a Calendar event to a Work Messages thread by calling the
-    existing POST /messages handler directly (in-process function call, not
-    a modification of it) - reused exactly the way 'Convert to Task' already
+async def open_conversation(event_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    """Links a Calendar event to a Work Messages thread by calling directly
+    into services.messages.create_message (in-process, same layer both
+    modules now share) - reused exactly the way 'Convert to Task' already
     reuses POST /owner/tasks. Idempotent: once a thread exists for this
     event, every subsequent call returns that same thread instead of
     creating a new one each time."""
-    require_calendar_access(current_user)
-    event = await get_accessible_calendar_event(event_id, current_user)
-
-    if event.get("linked_thread_id"):
-        return {"thread_id": event["linked_thread_id"], "created": False}
-
-    participants = await db.calendar_event_participants.find(
-        {"event_id": event_id}, {"_id": 0, "participant_id": 1}
-    ).to_list(1000)
-    other_ids = list({p["participant_id"] for p in participants if p["participant_id"] != current_user["id"]})
-    if not other_ids:
-        raise HTTPException(status_code=400, detail="No other participants to start a conversation with")
-
-    message = MessageCreate(
-        subject=f"{event['title']} ({event['reference_number']})",
-        body=f"محادثة بخصوص الموعد: {event['title']} - {event['start_date']}",
-        recipient_type=MessageRecipientType.EMPLOYEE,
-        recipient_ids=other_ids,
-    )
-    # Direct function call into the Work Messages route handler. Unreachable
-    # today: this whole endpoint is still Mongo-backed above this point and
-    # already 503s at get_accessible_calendar_event before reaching here
-    # (MongoDB has no live instance). create_message's signature now also
-    # requires an injected `pg` session (Module 8/Messaging migrated to
-    # Postgres) that a direct call like this can't supply - must be fixed to
-    # call messages_service.create_message(pg, ...) directly when Calendar
-    # migrates (Module 9).
-    created = await create_message(message, current_user)
-    thread_id = created.thread_id
-
-    await db.calendar_events.update_one({"id": event_id}, {"$set": {"linked_thread_id": thread_id}})
-    await write_calendar_activity(event["company_id"], event_id, current_user, "conversation_started", event["title"])
-    return {"thread_id": thread_id, "created": True}
+    return await calendar_service.open_conversation(pg, current_user, event_id)
 
 @api_router.post("/calendar/events/check-conflicts")
-async def check_conflicts_endpoint(data: ConflictCheckRequest, current_user: dict = Depends(get_current_user)):
+async def check_conflicts_endpoint(data: ConflictCheckRequest, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     """Dry-run used by the compose UI before save - never mutates anything."""
-    require_calendar_access(current_user)
-    company_id = current_user["company_id"]
-    company = await db.companies.find_one({"id": company_id}, {"_id": 0, "owner_id": 1})
-    owner_id = company["owner_id"] if company else None
-    participant_ids = await resolve_calendar_recipients(company_id, data.recipient_type, data.recipient_ids, owner_id)
-
-    start_dt = combine_event_datetime(data.start_date, data.start_time, data.all_day, False)
-    end_dt = combine_event_datetime(data.end_date, data.end_time, data.all_day, True)
-    conflicts = await check_calendar_conflicts(company_id, participant_ids, start_dt, end_dt, data.all_day, exclude_event_id=data.exclude_event_id)
-    holiday_conflict = await check_holiday_conflict(company_id, start_dt, end_dt)
-    return {"conflicts": conflicts, "holiday_conflict": holiday_conflict, "has_conflict": bool(conflicts or holiday_conflict)}
+    return await calendar_service.check_conflicts_endpoint(pg, current_user, data)
 
 @api_router.post("/calendar/events/{event_id}/respond")
-async def respond_to_calendar_event(event_id: str, data: EventResponseUpdate, current_user: dict = Depends(get_current_user)):
-    require_calendar_access(current_user)
-    if data.status not in (AttendanceResponseStatus.ACCEPTED, AttendanceResponseStatus.DECLINED, AttendanceResponseStatus.TENTATIVE):
-        raise HTTPException(status_code=400, detail="Invalid response status")
-    event = await get_accessible_calendar_event(event_id, current_user)
-    participant = await db.calendar_event_participants.find_one(
-        {"event_id": event_id, "participant_id": current_user["id"]}, {"_id": 0}
-    )
-    if not participant:
-        raise HTTPException(status_code=404, detail="You are not a participant of this event")
-
-    now = datetime.now(timezone.utc).isoformat()
-    await db.calendar_event_participants.update_one(
-        {"id": participant["id"]}, {"$set": {"attendance_status": data.status, "responded_at": now}}
-    )
-    verb = {"accepted": "accepted", "declined": "declined", "tentative": "tentative"}[data.status]
-    await write_calendar_activity(event["company_id"], event_id, current_user, verb, event["title"])
-    # "Notify Owner" for every individual response, mirroring the oversight
-    # model Communication Center already established for Work Messages -
-    # the Owner is notified company-wide, not just for events they organized.
-    await notify_for_calendar_event(event, verb, [], actor=current_user, notify_owner_too=True)
-
-    all_participants = await db.calendar_event_participants.find({"event_id": event_id}, {"_id": 0, "attendance_status": 1}).to_list(1000)
-    if all_participants and all(p["attendance_status"] != AttendanceResponseStatus.NO_RESPONSE for p in all_participants):
-        await notify_for_calendar_event(event, "all_responded", [], actor=current_user, notify_owner_too=True)
-
-    return {"message": "Response recorded", "status": data.status}
+async def respond_to_calendar_event(event_id: str, data: EventResponseUpdate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await calendar_service.respond_to_calendar_event(pg, current_user, event_id, data.status)
 
 @api_router.post("/calendar/events/{event_id}/reminders")
-async def create_calendar_reminder(event_id: str, data: EventReminderCreate, current_user: dict = Depends(get_current_user)):
+async def create_calendar_reminder(event_id: str, data: EventReminderCreate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     """Owner may set a reminder on any company event (oversight role) even
     when not a participant; everyone else must be a participant or the
     creator - checked via get_accessible_calendar_event."""
-    require_calendar_access(current_user)
-    event = await get_accessible_calendar_event(event_id, current_user)
-
-    if data.preset:
-        if data.preset not in CALENDAR_REMINDER_PRESETS:
-            raise HTTPException(status_code=400, detail="Invalid reminder preset")
-        event_start = combine_event_datetime(event["start_date"], event.get("start_time"), event["all_day"], False)
-        remind_at = (event_start - CALENDAR_REMINDER_PRESETS[data.preset]).isoformat()
-    elif data.remind_at:
-        remind_at = data.remind_at
-    else:
-        raise HTTPException(status_code=400, detail="Provide a preset or an explicit remind_at")
-
-    reminder_id = str(uuid.uuid4())
-    await db.calendar_event_reminders.insert_one({
-        "id": reminder_id, "event_id": event_id, "user_id": current_user["id"], "company_id": event["company_id"],
-        "remind_at": remind_at, "notified_at": None, "created_at": datetime.now(timezone.utc).isoformat(),
-    })
-    return {"id": reminder_id, "remind_at": remind_at}
+    return await calendar_service.create_calendar_reminder(pg, current_user, event_id, data)
 
 @api_router.post("/calendar/events/{event_id}/attachments")
-async def upload_calendar_attachment(event_id: str, data: AttachmentUpload, current_user: dict = Depends(get_current_user)):
-    """Same base64-by-reference architecture as message_attachments (reusing
-    the pure classify_attachment_type/MAX_ATTACHMENT_BYTES helpers directly,
-    unmodified) - its own collection, so migrating to object storage later
-    only means changing what the 'data' field holds, not this shape."""
-    require_calendar_access(current_user)
-    event = await get_event_for_edit(event_id, current_user)
-
-    raw = data.data.split(",", 1)[-1] if data.data.startswith("data:") else data.data
-    try:
-        decoded_size = len(base64.b64decode(raw, validate=False))
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid file data")
-    if decoded_size > MAX_ATTACHMENT_BYTES:
-        raise HTTPException(status_code=400, detail=f"File exceeds the {MAX_ATTACHMENT_BYTES // (1024*1024)}MB limit")
-
-    attachment_id = str(uuid.uuid4())
-    await db.calendar_attachments.insert_one({
-        "id": attachment_id, "event_id": event_id, "company_id": event["company_id"],
-        "filename": data.filename, "mime_type": data.mime_type,
-        "attachment_type": classify_attachment_type(data.mime_type),
-        "data": data.data, "size_bytes": decoded_size,
-        "uploaded_at": datetime.now(timezone.utc).isoformat(),
-    })
-    await write_calendar_activity(event["company_id"], event_id, current_user, "attachment_added", event["title"])
-    participant_ids = await participant_ids_for_event(event_id)
-    if participant_ids:
-        await notify_for_calendar_event(event, "attachment_added", participant_ids, actor=current_user)
-    return {"id": attachment_id, "filename": data.filename, "attachment_type": classify_attachment_type(data.mime_type), "size_bytes": decoded_size}
+async def upload_calendar_attachment(event_id: str, data: AttachmentUpload, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    """Same base64-by-reference upload contract as message_attachments -
+    metadata-only Postgres row, bytes in MinIO."""
+    return await calendar_service.upload_calendar_attachment(pg, current_user, event_id, data)
 
 @api_router.get("/calendar-attachments/{attachment_id}")
-async def get_calendar_attachment(attachment_id: str, current_user: dict = Depends(get_current_user)):
-    require_calendar_access(current_user)
-    attachment = await db.calendar_attachments.find_one({"id": attachment_id}, {"_id": 0})
-    if not attachment or attachment["company_id"] != current_user["company_id"]:
-        raise HTTPException(status_code=404, detail="Attachment not found")
-    await get_accessible_calendar_event(attachment["event_id"], current_user)
-    return attachment
+async def get_calendar_attachment(attachment_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await calendar_service.get_calendar_attachment(pg, current_user, attachment_id)
 
 @api_router.get("/owner/calendar/working-hours")
-async def get_company_working_hours(current_user: dict = Depends(get_current_user)):
-    if current_user["role"] not in (UserRole.COMPANY_OWNER, UserRole.EMPLOYEE):
-        raise HTTPException(status_code=403, detail="Access denied")
-    return await get_working_hours(current_user["company_id"])
+async def get_company_working_hours(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await calendar_service.get_company_working_hours(pg, current_user)
 
 @api_router.put("/owner/calendar/working-hours")
-async def update_company_working_hours(data: WorkingHoursUpdate, current_user: dict = Depends(get_current_user)):
-    """Owner-only write; stored as one nested field on companies (same
-    additive-nested-settings convention as attendance_settings) so it stays
+async def update_company_working_hours(data: WorkingHoursUpdate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    """Owner-only write; stored as flattened columns on companies (same
+    additive-settings convention as attendance_settings) so it stays
     configurable later without a schema redesign."""
-    if current_user["role"] != UserRole.COMPANY_OWNER:
-        raise HTTPException(status_code=403, detail="Access denied")
-    await db.companies.update_one(
-        {"id": current_user["company_id"]},
-        {"$set": {"working_hours": data.model_dump()}}
-    )
-    return {"message": "Working hours updated", "working_hours": data.model_dump()}
+    return await calendar_service.update_company_working_hours(pg, current_user, data)
 
 @api_router.get("/owner/calendar/monitor")
-async def calendar_owner_monitor(current_user: dict = Depends(get_current_user), page: int = 1, page_size: int = 20):
+async def calendar_owner_monitor(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db), page: int = 1, page_size: int = 20):
     """Full company-wide visibility, mirroring Communication Center's role -
     every event regardless of visibility level, with per-participant
     response detail for oversight."""
-    if current_user["role"] != UserRole.COMPANY_OWNER:
-        raise HTTPException(status_code=403, detail="Access denied")
-    page, page_size = calendar_paginate(page, page_size)
-    company_id = current_user["company_id"]
-
-    total = await db.calendar_events.count_documents({"company_id": company_id})
-    events = await db.calendar_events.find({"company_id": company_id}, {"_id": 0}) \
-        .sort("start_date", -1).skip((page - 1) * page_size).limit(page_size).to_list(page_size)
-
-    event_ids = [e["id"] for e in events]
-    participants = await db.calendar_event_participants.find({"event_id": {"$in": event_ids}}, {"_id": 0}).to_list(5000)
-    by_event: Dict[str, list] = {}
-    for p in participants:
-        by_event.setdefault(p["event_id"], []).append(p)
-
-    items = []
-    for event in events:
-        occ_start = combine_event_datetime(event["start_date"], event.get("start_time"), event["all_day"], False)
-        occ_end = combine_event_datetime(event["end_date"], event.get("end_time"), event["all_day"], True)
-        items.append({
-            **event,
-            "display_status": compute_display_status(event, occ_start, occ_end),
-            "participants": by_event.get(event["id"], []),
-        })
-    return {"items": items, "total": total, "page": page, "page_size": page_size}
+    return await calendar_service.calendar_owner_monitor(pg, current_user, page, page_size)
 
 @api_router.get("/owner/calendar/events/{event_id}/activity")
-async def get_calendar_event_activity(event_id: str, current_user: dict = Depends(get_current_user)):
-    if current_user["role"] != UserRole.COMPANY_OWNER:
-        raise HTTPException(status_code=403, detail="Access denied")
-    event = await db.calendar_events.find_one({"id": event_id, "company_id": current_user["company_id"]}, {"_id": 0, "id": 1})
-    if not event:
-        raise HTTPException(status_code=404, detail="Event not found")
-    activity = await db.calendar_activity_log.find({"event_id": event_id}, {"_id": 0}).sort("created_at", -1).to_list(200)
-    return activity
+async def get_calendar_event_activity(event_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await calendar_service.get_calendar_event_activity(pg, current_user, event_id)
 
 # ============ Company Holiday Management ============
 # Holidays are calendar_events with category=company_holiday - not a
@@ -2915,85 +2050,29 @@ async def get_calendar_event_activity(event_id: str, current_user: dict = Depend
 # activity log) plus the is_active enable/disable toggle.
 
 @api_router.get("/calendar/holidays")
-async def list_company_holidays(current_user: dict = Depends(get_current_user)):
+async def list_company_holidays(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     """Flat list of holiday base records (not occurrence-expanded), for the
     Owner's Company Holidays management page - distinct from GET
     /calendar/events, which is bounded to a view range and expands
     recurrence for calendar rendering."""
-    if current_user["role"] != UserRole.COMPANY_OWNER:
-        raise HTTPException(status_code=403, detail="Access denied")
-    holidays = await db.calendar_events.find(
-        {"company_id": current_user["company_id"], "category": EventCategory.COMPANY_HOLIDAY},
-        {"_id": 0}
-    ).sort("start_date", -1).to_list(1000)
-    return holidays
+    return await calendar_service.list_company_holidays(pg, current_user)
 
 @api_router.post("/calendar/events/{event_id}/deactivate")
-async def deactivate_company_holiday(event_id: str, current_user: dict = Depends(get_current_user)):
-    if current_user["role"] != UserRole.COMPANY_OWNER:
-        raise HTTPException(status_code=403, detail="Access denied")
-    event = await db.calendar_events.find_one({"id": event_id, "company_id": current_user["company_id"]}, {"_id": 0})
-    if not event:
-        raise HTTPException(status_code=404, detail="Event not found")
-    if event["category"] != EventCategory.COMPANY_HOLIDAY:
-        raise HTTPException(status_code=400, detail="Only company holidays can be deactivated")
-    await db.calendar_events.update_one(
-        {"id": event_id},
-        {"$set": {"is_active": False, "updated_at": datetime.now(timezone.utc).isoformat(),
-                   "updated_by": current_user["id"], "updated_by_name": current_user.get("name")}}
-    )
-    await write_calendar_activity(event["company_id"], event_id, current_user, "holiday_deactivated", event["title"])
-    return {"message": "Holiday deactivated", "is_active": False}
+async def deactivate_company_holiday(event_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await calendar_service.deactivate_company_holiday(pg, current_user, event_id)
 
 @api_router.post("/calendar/events/{event_id}/reactivate")
-async def reactivate_company_holiday(event_id: str, current_user: dict = Depends(get_current_user)):
-    if current_user["role"] != UserRole.COMPANY_OWNER:
-        raise HTTPException(status_code=403, detail="Access denied")
-    event = await db.calendar_events.find_one({"id": event_id, "company_id": current_user["company_id"]}, {"_id": 0})
-    if not event:
-        raise HTTPException(status_code=404, detail="Event not found")
-    if event["category"] != EventCategory.COMPANY_HOLIDAY:
-        raise HTTPException(status_code=400, detail="Only company holidays can be reactivated")
-    await db.calendar_events.update_one(
-        {"id": event_id},
-        {"$set": {"is_active": True, "updated_at": datetime.now(timezone.utc).isoformat(),
-                   "updated_by": current_user["id"], "updated_by_name": current_user.get("name")}}
-    )
-    await write_calendar_activity(event["company_id"], event_id, current_user, "holiday_reactivated", event["title"])
-    return {"message": "Holiday reactivated", "is_active": True}
+async def reactivate_company_holiday(event_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await calendar_service.reactivate_company_holiday(pg, current_user, event_id)
 
 @api_router.post("/calendar/holidays/weekly-pattern")
-async def create_weekly_holiday_pattern(data: WeeklyHolidayPatternCreate, current_user: dict = Depends(get_current_user)):
+async def create_weekly_holiday_pattern(data: WeeklyHolidayPatternCreate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     """Creates one permanent (never-ending) weekly-recurring company_holiday
     event per selected weekday - e.g. Friday-only, or Friday+Saturday. Reuses
     create_calendar_event directly (in-process function call, same pattern as
     /open-conversation calling into Work Messages) instead of duplicating its
     reference-number/participant/notification/activity-log logic."""
-    if current_user["role"] != UserRole.COMPANY_OWNER:
-        raise HTTPException(status_code=403, detail="Access denied")
-    weekdays = sorted(set(data.weekdays))
-    if not weekdays or any(wd < 0 or wd > 6 for wd in weekdays):
-        raise HTTPException(status_code=400, detail="weekdays must be 0-6 (0=Sunday..6=Saturday)")
-
-    created = []
-    for wd in weekdays:
-        start_date = next_date_for_weekday(wd)
-        event_data = CalendarEventCreate(
-            title=data.title, description=data.description,
-            category=EventCategory.COMPANY_HOLIDAY,
-            start_date=start_date, end_date=start_date, all_day=True,
-            visibility=EventVisibility.COMPANY, recipient_type=EventRecipientType.COMPANY,
-            recurrence_type=RecurrenceType.WEEKLY, recurrence_interval=1,
-            recurrence_end_type=RecurrenceEndType.NEVER,
-            # A permanent, company-wide weekly holiday is an admin-level
-            # schedule decision - it shouldn't be blocked by any one
-            # employee's pre-existing meeting on that weekday, unlike a
-            # single ad-hoc holiday where overriding a conflict is an
-            # explicit, per-event opt-in.
-            override_conflicts=True,
-        )
-        created.append(await create_calendar_event(event_data, current_user))
-    return {"message": "Weekly holiday pattern created", "created": created}
+    return await calendar_service.create_weekly_holiday_pattern(pg, current_user, data)
 
 # ============ Seed Data (For Testing) ============
 

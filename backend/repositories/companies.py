@@ -58,6 +58,14 @@ async def get_working_hours(db: AsyncSession, company_id) -> dict:
     }
 
 
+async def update_working_hours(db: AsyncSession, company_id, working_days, start_time, end_time) -> None:
+    await db.execute(
+        update(Company).where(Company.id == company_id).values(
+            working_days=working_days, working_hours_start_time=start_time, working_hours_end_time=end_time,
+        )
+    )
+
+
 async def soft_delete_cascade(db: AsyncSession, company_id, deleted_at) -> None:
     """Company deletion = one transaction stamping deleted_at on the company
     and every soft-deletable child (users, tasks, departments). Rows without

@@ -450,7 +450,11 @@ class CalendarEvent(Base, TimestampMixin):
     online_link: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     visibility: Mapped[str] = mapped_column(String, nullable=False, server_default="company")
     recipient_type: Mapped[str] = mapped_column(String, nullable=False, server_default="owner")
-    recipient_ids: Mapped[Optional[List[uuid.UUID]]] = mapped_column(ARRAY(PG_UUID(as_uuid=True)), nullable=True)
+    # Polymorphic by design (same pattern as Message.recipient_ids, see
+    # Module 8's migration): a list of employee-id strings for
+    # employee/owner_plus_employees, or department-name strings for
+    # department - never a UUID-only column.
+    recipient_ids: Mapped[Optional[List[str]]] = mapped_column(PG_ARRAY(String), nullable=True)
     recurrence_type: Mapped[str] = mapped_column(String, nullable=False, server_default="none")
     recurrence_interval: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
     recurrence_end_type: Mapped[str] = mapped_column(String, nullable=False, server_default="never")
