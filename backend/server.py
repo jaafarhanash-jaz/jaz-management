@@ -31,6 +31,7 @@ import services.auth as auth_service
 import services.departments as departments_service
 import services.employees as employees_service
 import services.heartbeat as heartbeat_service
+import services.reports as reports_service
 import services.seed as seed_service
 import services.tasks as tasks_service
 from services.admin import parse_uuid
@@ -2057,22 +2058,10 @@ async def get_attendance_audit_log(current_user: dict = Depends(get_current_user
     return await attendance_service.get_attendance_audit_log(pg, parse_uuid(current_user["company_id"]))
 
 @api_router.get("/owner/reports", response_model=List[ReportResponse])
-async def get_reports(current_user: dict = Depends(get_current_user)):
+async def get_reports(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     if current_user["role"] != UserRole.COMPANY_OWNER:
         raise HTTPException(status_code=403, detail="Access denied")
-    
-    reports = await db.reports.find(
-        {"company_id": current_user["company_id"]},
-        {"_id": 0}
-    ).sort("created_at", -1).to_list(1000)
-    
-    # Add employee names
-    for report in reports:
-        employee = await db.users.find_one({"id": report["employee_id"]}, {"_id": 0})
-        if employee:
-            report["employee_name"] = employee["name"]
-    
-    return reports
+    return await reports_service.list_reports_for_owner(pg, current_user["company_id"])
 
 @api_router.get("/owner/departments", response_model=List[DepartmentResponse])
 async def get_departments(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
@@ -2244,25 +2233,10 @@ async def get_employee_performance(current_user: dict = Depends(get_current_user
     }
 
 @api_router.post("/employee/reports", response_model=ReportResponse)
-async def create_report(report: ReportCreate, current_user: dict = Depends(get_current_user)):
+async def create_report(report: ReportCreate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     if current_user["role"] != UserRole.EMPLOYEE:
         raise HTTPException(status_code=403, detail="Access denied")
-    
-    report_doc = {
-        "id": str(uuid.uuid4()),
-        "employee_id": current_user["id"],
-        "employee_name": current_user["name"],
-        "company_id": current_user["company_id"],
-        "title": report.title,
-        "description": report.description,
-        "files": report.files,
-        "images": report.images,
-        "status": "pending",
-        "created_at": datetime.now(timezone.utc).isoformat()
-    }
-    await db.reports.insert_one(report_doc)
-    
-    return ReportResponse(**report_doc)
+    return await reports_service.create_report(pg, current_user, report)
 
 @api_router.put("/employee/profile")
 async def update_profile(updates: dict, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
