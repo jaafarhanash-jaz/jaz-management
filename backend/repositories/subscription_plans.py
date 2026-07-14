@@ -22,6 +22,11 @@ async def list_all(db: AsyncSession) -> List[SubscriptionPlan]:
     return list(result.scalars().all())
 
 
+async def list_active(db: AsyncSession) -> List[SubscriptionPlan]:
+    result = await db.execute(select(SubscriptionPlan).where(SubscriptionPlan.is_active.is_(True)))
+    return list(result.scalars().all())
+
+
 async def create(db: AsyncSession, **fields) -> SubscriptionPlan:
     fields.setdefault("id", uuid.uuid4())
     plan = SubscriptionPlan(**fields)
