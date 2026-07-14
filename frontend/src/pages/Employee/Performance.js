@@ -27,6 +27,21 @@ const EmployeePerformance = ({ onLogout, language, setLanguage }) => {
 
   if (loading) return <Layout userRole="employee" onLogout={onLogout} language={language} setLanguage={setLanguage}><div className="text-center py-12">Loading...</div></Layout>;
 
+  // The fetch can fail (stale token / network / backend restart), leaving
+  // perf null while loading is false. Without this guard the tasksData/render
+  // below would dereference null and crash the page (same class as the Owner
+  // Dashboard bug). Render an explicit, recoverable state instead.
+  if (!perf) return (
+    <Layout userRole="employee" onLogout={onLogout} language={language} setLanguage={setLanguage}>
+      <div className="text-center py-12 text-gray-500" data-testid="employee-performance-error">
+        <p className="mb-4">تعذر تحميل بيانات الأداء. تحقق من الاتصال وحاول مرة أخرى.</p>
+        <button onClick={fetchPerf} className="px-4 py-2 rounded-sm bg-[#0033A0] hover:bg-[#002277] text-white" data-testid="performance-retry-btn">
+          إعادة المحاولة
+        </button>
+      </div>
+    </Layout>
+  );
+
   const tasksData = [
     { name: 'مكتملة', value: perf.completed_tasks, color: '#00A36C' },
     { name: 'متأخرة', value: perf.overdue_tasks, color: '#E11D48' },

@@ -11,12 +11,34 @@ import {
   LogOut,
   Menu,
   X,
-} from 'lucide-react';import { useState } from 'react';
+  Mail,
+  Radio,
+  CalendarDays,
+  CalendarOff,
+} from 'lucide-react';import { useState, useEffect } from 'react';
 import { t } from '@/utils/translations';
+import api from '@/utils/api';
 
 export const Layout = ({ children, userRole, onLogout, language, setLanguage }) => {
   const location = useLocation();
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [unreadMessages, setUnreadMessages] = useState(0);
+
+  // Sidebar-wide unread badge - reuses the existing inbox endpoint
+  // (unread_only=true, page_size=1) rather than a dedicated count endpoint.
+  // Not polled for super_admin: platform staff have no company_id and no
+  // messaging route.
+  useEffect(() => {
+    if (userRole !== 'company_owner' && userRole !== 'employee') return;
+    const poll = () => {
+      api.get('/messages/inbox?unread_only=true&page_size=1')
+        .then((res) => setUnreadMessages(res.data.total))
+        .catch(() => {});
+    };
+    poll();
+    const interval = setInterval(poll, 10000);
+    return () => clearInterval(interval);
+  }, [userRole]);
 
   const getMenuItems = () => {
     if (userRole === 'super_admin') {
@@ -31,6 +53,11 @@ export const Layout = ({ children, userRole, onLogout, language, setLanguage }) 
         { icon: Users, label: t('employees', language), path: '/company-owner/employees' },
         { icon: CheckSquare, label: t('tasks', language), path: '/company-owner/tasks' },
         { icon: Clock, label: t('attendance', language), path: '/company-owner/attendance' },
+        { icon: Mail, label: 'رسائل العمل', path: '/company-owner/messages', badge: unreadMessages },
+        { icon: Radio, label: 'مركز التواصل', path: '/company-owner/communication-center' },
+        { icon: CalendarDays, label: 'التقويم', path: '/company-owner/calendar' },
+        { icon: CalendarDays, label: 'مراقبة التقويم', path: '/company-owner/calendar-monitor' },
+        { icon: CalendarOff, label: 'عطلات الشركة', path: '/company-owner/company-holidays' },
         { icon: FileText, label: t('reports', language), path: '/company-owner/reports' },
         { icon: Building2, label: t('departments', language), path: '/company-owner/departments' },
         { icon: CreditCard, label: 'الاشتراك', path: '/company-owner/subscription' },
@@ -40,6 +67,8 @@ export const Layout = ({ children, userRole, onLogout, language, setLanguage }) 
         { icon: LayoutDashboard, label: t('dashboard', language), path: '/employee/dashboard' },
         { icon: CheckSquare, label: t('tasks', language), path: '/employee/tasks' },
         { icon: Clock, label: t('attendance', language), path: '/employee/attendance' },
+        { icon: Mail, label: 'رسائل العمل', path: '/employee/messages', badge: unreadMessages },
+        { icon: CalendarDays, label: 'التقويم', path: '/employee/calendar' },
         { icon: FileText, label: t('performance', language), path: '/employee/performance' },
         { icon: FileText, label: t('reports', language), path: '/employee/reports' },
       ];
@@ -88,7 +117,14 @@ export const Layout = ({ children, userRole, onLogout, language, setLanguage }) 
                   onClick={() => setSidebarOpen(false)}
                 >
                   <Icon className={`w-5 h-5 ${language === 'ar' ? 'flip-rtl' : ''}`} />
-                  <span className="font-medium text-sm">{item.label}</span>
+                  <span className="font-medium text-sm flex-1">{item.label}</span>
+                  {!!item.badge && (
+                    <span className={`text-xs font-bold rounded-full min-w-[20px] h-5 flex items-center justify-center px-1 ${
+                      isActive ? 'bg-white text-[#0033A0]' : 'bg-red-500 text-white'
+                    }`}>
+                      {item.badge > 99 ? '99+' : item.badge}
+                    </span>
+                  )}
                 </Link>
               );
             })}

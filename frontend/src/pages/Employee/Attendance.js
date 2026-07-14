@@ -30,19 +30,33 @@ const EmployeeAttendance = ({ onLogout, language, setLanguage }) => {
     setLoading(false);
   };
 
-  const getLocation = () => new Promise((resolve) => {
-    if (!navigator.geolocation) return resolve(null);
+  // GPS is mandatory for attendance: a denied/unavailable location rejects
+  // before any API call is made, matching the server-side enforcement.
+  const getLocation = () => new Promise((resolve, reject) => {
+    if (!navigator.geolocation) return reject(new Error('unsupported'));
     navigator.geolocation.getCurrentPosition(
-      (pos) => resolve({ latitude: pos.coords.latitude, longitude: pos.coords.longitude }),
-      () => resolve(null),
-      { timeout: 5000 }
+      (pos) => resolve({
+        latitude: pos.coords.latitude,
+        longitude: pos.coords.longitude,
+        accuracy: pos.coords.accuracy,
+      }),
+      (err) => reject(err),
+      { timeout: 10000, enableHighAccuracy: true }
     );
   });
 
+  const GPS_REQUIRED_MSG = 'خدمة الموقع (GPS) مطلوبة لتسجيل الحضور. يرجى السماح بالوصول إلى موقعك من إعدادات المتصفح والمحاولة مجدداً.';
+
   const doCheckIn = async (qrCode) => {
-    const loc = await getLocation();
+    let loc;
     try {
-      await api.post('/employee/attendance/check-in', { qr_code: qrCode, ...loc });
+      loc = await getLocation();
+    } catch (e) {
+      toast.error(GPS_REQUIRED_MSG);
+      return;
+    }
+    try {
+      await api.post('/employee/attendance/check-in', { qr_code: qrCode, ...loc, device_info: navigator.userAgent });
       toast.success('تم تسجيل الحضور بنجاح');
       fetchAll();
     } catch (e) {
@@ -50,10 +64,16 @@ const EmployeeAttendance = ({ onLogout, language, setLanguage }) => {
     }
   };
 
-  const doCheckOut = async () => {
-    const loc = await getLocation();
+  const doCheckOut = async (qrCode) => {
+    let loc;
     try {
-      await api.post('/employee/attendance/check-out', loc || {});
+      loc = await getLocation();
+    } catch (e) {
+      toast.error(GPS_REQUIRED_MSG);
+      return;
+    }
+    try {
+      await api.post('/employee/attendance/check-out', { qr_code: qrCode, ...loc, device_info: navigator.userAgent });
       toast.success('تم تسجيل الانصراف بنجاح');
       fetchAll();
     } catch (e) {
@@ -74,7 +94,7 @@ const EmployeeAttendance = ({ onLogout, language, setLanguage }) => {
           async (decodedText) => {
             await stopScanner();
             if (mode === 'checkin') await doCheckIn(decodedText);
-            else await doCheckOut();
+            else await doCheckOut(decodedText);
           }
         );
       } catch (err) {
@@ -127,8 +147,8 @@ const EmployeeAttendance = ({ onLogout, language, setLanguage }) => {
               </Button>
             )}
             {today?.check_in_time && !today?.check_out_time && (
-              <Button onClick={doCheckOut} className="bg-red-600 hover:bg-red-700 text-white" data-testid="checkout-btn">
-                <LogOut className="w-4 h-4 me-2" /> تسجيل انصراف
+              <Button onClick={() => startScanner('checkout')} className="bg-red-600 hover:bg-red-700 text-white" data-testid="checkout-btn">
+                <QrCode className="w-4 h-4 me-2" /> Scan QR - تسجيل انصراف
               </Button>
             )}
           </div>

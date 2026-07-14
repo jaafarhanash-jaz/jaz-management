@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -8,6 +9,7 @@ import { toast } from 'sonner';
 import { t } from '@/utils/translations';
 
 const LoginPage = ({ onLogin }) => {
+  const navigate = useNavigate();
   const [credentials, setCredentials] = useState({ email_or_phone: '', password: '' });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -28,9 +30,35 @@ const LoginPage = ({ onLogin }) => {
       toast.success(t('successLogin', language));
       onLogin(response.data.token, response.data.role);
     } catch (err) {
-      const errorMsg = language === 'ar'
-        ? 'البريد الإلكتروني أو كلمة المرور غير صحيحة'
-        : 'Invalid email or password';
+      const detail = err.response?.data?.detail;
+      const status = err.response?.status;
+      if (status === 403 && detail && typeof detail === 'object' && detail.field === 'subscription') {
+        const params = new URLSearchParams({
+          status: detail.status || '',
+          end_date: detail.subscription_end_date || ''
+        });
+        navigate(`/subscription-blocked?${params.toString()}`);
+        return;
+      }
+      // Only a genuine 401 means the credentials are wrong. Anything else
+      // (503 DB-unavailable, 500, or no response at all = network/timeout)
+      // must NOT be reported as "invalid password" - that masked the real
+      // cause. Surface the actual condition so it can be acted on.
+      let errorMsg;
+      if (status === 401) {
+        errorMsg = language === 'ar' ? 'البريد الإلكتروني أو كلمة المرور غير صحيحة' : 'Invalid email or password';
+      } else if (!err.response) {
+        errorMsg = language === 'ar'
+          ? 'تعذر الوصول إلى الخادم. تحقق من الاتصال وحاول مرة أخرى.'
+          : 'Cannot reach the server. Check your connection and try again.';
+      } else if (typeof detail === 'string' && detail) {
+        // Backend-provided message (e.g. the 503 "database unavailable").
+        errorMsg = detail;
+      } else {
+        errorMsg = language === 'ar'
+          ? `تعذر تسجيل الدخول (خطأ ${status}). يرجى المحاولة لاحقاً.`
+          : `Sign-in failed (error ${status}). Please try again later.`;
+      }
       setError(errorMsg);
       toast.error(errorMsg);
     } finally {

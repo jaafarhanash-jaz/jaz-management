@@ -4,7 +4,7 @@ import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import api from '@/utils/api';
 import { t } from '@/utils/translations';
-import { CheckCircle, Clock, TrendingUp, Bell } from 'lucide-react';
+import { CheckCircle, Clock, TrendingUp, Bell, CalendarDays, Timer, Gift, MailQuestion, PartyPopper } from 'lucide-react';
 
 const EmployeeDashboard = ({ onLogout, language, setLanguage }) => {
   const [dashboard, setDashboard] = useState(null);
@@ -15,10 +15,16 @@ const EmployeeDashboard = ({ onLogout, language, setLanguage }) => {
   }, []);
 
   const fetchDashboard = async () => {
+    setLoading(true);
     try {
       const response = await api.get('/employee/dashboard');
       setDashboard(response.data);
     } catch (error) {
+      // A failed fetch must not leave the page "not loading" with no data -
+      // the render below only enters its data-dependent branch once
+      // `dashboard` is actually populated, so this can safely leave it null
+      // without risking a crash. Unlike Owner Dashboard this page has no
+      // auto-poll, so an explicit retry action is the only recovery path.
       console.error('Error fetching dashboard:', error);
     } finally {
       setLoading(false);
@@ -66,8 +72,30 @@ const EmployeeDashboard = ({ onLogout, language, setLanguage }) => {
           <p className="text-gray-600 mt-2">مرحباً بك في لوحة التحكم</p>
         </div>
 
+        {/* Company Holiday banner - additive, only rendered when today is an
+            active company holiday or a configured weekly holiday. */}
+        {dashboard?.today_is_holiday && (
+          <Card className="p-4 bg-emerald-50 border border-emerald-200 rounded-md flex items-center gap-3" data-testid="today-holiday-banner">
+            <PartyPopper className="w-6 h-6 text-emerald-600 flex-shrink-0" />
+            <p className="text-emerald-800 font-medium">
+              {dashboard.today_holiday_type === 'weekly_holiday'
+                ? 'اليوم عطلة أسبوعية'
+                : `اليوم عطلة رسمية للشركة${dashboard.today_holiday_title ? `: ${dashboard.today_holiday_title}` : ''}`}
+            </p>
+          </Card>
+        )}
+
         {loading ? (
           <div className="text-center py-12">Loading...</div>
+        ) : !dashboard ? (
+          // The fetch failed - render an explicit, recoverable state instead
+          // of falling through into content that assumes `dashboard` exists.
+          <div className="text-center py-12 text-gray-500" data-testid="employee-dashboard-error">
+            <p className="mb-4">تعذر تحميل بيانات لوحة التحكم. تحقق من الاتصال وحاول مرة أخرى.</p>
+            <Button onClick={fetchDashboard} className="bg-[#0033A0] hover:bg-[#002277] text-white rounded-sm" data-testid="employee-dashboard-retry-btn">
+              إعادة المحاولة
+            </Button>
+          </div>
         ) : (
           <>
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
@@ -116,6 +144,55 @@ const EmployeeDashboard = ({ onLogout, language, setLanguage }) => {
                 )}
               </div>
             </Card>
+
+            {/* Calendar Widgets - additive section, existing dashboard content above is unchanged */}
+            {dashboard.calendar_widgets && (
+              <Card className="bg-white border border-gray-200 rounded-md shadow-sm p-6" data-testid="employee-calendar-widgets">
+                <div className="flex items-center gap-2 mb-4">
+                  <CalendarDays className="w-5 h-5 text-[#0033A0]" />
+                  <h2 className="text-xl font-bold text-[#0A0A0A]">جدول اليوم</h2>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                  <div>
+                    <p className="text-xs font-medium text-gray-500 mb-2">أحداث اليوم</p>
+                    {dashboard.calendar_widgets.today_events.length === 0 ? (
+                      <p className="text-xs text-gray-400">لا توجد أحداث اليوم</p>
+                    ) : dashboard.calendar_widgets.today_events.map((e) => (
+                      <p key={e.id} className="text-xs text-gray-700 py-0.5">{e.start.slice(11, 16)} - {e.title}</p>
+                    ))}
+                  </div>
+                  <div>
+                    <p className="text-xs font-medium text-gray-500 mb-2 flex items-center gap-1"><Timer className="w-3 h-3" /> الموعد القادم</p>
+                    {dashboard.calendar_widgets.next_event ? (
+                      <>
+                        <p className="text-sm font-bold text-[#0A0A0A]">{dashboard.calendar_widgets.next_event.title}</p>
+                        <p className="text-xs text-gray-500">{Math.floor(dashboard.calendar_widgets.next_event.seconds_remaining / 3600)} ساعة متبقية</p>
+                      </>
+                    ) : <p className="text-xs text-gray-400">لا يوجد</p>}
+                  </div>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                  <div>
+                    <p className="text-xs font-medium text-gray-500 mb-2">اجتماعات قادمة</p>
+                    {dashboard.calendar_widgets.upcoming_meetings.map((m) => (
+                      <p key={m.id} className="text-xs text-gray-700 py-0.5 truncate">{m.title} - {m.start.slice(0, 10)}</p>
+                    ))}
+                    {dashboard.calendar_widgets.upcoming_meetings.length === 0 && <p className="text-xs text-gray-400">لا يوجد</p>}
+                  </div>
+                  <div>
+                    <p className="text-xs font-medium text-gray-500 mb-2 flex items-center gap-1"><Gift className="w-3 h-3" /> عطلات قادمة</p>
+                    {dashboard.calendar_widgets.upcoming_holidays.map((h) => (
+                      <p key={h.id} className="text-xs text-gray-700 py-0.5 truncate">{h.title} - {h.start.slice(0, 10)}</p>
+                    ))}
+                    {dashboard.calendar_widgets.upcoming_holidays.length === 0 && <p className="text-xs text-gray-400">لا يوجد</p>}
+                  </div>
+                  <div>
+                    <p className="text-xs font-medium text-gray-500 mb-2 flex items-center gap-1"><MailQuestion className="w-3 h-3" /> دعوات بلا رد</p>
+                    <p className="text-2xl font-bold text-[#0A0A0A]">{dashboard.calendar_widgets.unanswered_invitations}</p>
+                  </div>
+                </div>
+              </Card>
+            )}
 
             {/* Latest Notification */}
             {dashboard.latest_notification && (
