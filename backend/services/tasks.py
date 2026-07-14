@@ -70,7 +70,12 @@ async def _attachments_response(db: AsyncSession, task_id) -> List[dict]:
     """Fetches attachment metadata for a task and re-inlines the file bytes
     as base64, keeping the response shape byte-identical to the old
     Mongo-era implementation that stored base64 directly on the task
-    document - see the migration plan's attachment response-shape decision."""
+    document - see the migration plan's attachment response-shape decision.
+    The frontend always uploads via FileReader.readAsDataURL, i.e. a full
+    "data:<mime>;base64,<payload>" string (same contract as Messaging/
+    Calendar attachments) - reconstructing that exact prefix here is
+    required for byte-identical old-Mongo-era responses; download_base64()
+    alone only returns the bare payload."""
     rows = await attachments_repo.list_by_task(db, task_id)
     result = []
     for row in rows:
@@ -78,7 +83,7 @@ async def _attachments_response(db: AsyncSession, task_id) -> List[dict]:
             "filename": row.original_filename,
             "mime_type": row.mime_type,
             "attachment_type": row.attachment_type,
-            "data": download_base64(row.storage_path),
+            "data": f"data:{row.mime_type};base64,{download_base64(row.storage_path)}",
             "size_bytes": row.file_size,
         })
     return result
@@ -96,7 +101,7 @@ async def _attachments_by_task(db: AsyncSession, task_ids) -> dict:
             "filename": row.original_filename,
             "mime_type": row.mime_type,
             "attachment_type": row.attachment_type,
-            "data": download_base64(row.storage_path),
+            "data": f"data:{row.mime_type};base64,{download_base64(row.storage_path)}",
             "size_bytes": row.file_size,
         })
     return grouped
