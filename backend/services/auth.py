@@ -57,9 +57,11 @@ def user_to_dict(user) -> dict:
 
 async def resolve_subscription_status(db: AsyncSession, company) -> str:
     """Self-heal on read: an active subscription whose end date has passed
-    is persisted as expired. Ported unchanged from the Mongo implementation."""
+    is persisted as expired. Compares DATE portions only, exactly like the
+    old implementation's is_past_date - a subscription ending today stays
+    active through the whole day and expires tomorrow."""
     if company.subscription_status == SUBSCRIPTION_ACTIVE and company.subscription_end_date and \
-            company.subscription_end_date < datetime.now(timezone.utc):
+            company.subscription_end_date.date() < datetime.now(timezone.utc).date():
         company.subscription_status = SUBSCRIPTION_EXPIRED
         await db.flush()
         return SUBSCRIPTION_EXPIRED

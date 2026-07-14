@@ -10,6 +10,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     String,
@@ -17,6 +18,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
+from sqlalchemy import text
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -52,8 +54,8 @@ class User(Base, TimestampMixin, SoftDeleteMixin):
     __tablename__ = "users"
 
     id: Mapped[uuid.UUID] = uuid_pk()
-    email: Mapped[str] = mapped_column(String, unique=True, nullable=False)
-    phone: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    email: Mapped[str] = mapped_column(String, nullable=False)
+    phone: Mapped[str] = mapped_column(String, nullable=False)
     password: Mapped[str] = mapped_column(String, nullable=False)
     name: Mapped[str] = mapped_column(String, nullable=False)
     role: Mapped[str] = mapped_column(String, nullable=False)
@@ -66,6 +68,11 @@ class User(Base, TimestampMixin, SoftDeleteMixin):
 
     __table_args__ = (
         CheckConstraint("role IN ('super_admin','company_owner','employee')", name="ck_users_role"),
+        # Partial unique: only LIVE rows contend. A soft-deleted user frees
+        # their email/phone for reuse, exactly matching the old hard-delete
+        # behavior (delete employee -> recreate with the same email works).
+        Index("uq_users_email_active", "email", unique=True, postgresql_where=text("deleted_at IS NULL")),
+        Index("uq_users_phone_active", "phone", unique=True, postgresql_where=text("deleted_at IS NULL")),
     )
 
 
@@ -139,7 +146,13 @@ class Department(Base, TimestampMixin, SoftDeleteMixin):
     name: Mapped[str] = mapped_column(String, nullable=False)
     head_id: Mapped[Optional[uuid.UUID]] = fk_uuid("users.id", nullable=True)
 
-    __table_args__ = (UniqueConstraint("company_id", "name", name="uq_departments_company_name"),)
+    __table_args__ = (
+        # Partial unique (live rows only) - same soft-delete rationale as users.
+        Index(
+            "uq_departments_company_name_active", "company_id", "name",
+            unique=True, postgresql_where=text("deleted_at IS NULL"),
+        ),
+    )
 
 
 # ============ Tasks ============

@@ -1,25 +1,13 @@
-import base64
 import uuid
 from datetime import datetime, timedelta, timezone
-from io import BytesIO
 
-import qrcode
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import repositories.subscription_plans as plans_repo
 import repositories.users as users_repo
 from models import Company
 from services.auth import hash_password
-
-
-def _generate_qr_code(data: str) -> str:
-    qr = qrcode.QRCode(version=1, box_size=10, border=5)
-    qr.add_data(data)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
-    buffered = BytesIO()
-    img.save(buffered, format="PNG")
-    return f"data:image/png;base64,{base64.b64encode(buffered.getvalue()).decode()}"
+from services.qr import generate_qr_code
 
 
 async def seed_identity_data(db: AsyncSession) -> None:
@@ -55,7 +43,7 @@ async def seed_identity_data(db: AsyncSession) -> None:
     if not owner:
         owner_id = uuid.uuid4()
         company_id = uuid.uuid4()
-        qr_code = _generate_qr_code(f"company:{company_id}")
+        qr_code = generate_qr_code(f"company:{company_id}")
 
         owner = await users_repo.create(
             db,

@@ -1,7 +1,7 @@
 import uuid
-from typing import Optional
+from typing import Dict, List, Optional
 
-from sqlalchemy import select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import User
@@ -39,3 +39,73 @@ async def update_last_seen(db: AsyncSession, user_id, last_seen_at) -> None:
     user = await get_by_id(db, user_id)
     if user:
         user.last_seen_at = last_seen_at
+
+
+async def get_names_by_ids(db: AsyncSession, user_ids) -> dict:
+    """Batched id -> name lookup (one query, replaces the Mongo-era N+1
+    per-creator find_one loop). Includes soft-deleted users on purpose:
+    a display name on historical data should survive the user's deletion."""
+    if not user_ids:
+        return {}
+    result = await db.execute(select(User.id, User.name).where(User.id.in_(list(user_ids))))
+    return {str(row.id): row.name for row in result.all()}
+
+
+async def get_by_ids(db: AsyncSession, user_ids) -> Dict[str, User]:
+    if not user_ids:
+        return {}
+    result = await db.execute(select(User).where(User.id.in_(list(user_ids))))
+    return {str(u.id): u for u in result.scalars().all()}
+
+
+async def count_employees(db: AsyncSession) -> int:
+    result = await db.execute(
+        select(func.count()).select_from(User).where(User.role == "employee", User.deleted_at.is_(None))
+    )
+    return result.scalar_one()
+
+
+async def employee_stats_by_company(db: AsyncSession, company_ids, online_cutoff) -> dict:
+    """One GROUP BY replacing the old per-company count_documents + per-user
+    presence loop: employee count, employees currently online (last_seen_at
+    within the presence window), and the most recent last_seen, per company."""
+    if not company_ids:
+        return {}
+    result = await db.execute(
+        select(
+            User.company_id,
+            func.count().label("employee_count"),
+            func.count().filter(User.last_seen_at >= online_cutoff).label("employees_online"),
+            func.max(User.last_seen_at).label("max_last_seen"),
+        )
+        .where(
+            User.company_id.in_(list(company_ids)),
+            User.role == "employee",
+            User.deleted_at.is_(None),
+        )
+        .group_by(User.company_id)
+    )
+    return {
+        str(row.company_id): {
+            "employee_count": row.employee_count,
+            "employees_online": row.employees_online,
+            "max_last_seen": row.max_last_seen,
+        }
+        for row in result.all()
+    }
+
+
+async def email_taken(db: AsyncSession, email: str, exclude_id=None) -> bool:
+    query = select(func.count()).select_from(User).where(User.email == email, User.deleted_at.is_(None))
+    if exclude_id is not None:
+        query = query.where(User.id != exclude_id)
+    result = await db.execute(query)
+    return result.scalar_one() > 0
+
+
+async def phone_taken(db: AsyncSession, phone: str, exclude_id=None) -> bool:
+    query = select(func.count()).select_from(User).where(User.phone == phone, User.deleted_at.is_(None))
+    if exclude_id is not None:
+        query = query.where(User.id != exclude_id)
+    result = await db.execute(query)
+    return result.scalar_one() > 0

@@ -25,7 +25,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db
 import repositories.users as users_repo
+import services.admin as admin_service
 import services.auth as auth_service
+import services.heartbeat as heartbeat_service
 import services.seed as seed_service
 
 ROOT_DIR = Path(__file__).parent
@@ -728,84 +730,8 @@ def generate_qr_code(data: str) -> str:
     img_str = base64.b64encode(buffered.getvalue()).decode()
     return f"data:image/png;base64,{img_str}"
 
-def is_past_date(date_str: Optional[str]) -> bool:
-    """Compares only the date portion so both plain 'YYYY-MM-DD' values and
-    legacy full ISO datetime values (from the Stripe flow) compare correctly."""
-    if not date_str:
-        return False
-    return date_str[:10] < datetime.now(timezone.utc).date().isoformat()
-
-# Plan fields that identify/manage the plan itself, not its configuration -
-# never copied onto a company.
-PLAN_IDENTITY_FIELDS = {"id", "name", "is_active"}
-# Plan field names that map to a differently-named company field, kept for
-# backward compatibility with fields already in use elsewhere in the app.
-PLAN_FIELD_RENAMES = {"price": "subscription_price"}
-
-def plan_config_for_company(plan: dict) -> dict:
-    """Maps a subscription plan's full configuration onto the company fields
-    that mirror it. A company must inherit everything about its assigned plan
-    - not just price and max_employees - whenever the plan is assigned,
-    changed, or renewed. Any plan property added in the future is picked up
-    automatically here with no further changes needed at the call sites."""
-    config = {}
-    for key, value in plan.items():
-        if key in PLAN_IDENTITY_FIELDS:
-            continue
-        if key == "max_employees":
-            config["max_employees"] = value
-        else:
-            config[PLAN_FIELD_RENAMES.get(key, f"subscription_{key}")] = value
-    return config
-
-async def resolve_subscription_status(company: dict) -> str:
-    """Self-heal on read: if an active subscription's end date has passed,
-    persist it as expired. No cron/scheduler - this runs inline wherever a
-    company is accessed."""
-    status_value = company.get("subscription_status")
-    if status_value == SubscriptionStatus.ACTIVE and is_past_date(company.get("subscription_end_date")):
-        await db.companies.update_one(
-            {"id": company["id"]},
-            {"$set": {"subscription_status": SubscriptionStatus.EXPIRED}}
-        )
-        return SubscriptionStatus.EXPIRED
-    return status_value
-
-# A user counts as online if their last heartbeat arrived within this window.
-# No cron/scheduler - "offline" is computed lazily wherever presence is read,
-# the same self-heal-on-read approach used for subscription expiry above.
-PRESENCE_TIMEOUT_SECONDS = 60
-
-def is_user_online(last_seen_at: Optional[str]) -> bool:
-    if not last_seen_at:
-        return False
-    try:
-        last_seen = datetime.fromisoformat(last_seen_at)
-    except ValueError:
-        return False
-    return (datetime.now(timezone.utc) - last_seen).total_seconds() <= PRESENCE_TIMEOUT_SECONDS
-
-async def get_company_presence(company: dict) -> dict:
-    """A company is online whenever its owner OR at least one employee has
-    sent a heartbeat within the last PRESENCE_TIMEOUT_SECONDS."""
-    owner = await db.users.find_one({"id": company.get("owner_id")}, {"_id": 0, "last_seen_at": 1})
-    owner_last_seen = owner.get("last_seen_at") if owner else None
-    owner_online = is_user_online(owner_last_seen)
-
-    employees = await db.users.find(
-        {"company_id": company["id"], "role": UserRole.EMPLOYEE},
-        {"_id": 0, "last_seen_at": 1}
-    ).to_list(1000)
-    employees_online = sum(1 for e in employees if is_user_online(e.get("last_seen_at")))
-
-    all_last_seens = [ls for ls in ([owner_last_seen] + [e.get("last_seen_at") for e in employees]) if ls]
-
-    return {
-        "owner_online": owner_online,
-        "employees_online": employees_online,
-        "company_online": owner_online or employees_online > 0,
-        "last_seen": max(all_last_seens) if all_last_seens else None
-    }
+# Subscription-status resolution, presence computation and plan-config
+# mapping moved to services/auth.py + services/admin.py (Postgres-backed).
 
 # ---- Smart QR Attendance helpers ----
 
@@ -845,7 +771,7 @@ def attendance_settings_for(company: dict) -> dict:
     }
 
 async def ensure_qr_token(company: dict) -> str:
-    """Self-heal on read (same pattern as resolve_subscription_status): a
+    """Self-heal on read (same pattern as subscription-expiry resolution): a
     company whose printed QR predates this feature - when the QR embedded the
     raw company id - gets an opaque random token and a regenerated QR image
     the first time its QR is needed. The QR encodes only this token, never
@@ -1744,27 +1670,6 @@ async def compute_calendar_dashboard_widgets(current_user: dict, is_owner: bool)
         widgets["unanswered_invitations"] = my_pending
     return widgets
 
-async def enforce_company_access(user: dict):
-    """Blocks company owners/employees whose company subscription is expired
-    or suspended. Super Admins have no company_id and are never affected.
-    The detail is a structured object (not a plain string) so the frontend can
-    show a dedicated blocked-experience page with the actual expiration date,
-    rather than a generic error."""
-    company_id = user.get("company_id")
-    if not company_id:
-        return
-    company = await db.companies.find_one({"id": company_id}, {"_id": 0})
-    if not company:
-        return
-    effective_status = await resolve_subscription_status(company)
-    if effective_status in (SubscriptionStatus.EXPIRED, SubscriptionStatus.SUSPENDED):
-        raise HTTPException(status_code=403, detail={
-            "field": "subscription",
-            "status": effective_status,
-            "message": f"Company subscription is {effective_status}",
-            "subscription_end_date": company.get("subscription_end_date")
-        })
-
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
     pg: AsyncSession = Depends(get_db),
@@ -1789,462 +1694,89 @@ async def heartbeat(current_user: dict = Depends(get_current_user), pg: AsyncSes
     """Lightweight presence signal sent periodically by logged-in owner/employee
     sessions. No new infrastructure - a company's online status is derived by
     checking how recently its users' last_seen_at falls within
-    PRESENCE_TIMEOUT_SECONDS, computed on read (see get_company_presence)."""
-    # Postgres-backed (Auth module, migrated).
+    PRESENCE_TIMEOUT_SECONDS, computed on read (see services/admin.py)."""
+    # Postgres-backed. See services/heartbeat.py for the Critical Task Alert
+    # fallback detection that piggybacks on this endpoint for employees.
     await users_repo.update_last_seen(pg, current_user["id"], datetime.now(timezone.utc))
-    await pg.commit()
 
     response = {"message": "ok"}
-
     if current_user["role"] == UserRole.EMPLOYEE:
-        # Critical Task Alert fallback detection - reuses this pre-existing,
-        # already app-wide-polled heartbeat instead of a new polling loop.
-        # Pages with their own task polling (e.g. Employee/Tasks.js) surface
-        # critical tasks sooner; this is the guaranteed floor (<= heartbeat
-        # interval) for pages that don't poll tasks at all.
-        pending = await db.tasks.find(
-            {
-                "assigned_to": current_user["id"],
-                "priority": TaskPriority.CRITICAL,
-                "status": {"$in": [TaskStatus.NEW, TaskStatus.SEEN]},
-            },
-            {"_id": 0}
-        ).to_list(50)
-
-        pending_critical_tasks = []
-        creator_names: Dict[str, Optional[str]] = {}
-        for task in pending:
-            if not task.get("alert_delivered_at"):
-                delivered_at = datetime.now(timezone.utc).isoformat()
-                # Atomic claim so concurrent heartbeats (multiple tabs) don't
-                # fire the "delivered" notification more than once.
-                claimed = await db.tasks.find_one_and_update(
-                    {"id": task["id"], "alert_delivered_at": None},
-                    {"$set": {"alert_delivered_at": delivered_at}}
-                )
-                if claimed:
-                    task["alert_delivered_at"] = delivered_at
-                    await db.notifications.insert_one({
-                        "id": str(uuid.uuid4()),
-                        "user_id": task["created_by"],
-                        "company_id": current_user["company_id"],
-                        "type": "critical_task_delivered",
-                        "title": "تم تسليم مهمة عاجلة",
-                        "message": f"تم عرض تنبيه المهمة العاجلة على الموظف {current_user['name']} للمهمة: {task['title']}",
-                        "read_status": False,
-                        "created_at": delivered_at
-                    })
-            creator_id = task.get("created_by")
-            if creator_id and creator_id not in creator_names:
-                creator = await db.users.find_one({"id": creator_id}, {"_id": 0, "name": 1})
-                creator_names[creator_id] = creator["name"] if creator else None
-            pending_critical_tasks.append({
-                "id": task["id"],
-                "title": task["title"],
-                "description": task.get("description"),
-                "priority": task["priority"],
-                "status": task["status"],
-                "due_date": task.get("due_date"),
-                "due_time": task.get("due_time"),
-                "created_at": task.get("created_at"),
-                "created_by_name": creator_names.get(creator_id),
-                "requires_proof": task.get("requires_proof", False),
-                "attachments": task.get("attachments", []),
-            })
-
-        response["pending_critical_tasks"] = pending_critical_tasks
-
+        response["pending_critical_tasks"] = await heartbeat_service.pending_critical_tasks(pg, current_user)
+    await pg.commit()
     return response
 
 # ============ Super Admin Routes ============
+# Postgres-backed (Super Admin module, migrated). Business logic lives in
+# services/admin.py; these handlers only check the role and delegate.
 
-EXPIRING_SOON_DAYS = 7
+def require_super_admin(current_user: dict):
+    if current_user["role"] != UserRole.SUPER_ADMIN:
+        raise HTTPException(status_code=403, detail="Access denied")
 
 @api_router.get("/admin/statistics")
-async def get_admin_statistics(current_user: dict = Depends(get_current_user)):
-    if current_user["role"] != UserRole.SUPER_ADMIN:
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    companies = await db.companies.find({}, {"_id": 0}).to_list(1000)
-    total_companies = len(companies)
-    total_employees = await db.users.count_documents({"role": UserRole.EMPLOYEE})
-
-    today = datetime.now(timezone.utc).date()
-    soon_cutoff = (today + timedelta(days=EXPIRING_SOON_DAYS)).isoformat()
-    today_str = today.isoformat()
-
-    active_count = 0
-    expired_count = 0
-    total_revenue = 0
-    expiring_soon_companies = []
-    expired_companies_list = []
-    companies_online_count = 0
-
-    for company in companies:
-        # Self-heal on read: resolve the true status before counting/displaying it
-        effective_status = await resolve_subscription_status(company)
-
-        presence = await get_company_presence(company)
-        if presence["company_online"]:
-            companies_online_count += 1
-
-        if effective_status == SubscriptionStatus.ACTIVE:
-            # Revenue only counts Active companies - expired/suspended contribute nothing
-            total_revenue += company.get("subscription_price") or 0
-            active_count += 1
-            end_date = company.get("subscription_end_date")
-            if end_date:
-                end_date_only = end_date[:10]
-                if today_str <= end_date_only <= soon_cutoff:
-                    remaining_days = (datetime.fromisoformat(end_date_only).date() - today).days
-                    expiring_soon_companies.append({
-                        "id": company["id"],
-                        "name": company["name"],
-                        "end_date": end_date_only,
-                        "remaining_days": remaining_days
-                    })
-        elif effective_status == SubscriptionStatus.EXPIRED:
-            expired_count += 1
-            expired_companies_list.append({
-                "id": company["id"],
-                "name": company["name"],
-                "end_date": (company.get("subscription_end_date") or "")[:10],
-                "status": effective_status
-            })
-
-    return {
-        "total_companies": total_companies,
-        "active_companies": active_count,
-        "inactive_companies": total_companies - active_count,
-        "total_employees": total_employees,
-        "total_revenue": total_revenue,
-        "expired_companies": expired_count,
-        "expiring_soon_count": len(expiring_soon_companies),
-        "expiring_soon_companies": expiring_soon_companies,
-        "expired_companies_list": expired_companies_list,
-        "companies_online": companies_online_count,
-        "companies_offline": total_companies - companies_online_count
-    }
+async def get_admin_statistics(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    require_super_admin(current_user)
+    return await admin_service.get_statistics(pg)
 
 @api_router.get("/admin/companies", response_model=List[CompanyResponse])
-async def get_all_companies(current_user: dict = Depends(get_current_user)):
-    if current_user["role"] != UserRole.SUPER_ADMIN:
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    companies = await db.companies.find({}, {"_id": 0}).to_list(1000)
-
-    # Add employee count, owner contact info, and self-healed status to each company
-    for company in companies:
-        count = await db.users.count_documents({"company_id": company["id"], "role": UserRole.EMPLOYEE})
-        company["employee_count"] = count
-        owner = await db.users.find_one({"id": company.get("owner_id")}, {"_id": 0, "password": 0})
-        if owner:
-            company["owner_name"] = owner.get("name")
-            company["owner_email"] = owner.get("email")
-            company["owner_phone"] = owner.get("phone")
-        company["subscription_status"] = await resolve_subscription_status(company)
-        company.update(await get_company_presence(company))
-
-    return companies
+async def get_all_companies(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    require_super_admin(current_user)
+    return await admin_service.list_companies(pg)
 
 @api_router.post("/admin/companies", response_model=CompanyResponse)
-async def create_company(company: CompanyCreate, current_user: dict = Depends(get_current_user)):
-    if current_user["role"] != UserRole.SUPER_ADMIN:
-        raise HTTPException(status_code=403, detail="Access denied")
-    
-    # Check if owner email already exists
-    existing = await db.users.find_one({"email": company.owner_email})
-    if existing:
-        raise HTTPException(status_code=400, detail="Email already registered")
-
-    # Subscription price and max_employees are always derived server-side from
-    # the selected plan - never trusted from the client.
-    plan = await db.subscription_plans.find_one({"id": company.subscription_plan_id}, {"_id": 0})
-    if not plan or not plan.get("is_active"):
-        raise HTTPException(status_code=400, detail="Selected subscription plan is not available")
-
-    company_id = str(uuid.uuid4())
-    owner_id = str(uuid.uuid4())
-    
-    # The attendance QR encodes only an opaque random token - never any
-    # company data (see ensure_qr_token for companies created before this).
-    qr_token = uuid.uuid4().hex
-    qr_code = generate_qr_code(qr_token)
-
-    # Create owner user
-    owner_user = {
-        "id": owner_id,
-        "email": company.owner_email,
-        "phone": company.owner_phone,
-        "password": hash_password(company.owner_password),
-        "name": company.owner_name,
-        "role": UserRole.COMPANY_OWNER,
-        "company_id": company_id,
-        "status": "active",
-        "created_at": datetime.now(timezone.utc).isoformat()
-    }
-    await db.users.insert_one(owner_user)
-    
-    # Create company
-    company_doc = {
-        "id": company_id,
-        "name": company.name,
-        "owner_id": owner_id,
-        "qr_code": qr_code,
-        "qr_token": qr_token,
-        "subscription_status": "active",
-        "subscription_plan_id": company.subscription_plan_id,
-        "subscription_start_date": None,
-        "subscription_end_date": None,
-        **plan_config_for_company(plan),
-        "address": company.address,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "employee_count": 0
-    }
-    await db.companies.insert_one(company_doc)
-    
-    return CompanyResponse(**company_doc)
+async def create_company(company: CompanyCreate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    require_super_admin(current_user)
+    return await admin_service.create_company(pg, company)
 
 @api_router.put("/admin/companies/{company_id}")
-async def update_company(company_id: str, updates: CompanyOwnerUpdate, current_user: dict = Depends(get_current_user)):
-    if current_user["role"] != UserRole.SUPER_ADMIN:
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    company = await db.companies.find_one({"id": company_id}, {"_id": 0})
-    if not company:
-        raise HTTPException(status_code=404, detail="Company not found")
-
-    owner_id = company.get("owner_id")
-
-    # Whitelist allowed company fields. subscription_status, subscription_end_date
-    # and subscription_price are intentionally excluded here: status/dates are only
-    # changed via the dedicated activate/suspend/reactivate/renew actions (so their
-    # validation can't be bypassed by a generic field edit), and price is always
-    # derived from the assigned plan below, never client-set directly.
-    allowed_fields = ["name", "address"]
-    company_updates = {k: v for k, v in updates.model_dump(exclude_none=True).items() if k in allowed_fields}
-
-    # Changing the plan updates the company's full plan configuration together,
-    # but never touches subscription_status, subscription_start_date or
-    # subscription_end_date.
-    if updates.subscription_plan_id is not None:
-        plan = await db.subscription_plans.find_one({"id": updates.subscription_plan_id}, {"_id": 0})
-        if not plan or not plan.get("is_active"):
-            raise HTTPException(status_code=400, detail="Selected subscription plan is not available")
-        company_updates["subscription_plan_id"] = updates.subscription_plan_id
-        company_updates.update(plan_config_for_company(plan))
-
-    # Validate owner account changes before writing anything, so the company
-    # and owner updates either both apply or neither does. MongoDB multi-document
-    # transactions require a replica set, which this deployment doesn't use (and
-    # nothing else in this app uses transactions either), so atomicity here is
-    # enforced by validating everything up front rather than a DB transaction.
-    owner_updates = {}
-
-    if updates.owner_name is not None:
-        if not updates.owner_name.strip():
-            raise HTTPException(status_code=400, detail={"field": "owner_name", "message": "Owner name is required"})
-        owner_updates["name"] = updates.owner_name
-
-    if updates.owner_email is not None:
-        existing = await db.users.find_one({"email": updates.owner_email, "id": {"$ne": owner_id}})
-        if existing:
-            raise HTTPException(status_code=400, detail={"field": "owner_email", "message": "Email already registered"})
-        owner_updates["email"] = updates.owner_email
-
-    if updates.owner_phone is not None:
-        if not updates.owner_phone.strip():
-            raise HTTPException(status_code=400, detail={"field": "owner_phone", "message": "Phone number is required"})
-        existing = await db.users.find_one({"phone": updates.owner_phone, "id": {"$ne": owner_id}})
-        if existing:
-            raise HTTPException(status_code=400, detail={"field": "owner_phone", "message": "Phone number already registered"})
-        owner_updates["phone"] = updates.owner_phone
-
-    if updates.owner_password or updates.owner_password_confirm:
-        if updates.owner_password != updates.owner_password_confirm:
-            raise HTTPException(status_code=400, detail={"field": "owner_password_confirm", "message": "Passwords do not match"})
-        owner_updates["password"] = hash_password(updates.owner_password)
-
-    if not company_updates and not owner_updates:
-        raise HTTPException(status_code=400, detail="No valid fields to update")
-
-    if company_updates:
-        await db.companies.update_one({"id": company_id}, {"$set": company_updates})
-
-    if owner_updates and owner_id:
-        await db.users.update_one({"id": owner_id, "role": UserRole.COMPANY_OWNER}, {"$set": owner_updates})
-
-    return {"message": "Company updated successfully"}
+async def update_company(company_id: str, updates: CompanyOwnerUpdate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    require_super_admin(current_user)
+    return await admin_service.update_company(pg, company_id, updates)
 
 @api_router.post("/admin/companies/{company_id}/activate")
-async def activate_subscription(company_id: str, data: SubscriptionActivate, current_user: dict = Depends(get_current_user)):
-    if current_user["role"] != UserRole.SUPER_ADMIN:
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    company = await db.companies.find_one({"id": company_id}, {"_id": 0})
-    if not company:
-        raise HTTPException(status_code=404, detail="Company not found")
-
-    if data.subscription_end_date < data.subscription_start_date:
-        raise HTTPException(status_code=400, detail="End date cannot be earlier than start date")
-
-    await db.companies.update_one(
-        {"id": company_id},
-        {"$set": {
-            "subscription_status": SubscriptionStatus.ACTIVE,
-            "subscription_start_date": data.subscription_start_date,
-            "subscription_end_date": data.subscription_end_date
-        }}
-    )
-    return {"message": "Subscription activated successfully"}
+async def activate_subscription(company_id: str, data: SubscriptionActivate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    require_super_admin(current_user)
+    return await admin_service.activate_subscription(pg, company_id, data)
 
 @api_router.post("/admin/companies/{company_id}/suspend")
-async def suspend_subscription(company_id: str, current_user: dict = Depends(get_current_user)):
-    if current_user["role"] != UserRole.SUPER_ADMIN:
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    result = await db.companies.update_one(
-        {"id": company_id},
-        {"$set": {"subscription_status": SubscriptionStatus.SUSPENDED}}
-    )
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Company not found")
-
-    return {"message": "Subscription suspended successfully"}
+async def suspend_subscription(company_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    require_super_admin(current_user)
+    return await admin_service.suspend_subscription(pg, company_id)
 
 @api_router.post("/admin/companies/{company_id}/reactivate")
-async def reactivate_subscription(company_id: str, current_user: dict = Depends(get_current_user)):
-    if current_user["role"] != UserRole.SUPER_ADMIN:
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    company = await db.companies.find_one({"id": company_id}, {"_id": 0})
-    if not company:
-        raise HTTPException(status_code=404, detail="Company not found")
-
-    if company.get("subscription_status") != SubscriptionStatus.SUSPENDED:
-        raise HTTPException(status_code=400, detail="Company is not suspended")
-
-    if is_past_date(company.get("subscription_end_date")):
-        raise HTTPException(
-            status_code=400,
-            detail="Subscription has expired and must be renewed by updating the subscription dates first"
-        )
-
-    await db.companies.update_one({"id": company_id}, {"$set": {"subscription_status": SubscriptionStatus.ACTIVE}})
-    return {"message": "Subscription reactivated successfully"}
+async def reactivate_subscription(company_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    require_super_admin(current_user)
+    return await admin_service.reactivate_subscription(pg, company_id)
 
 @api_router.post("/admin/companies/{company_id}/renew")
-async def renew_subscription(company_id: str, data: SubscriptionRenew, current_user: dict = Depends(get_current_user)):
-    if current_user["role"] != UserRole.SUPER_ADMIN:
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    company = await db.companies.find_one({"id": company_id}, {"_id": 0})
-    if not company:
-        raise HTTPException(status_code=404, detail="Company not found")
-
-    # Option 1 (renew using current plan): plan_id omitted, falls back to the
-    # company's current plan. Option 2 (renew using a different plan): the
-    # admin's chosen plan_id is used instead.
-    plan_id = data.subscription_plan_id or company.get("subscription_plan_id")
-    if not plan_id:
-        raise HTTPException(status_code=400, detail="No subscription plan selected")
-
-    plan = await db.subscription_plans.find_one({"id": plan_id}, {"_id": 0})
-    if not plan or not plan.get("is_active"):
-        raise HTTPException(status_code=400, detail="Selected subscription plan is not available")
-
-    # Extend from the later of the current end date or today, so renewing before
-    # expiry doesn't discard remaining time. Uses the same 30-days-per-month
-    # approximation already used by the existing Stripe webhook success handler.
-    # subscription_start_date is intentionally left untouched.
-    today = datetime.now(timezone.utc).date()
-    base_date = today
-    current_end = company.get("subscription_end_date")
-    if current_end:
-        try:
-            base_date = max(today, datetime.fromisoformat(current_end[:10]).date())
-        except ValueError:
-            base_date = today
-    new_end_date = (base_date + timedelta(days=30 * plan["duration_months"])).isoformat()
-
-    await db.companies.update_one(
-        {"id": company_id},
-        {"$set": {
-            "subscription_plan_id": plan_id,
-            **plan_config_for_company(plan),
-            "subscription_status": SubscriptionStatus.ACTIVE,
-            "subscription_end_date": new_end_date
-        }}
-    )
-    return {"message": "Subscription renewed successfully"}
+async def renew_subscription(company_id: str, data: SubscriptionRenew, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    require_super_admin(current_user)
+    return await admin_service.renew_subscription(pg, company_id, data)
 
 @api_router.delete("/admin/companies/{company_id}")
-async def delete_company(company_id: str, current_user: dict = Depends(get_current_user)):
-    if current_user["role"] != UserRole.SUPER_ADMIN:
-        raise HTTPException(status_code=403, detail="Access denied")
-    
-    # Delete company and all related data
-    await db.companies.delete_one({"id": company_id})
-    await db.users.delete_many({"company_id": company_id})
-    await db.tasks.delete_many({"company_id": company_id})
-    await db.attendance.delete_many({"company_id": company_id})
-    await db.reports.delete_many({"company_id": company_id})
-    
-    return {"message": "Company deleted successfully"}
+async def delete_company(company_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    require_super_admin(current_user)
+    return await admin_service.delete_company(pg, company_id)
 
 @api_router.get("/admin/subscription-plans", response_model=List[SubscriptionPlanResponse])
-async def get_subscription_plans(current_user: dict = Depends(get_current_user)):
-    if current_user["role"] != UserRole.SUPER_ADMIN:
-        raise HTTPException(status_code=403, detail="Access denied")
-    
-    plans = await db.subscription_plans.find({}, {"_id": 0}).to_list(100)
-    return plans
+async def get_subscription_plans(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    require_super_admin(current_user)
+    return await admin_service.list_plans(pg)
 
 @api_router.post("/admin/subscription-plans", response_model=SubscriptionPlanResponse)
-async def create_subscription_plan(plan: SubscriptionPlanCreate, current_user: dict = Depends(get_current_user)):
-    if current_user["role"] != UserRole.SUPER_ADMIN:
-        raise HTTPException(status_code=403, detail="Access denied")
-    
-    plan_doc = {
-        "id": str(uuid.uuid4()),
-        **plan.model_dump(),
-        "is_active": True
-    }
-    await db.subscription_plans.insert_one(plan_doc)
-    return SubscriptionPlanResponse(**plan_doc)
+async def create_subscription_plan(plan: SubscriptionPlanCreate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    require_super_admin(current_user)
+    return await admin_service.create_plan(pg, plan)
 
 @api_router.put("/admin/subscription-plans/{plan_id}")
-async def update_subscription_plan(plan_id: str, updates: SubscriptionPlanUpdate, current_user: dict = Depends(get_current_user)):
-    if current_user["role"] != UserRole.SUPER_ADMIN:
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    safe_updates = updates.model_dump(exclude_none=True)
-    if not safe_updates:
-        raise HTTPException(status_code=400, detail="No valid fields to update")
-
-    result = await db.subscription_plans.update_one({"id": plan_id}, {"$set": safe_updates})
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Plan not found")
-
-    return {"message": "Plan updated successfully"}
+async def update_subscription_plan(plan_id: str, updates: SubscriptionPlanUpdate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    require_super_admin(current_user)
+    return await admin_service.update_plan(pg, plan_id, updates)
 
 @api_router.delete("/admin/subscription-plans/{plan_id}")
-async def delete_subscription_plan(plan_id: str, current_user: dict = Depends(get_current_user)):
-    if current_user["role"] != UserRole.SUPER_ADMIN:
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    companies_using_plan = await db.companies.count_documents({"subscription_plan_id": plan_id})
-    if companies_using_plan > 0:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Cannot delete this plan: {companies_using_plan} company(ies) are currently assigned to it"
-        )
-
-    result = await db.subscription_plans.delete_one({"id": plan_id})
-    if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Plan not found")
-
-    return {"message": "Plan deleted successfully"}
+async def delete_subscription_plan(plan_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    require_super_admin(current_user)
+    return await admin_service.delete_plan(pg, plan_id)
 
 # ============ Company Owner Routes ============
 
@@ -5389,69 +4921,12 @@ async def create_weekly_holiday_pattern(data: WeeklyHolidayPatternCreate, curren
 
 @api_router.post("/seed")
 async def seed_data(pg: AsyncSession = Depends(get_db)):
-    # Postgres-backed (Auth module, migrated): super admin, demo plan, demo
-    # company+owner, demo employees. Idempotent via business keys (email /
-    # plan name) - see services/seed.py.
+    # Postgres-backed: super admin, demo plan, demo company+owner, demo
+    # employees. Idempotent via business keys (email / plan name) - see
+    # services/seed.py. The old Mongo demo departments/tasks seeding was
+    # removed per the cleanup-first migration policy; it gets reintroduced
+    # in seed_service as those modules migrate to Postgres.
     await seed_service.seed_identity_data(pg)
-
-    # Everything below (departments/tasks) is still Mongo-backed and will
-    # stay that way until the Employees/Tasks modules migrate. MongoDB has
-    # no live instance right now (see migration plan) - this block is
-    # expected to hit the existing ServerSelectionTimeoutError -> 503
-    # handler on first call. Harmless: it only runs once (guarded by the
-    # company_id existence check below), the Postgres portion above already
-    # committed by this point, and the test suite's seed fixture doesn't
-    # assert on this endpoint's response.
-    company_id = "company-001"
-    company = await db.companies.find_one({"id": company_id})
-    if not company:
-        owner_id = "owner-001"
-
-        # Create demo tasks
-        tasks = [
-            {
-                "id": "task-001",
-                "company_id": company_id,
-                "assigned_to": "emp-001",
-                "title": "متابعة العملاء الجدد",
-                "description": "التواصل مع قائمة العملاء المحتملين وإرسال العروض",
-                "priority": TaskPriority.HIGH,
-                "status": TaskStatus.NEW,
-                "due_date": (datetime.now(timezone.utc) + timedelta(days=2)).date().isoformat(),
-                "requires_proof": False,
-                "proof_files": [],
-                "created_by": owner_id,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "completed_at": None
-            },
-            {
-                "id": "task-002",
-                "company_id": company_id,
-                "assigned_to": "emp-002",
-                "title": "تصميم حملة إعلانية",
-                "description": "إنشاء محتوى إبداعي للحملة الإعلانية القادمة",
-                "priority": TaskPriority.MEDIUM,
-                "status": TaskStatus.IN_PROGRESS,
-                "due_date": (datetime.now(timezone.utc) + timedelta(days=5)).date().isoformat(),
-                "requires_proof": True,
-                "proof_files": [],
-                "created_by": owner_id,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "completed_at": None
-            }
-        ]
-        await db.tasks.insert_many(tasks)
-        
-        # Create demo department
-        dept_doc = {
-            "id": "dept-001",
-            "company_id": company_id,
-            "name": "المبيعات",
-            "head_id": "emp-001",
-            "created_at": datetime.now(timezone.utc).isoformat()
-        }
-        await db.departments.insert_one(dept_doc)
-    
     return {"message": "Seed data created successfully", "admin_email": "admin@jaz.com", "admin_password": "admin123", "owner_email": "owner@demo.com", "owner_password": "owner123", "employee_email": "employee1@demo.com", "employee_password": "emp123"}
 
 
