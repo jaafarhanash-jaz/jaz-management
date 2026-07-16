@@ -2,8 +2,10 @@ from typing import List
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import repositories.companies as companies_repo
 import repositories.reports as reports_repo
 import repositories.users as users_repo
+import services.notifications as notifications_service
 from services.admin import parse_uuid
 
 
@@ -34,11 +36,12 @@ async def list_reports_for_owner(db: AsyncSession, company_id) -> List[dict]:
 
 
 async def create_report(db: AsyncSession, current_user: dict, data) -> dict:
+    company_id = parse_uuid(current_user["company_id"])
     report = await reports_repo.create(
         db,
         employee_id=parse_uuid(current_user["id"]),
         employee_name=current_user["name"],
-        company_id=parse_uuid(current_user["company_id"]),
+        company_id=company_id,
         title=data.title,
         description=data.description,
         files=data.files,
@@ -47,4 +50,22 @@ async def create_report(db: AsyncSession, current_user: dict, data) -> dict:
     )
     await db.flush()
     await db.refresh(report)
+
+    company = await companies_repo.get_by_id(db, company_id)
+    if company:
+        await notifications_service.publish(
+            db,
+            user_id=company.owner_id,
+            company_id=company_id,
+            category=notifications_service.CATEGORY_REPORTS,
+            type="report_submitted",
+            title="تقرير جديد",
+            message=f"قدّم الموظف {current_user['name']} تقريراً جديداً: {report.title}",
+            entity_type="report",
+            entity_id=report.id,
+            action_url="/company-owner/reports",
+            sender_id=parse_uuid(current_user["id"]),
+            sender_name=current_user["name"],
+        )
+
     return report_response(report, employee_name=current_user["name"])

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { Layout } from '@/components/Layout';
 import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -57,11 +58,24 @@ const EmployeeTasks = ({ onLogout, language, setLanguage }) => {
   const [confirmAction, setConfirmAction] = useState(null);
   const knownUrgentIds = useRef(null);
 
+  // The Employee Dashboard's "Quick Open" links here with ?highlight=<id> -
+  // scrolls to and briefly outlines that task card so the click feels like
+  // it actually landed somewhere, instead of dropping the employee onto an
+  // undifferentiated list they have to re-scan.
+  const [searchParams] = useSearchParams();
+  const highlightId = searchParams.get('highlight');
+
   useEffect(() => {
     fetchTasks();
     const interval = setInterval(() => fetchTasks(true), 10000);
     return () => clearInterval(interval);
   }, []);
+
+  useEffect(() => {
+    if (!highlightId || tasks.length === 0) return;
+    const el = document.getElementById(`task-${highlightId}`);
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }, [highlightId, tasks]);
 
   const fetchTasks = async (silent = false) => {
     if (!silent) setLoading(true);
@@ -138,7 +152,8 @@ const EmployeeTasks = ({ onLogout, language, setLanguage }) => {
   const renderTaskCard = (task, highlight = false) => (
     <Card
       key={task.id}
-      className={`p-6 border rounded-md task-card ${highlight ? 'bg-red-50/40 border-red-200' : 'bg-white border-gray-200'}`}
+      id={`task-${task.id}`}
+      className={`p-6 border rounded-md task-card transition-shadow ${highlight ? 'bg-red-50/40 border-red-200' : 'bg-white border-gray-200'} ${highlightId === task.id ? 'ring-2 ring-[#0033A0] ring-offset-2' : ''}`}
       data-testid={`emp-task-${task.id}`}
     >
       <div className="flex justify-between items-start gap-4 mb-3">

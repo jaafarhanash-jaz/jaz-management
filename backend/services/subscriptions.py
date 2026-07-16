@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import repositories.companies as companies_repo
 import repositories.payment_transactions as payment_transactions_repo
 import repositories.subscription_plans as subscription_plans_repo
+import services.notifications as notifications_service
 from services.admin import parse_uuid, plan_to_response
 
 
@@ -59,6 +60,29 @@ async def _activate_from_transaction(db: AsyncSession, tx) -> None:
     if plan:
         end_date = datetime.now(timezone.utc) + timedelta(days=30 * plan.duration_months)
         await companies_repo.activate_subscription(db, tx.company_id, tx.plan_id, end_date)
+
+        await notifications_service.publish(
+            db,
+            user_id=tx.user_id,
+            company_id=tx.company_id,
+            category=notifications_service.CATEGORY_PAYMENTS,
+            type="payment_received",
+            title="تم استلام الدفعة",
+            message=f"تم تفعيل اشتراك خطة {plan.name} بنجاح",
+            entity_type="payment_transaction",
+            entity_id=tx.id,
+            action_url="/company-owner/subscription",
+        )
+        await notifications_service.publish_to_role(
+            db,
+            role="super_admin",
+            category=notifications_service.CATEGORY_PAYMENTS,
+            type="payment_received",
+            title="دفعة جديدة",
+            message=f"تم استلام دفعة بقيمة {tx.amount} {tx.currency} لخطة {plan.name}",
+            entity_type="payment_transaction",
+            entity_id=tx.id,
+        )
 
 
 async def check_payment_status(db: AsyncSession, session_id: str, host_url: str) -> dict:

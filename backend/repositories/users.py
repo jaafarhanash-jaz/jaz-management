@@ -168,3 +168,8 @@ async def count_matching_ids_in_company(db: AsyncSession, ids, company_id) -> in
         select(func.count()).select_from(User).where(User.id.in_(list(ids)), User.company_id == company_id)
     )
     return result.scalar_one()
+
+
+async def list_by_role(db: AsyncSession, role: str) -> List[User]:
+    result = await db.execute(select(User).where(User.role == role, User.deleted_at.is_(None)))
+    return list(result.scalars().all())

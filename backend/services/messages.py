@@ -11,8 +11,8 @@ import repositories.message_attachments as attachments_repo
 import repositories.message_recipients as recipients_repo
 import repositories.message_reminders as reminders_repo
 import repositories.messages as messages_repo
-import repositories.notifications as notifications_repo
 import repositories.users as users_repo
+import services.notifications as notifications_service
 from models import Message
 from services.admin import parse_uuid
 from services.storage import classify_attachment_type, decode_and_validate, download_base64, upload
@@ -104,9 +104,12 @@ async def deliver_message(db: AsyncSession, message, employee_ids: List[uuid.UUI
             role="recipient", status="delivered", is_unread=True, is_starred=False,
             delivered_at=now,
         )
-        await notifications_repo.create(
+        await notifications_service.publish(
             db, user_id=employee_id, company_id=message.company_id,
-            type="work_message", title="رسالة عمل جديدة", message=message.subject,
+            category=notifications_service.CATEGORY_MESSAGES, type="work_message",
+            title="رسالة عمل جديدة", message=message.subject,
+            entity_type="message", entity_id=message.id,
+            sender_id=message.sender_id, sender_name=message.sender_name,
         )
 
     await write_message_activity(
@@ -120,9 +123,12 @@ async def notify_reply_participants(db: AsyncSession, reply, thread_id, particip
     existing thread-level row for every other participant and notifies them."""
     await recipients_repo.mark_unread_bulk(db, thread_id, participant_ids)
     for participant_id in participant_ids:
-        await notifications_repo.create(
+        await notifications_service.publish(
             db, user_id=participant_id, company_id=reply.company_id,
-            type="message_reply", title="رد على رسالة", message=reply.subject,
+            category=notifications_service.CATEGORY_MESSAGES, type="message_reply",
+            title="رد على رسالة", message=reply.subject,
+            entity_type="message", entity_id=reply.id,
+            sender_id=reply.sender_id, sender_name=reply.sender_name,
         )
     await write_message_activity(
         db, reply.company_id, reply.id, {"id": str(reply.sender_id), "name": reply.sender_name},

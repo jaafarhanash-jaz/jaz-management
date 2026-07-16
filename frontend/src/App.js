@@ -18,11 +18,13 @@ import CalendarMonitor from './pages/Owner/CalendarMonitor';
 import CompanyHolidays from './pages/Owner/CompanyHolidays';
 import WorkMessages from './pages/WorkMessages';
 import CalendarPage from './pages/Calendar';
+import Announcements from './pages/Announcements';
 import EmployeeDashboard from './pages/Employee/Dashboard';
 import EmployeeTasks from './pages/Employee/Tasks';
 import EmployeeAttendance from './pages/Employee/Attendance';
 import EmployeePerformance from './pages/Employee/Performance';
 import EmployeeReports from './pages/Employee/Reports';
+import Profile from './pages/Profile';
 import { Toaster } from 'sonner';
 import CriticalTaskAlert from './components/CriticalTaskAlert';
 import '@/App.css';
@@ -30,7 +32,9 @@ import '@/App.css';
 function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [userRole, setUserRole] = useState(null);
-  const [language, setLanguage] = useState('ar');
+  // Preferred Language (Profile/Account Settings) - persisted so the choice
+  // survives a reload instead of resetting to Arabic every time.
+  const [language, setLanguage] = useState(() => localStorage.getItem('language') || 'ar');
   const [pendingCriticalTasks, setPendingCriticalTasks] = useState([]);
 
   useEffect(() => {
@@ -46,6 +50,7 @@ function App() {
   useEffect(() => {
     document.documentElement.dir = language === 'ar' ? 'rtl' : 'ltr';
     document.documentElement.lang = language;
+    localStorage.setItem('language', language);
   }, [language]);
 
   // Lightweight presence heartbeat for owner/employee sessions (not super_admin -
@@ -59,7 +64,16 @@ function App() {
         .then((res) => {
           // Only present for employee sessions; undefined for owner/super_admin.
           if (res.data.pending_critical_tasks) {
-            setPendingCriticalTasks(res.data.pending_critical_tasks);
+            // Keep referential identity when the list is unchanged. A new
+            // array object here every 20s re-renders App, and because
+            // ProtectedRoute is defined inside App, a re-render REMOUNTS the
+            // entire page tree (new component identity) - which tore down
+            // the notifications SSE connection and rebuilt the whole DOM on
+            // every heartbeat for employee sessions.
+            setPendingCriticalTasks((prev) => {
+              const next = res.data.pending_critical_tasks;
+              return JSON.stringify(prev) === JSON.stringify(next) ? prev : next;
+            });
           }
         })
         .catch(() => {});
@@ -136,6 +150,14 @@ function App() {
             element={
               <ProtectedRoute allowedRoles={['super_admin']}>
                 <SuperAdminPlans onLogout={handleLogout} language={language} setLanguage={setLanguage} />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/super-admin/profile"
+            element={
+              <ProtectedRoute allowedRoles={['super_admin']}>
+                <Profile onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole="super_admin" />
               </ProtectedRoute>
             }
           />
@@ -237,6 +259,22 @@ function App() {
               </ProtectedRoute>
             }
           />
+          <Route
+            path="/company-owner/announcements"
+            element={
+              <ProtectedRoute allowedRoles={['company_owner']}>
+                <Announcements onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole="company_owner" />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/company-owner/profile"
+            element={
+              <ProtectedRoute allowedRoles={['company_owner']}>
+                <Profile onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole="company_owner" />
+              </ProtectedRoute>
+            }
+          />
 
           {/* Employee Routes */}
           <Route
@@ -292,6 +330,22 @@ function App() {
             element={
               <ProtectedRoute allowedRoles={['employee']}>
                 <CalendarPage onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole="employee" />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/employee/announcements"
+            element={
+              <ProtectedRoute allowedRoles={['employee']}>
+                <Announcements onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole="employee" />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/employee/profile"
+            element={
+              <ProtectedRoute allowedRoles={['employee']}>
+                <Profile onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole="employee" />
               </ProtectedRoute>
             }
           />

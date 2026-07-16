@@ -152,14 +152,6 @@ const LoginPage = ({ onLogin }) => {
               {loading ? 'جاري التسجيل...' : t('login', language)}
             </Button>
           </form>
-
-          {/* Demo Credentials */}
-          <div className="mt-8 p-4 bg-gray-50 rounded-sm border border-gray-200">
-            <p className="text-xs text-gray-600 font-medium mb-2">بيانات التجربة:</p>
-            <p className="text-xs text-gray-500">Super Admin: admin@jaz.com / admin123</p>
-            <p className="text-xs text-gray-500">Owner: owner@demo.com / owner123</p>
-            <p className="text-xs text-gray-500">Employee: employee1@demo.com / emp123</p>
-          </div>
         </Card>
       </div>
     </div>

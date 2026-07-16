@@ -40,14 +40,129 @@ async def list_by_company(db: AsyncSession, company_id) -> List[Task]:
     return list(result.scalars().all())
 
 
+async def list_active_by_company(db: AsyncSession, company_id) -> List[Task]:
+    """Task History feature: the Owner Tasks page's main list now shows
+    only active work - every task except those already completed. Same
+    Task table/rows as list_by_company, just one extra status exclusion;
+    completed tasks aren't deleted or moved, they simply belong to the
+    separate Task History archive read (list_completed_by_company)."""
+    result = await db.execute(
+        select(Task).where(
+            Task.company_id == company_id,
+            Task.deleted_at.is_(None),
+            Task.status != "completed",
+        )
+    )
+    return list(result.scalars().all())
+
+
+async def list_completed_by_company(
+    db: AsyncSession, company_id, *,
+    search=None, employee_id=None, created_by=None, priority=None,
+    created_from=None, created_to=None, completed_from=None, completed_to=None,
+) -> List[Task]:
+    """Task History archive: the same Task rows, status='completed', never
+    moved or copied anywhere - a differently-filtered read of the same
+    table, same style as attendance's list_by_company filters. Ordered
+    newest-completed-first by default; the service layer re-sorts in
+    memory for the two name/priority-derived sort options that have no
+    matching indexed column."""
+    query = select(Task).where(
+        Task.company_id == company_id,
+        Task.deleted_at.is_(None),
+        Task.status == "completed",
+    )
+    if search:
+        query = query.where(Task.title.ilike(f"%{search}%"))
+    if employee_id is not None:
+        query = query.where(Task.assigned_to == employee_id)
+    if created_by is not None:
+        query = query.where(Task.created_by == created_by)
+    if priority is not None:
+        query = query.where(Task.priority == priority)
+    if created_from is not None:
+        query = query.where(Task.created_at >= created_from)
+    if created_to is not None:
+        query = query.where(Task.created_at < created_to)
+    if completed_from is not None:
+        query = query.where(Task.completed_at >= completed_from)
+    if completed_to is not None:
+        query = query.where(Task.completed_at < completed_to)
+    query = query.order_by(Task.completed_at.desc())
+    result = await db.execute(query)
+    return list(result.scalars().all())
+
+
+HIDDEN_STATUSES = ("scheduled", "pending_sequence")
+
+
 async def list_for_employee(db: AsyncSession, employee_id) -> List[Task]:
     """No company_id filter, matching the old query exactly - a task's
     assigned_to always belongs to the company that created it, so this is
-    safe as-is."""
+    safe as-is. Excludes tasks not yet activated (future-scheduled, or a
+    later step in a sequential workflow that hasn't been reached) - the
+    employee must not see these at all, not just have them visually hidden."""
     result = await db.execute(
-        select(Task).where(Task.assigned_to == employee_id, Task.deleted_at.is_(None))
+        select(Task).where(
+            Task.assigned_to == employee_id,
+            Task.deleted_at.is_(None),
+            Task.status.notin_(HIDDEN_STATUSES),
+        )
     )
     return list(result.scalars().all())
+
+
+async def list_due_scheduled(db: AsyncSession, company_id, now) -> List[Task]:
+    """Self-heal source: Scheduled Tasks whose activation time has arrived.
+    Called from every task-list/dashboard read path (see services/tasks.py)
+    - no scheduler process, same pattern as message/calendar reminders."""
+    result = await db.execute(
+        select(Task).where(
+            Task.company_id == company_id,
+            Task.status == "scheduled",
+            Task.scheduled_activation_at <= now,
+            Task.deleted_at.is_(None),
+        )
+    )
+    return list(result.scalars().all())
+
+
+async def get_next_workflow_step(db: AsyncSession, batch_id, sequence_order: int) -> Optional[Task]:
+    result = await db.execute(
+        select(Task).where(
+            Task.batch_id == batch_id,
+            Task.sequence_order == sequence_order,
+            Task.deleted_at.is_(None),
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def list_workflow_steps(db: AsyncSession, batch_id) -> List[Task]:
+    result = await db.execute(
+        select(Task)
+        .where(Task.batch_id == batch_id, Task.sequence_order.is_not(None), Task.deleted_at.is_(None))
+        .order_by(Task.sequence_order)
+    )
+    return list(result.scalars().all())
+
+
+async def list_active_workflow_batch_ids(db: AsyncSession, company_id) -> List:
+    """Distinct batch_ids for sequential workflows that still have at least
+    one non-terminal step - powers the owner dashboard's workflow-progress
+    widget. A workflow "finishes" (drops out of this list) once every step
+    is completed/cancelled/rejected."""
+    result = await db.execute(
+        select(Task.batch_id)
+        .where(
+            Task.company_id == company_id,
+            Task.sequence_order.is_not(None),
+            Task.deleted_at.is_(None),
+        )
+        .group_by(Task.batch_id)
+        .having(func.bool_or(Task.status.notin_(("completed", "cancelled", "rejected"))))
+    )
+    return [row[0] for row in result.all()]
 
 
 async def create(db: AsyncSession, **fields) -> Task:

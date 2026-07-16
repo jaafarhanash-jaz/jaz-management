@@ -7,11 +7,45 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 import repositories.companies as companies_repo
 import repositories.users as users_repo
+import services.notifications as notifications_service
 from services.admin import parse_uuid
 from services.auth import hash_password
+from services.storage import decode_and_validate, delete as storage_delete, download_base64, upload as storage_upload
 
 UPDATE_ALLOWED_FIELDS = ["name", "phone", "department", "position", "status", "avatar"]
 PROFILE_ALLOWED_FIELDS = ["name", "phone", "avatar"]
+
+# Employee CV (Part 1): PDF/DOC/DOCX only, matching the feature spec. Checked
+# against both the client-supplied MIME type and the filename extension
+# (either match is accepted) since browsers report inconsistent MIME types
+# for legacy .doc files - a purely MIME-based check would false-reject real
+# DOC uploads from some clients.
+CV_ALLOWED_MIME_TYPES = {
+    "application/pdf": "pdf",
+    "application/msword": "doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+}
+
+
+def _iso(value) -> Optional[str]:
+    return value.isoformat() if value else None
+
+
+def _validate_cv_file(filename: str, mime_type: str) -> None:
+    ext = filename.rsplit(".", 1)[-1].lower() if filename and "." in filename else ""
+    if mime_type not in CV_ALLOWED_MIME_TYPES and ext not in CV_ALLOWED_MIME_TYPES.values():
+        raise HTTPException(status_code=400, detail="CV must be a PDF, DOC, or DOCX file")
+
+
+def _cv_response(user) -> Optional[dict]:
+    if not user.cv_storage_path:
+        return None
+    return {
+        "filename": user.cv_original_filename,
+        "mime_type": user.cv_mime_type,
+        "size_bytes": user.cv_file_size,
+        "uploaded_at": _iso(user.cv_uploaded_at),
+    }
 
 
 def user_response(user) -> dict:
@@ -26,6 +60,7 @@ def user_response(user) -> dict:
         "status": user.status,
         "department": user.department,
         "position": user.position,
+        "cv": _cv_response(user),
     }
 
 
@@ -34,7 +69,27 @@ async def list_employees(db: AsyncSession, company_id) -> List[dict]:
     return [user_response(e) for e in employees]
 
 
-async def create_employee(db: AsyncSession, company_id, data) -> dict:
+async def _store_cv(db: AsyncSession, employee, uploaded_by, cv_data) -> None:
+    """Shared by create_employee (optional CV at creation) and
+    upload_employee_cv (upload/replace from Edit Employee) - one storage
+    write path, no duplicated validation/upload logic. Deletes the previous
+    file from object storage when replacing, so nothing is orphaned."""
+    _validate_cv_file(cv_data.filename, cv_data.mime_type)
+    decoded = decode_and_validate(cv_data.data, cv_data.filename)
+    old_storage_path = employee.cv_storage_path
+    storage_path, _checksum = storage_upload(decoded, prefix=f"employees/{employee.id}/cv")
+    employee.cv_storage_path = storage_path
+    employee.cv_original_filename = cv_data.filename
+    employee.cv_mime_type = cv_data.mime_type
+    employee.cv_file_size = len(decoded)
+    employee.cv_uploaded_at = datetime.now(timezone.utc)
+    employee.cv_uploaded_by = uploaded_by
+    await db.flush()
+    if old_storage_path:
+        storage_delete(old_storage_path)
+
+
+async def create_employee(db: AsyncSession, company_id, created_by, data) -> dict:
     if await users_repo.email_taken(db, data.email):
         raise HTTPException(status_code=400, detail="Email already registered")
     # The old Mongo implementation never checked phone uniqueness (there was
@@ -71,6 +126,24 @@ async def create_employee(db: AsyncSession, company_id, data) -> dict:
     )
     await db.flush()
     await db.refresh(employee)
+
+    if getattr(data, "cv", None):
+        await _store_cv(db, employee, parse_uuid(created_by), data.cv)
+
+    if company:
+        await notifications_service.publish(
+            db,
+            user_id=company.owner_id,
+            company_id=company_id,
+            category=notifications_service.CATEGORY_SYSTEM,
+            type="employee_created",
+            title="موظف جديد",
+            message=f"تمت إضافة الموظف {employee.name} إلى الشركة",
+            entity_type="user",
+            entity_id=employee.id,
+            action_url="/company-owner/employees",
+        )
+
     return user_response(employee)
 
 
@@ -94,6 +167,47 @@ async def update_employee(db: AsyncSession, company_id, employee_id: str, update
     return {"message": "Employee updated successfully"}
 
 
+async def upload_employee_cv(db: AsyncSession, company_id, employee_id: str, uploaded_by, cv_data) -> dict:
+    """Upload (or Replace, per Edit Employee's spec) - _store_cv already
+    deletes whatever CV was previously on file, so this one function covers
+    both actions with no branching needed."""
+    parsed_id = parse_uuid(employee_id)
+    employee = await users_repo.get_employee_in_company(db, parsed_id, company_id) if parsed_id else None
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    await _store_cv(db, employee, parse_uuid(uploaded_by), cv_data)
+    return _cv_response(employee)
+
+
+async def get_employee_cv(db: AsyncSession, company_id, employee_id: str) -> dict:
+    """Preview/Download - lazy-loads the base64 payload only here, same
+    lazy-load boundary as message/calendar attachments (list/edit views only
+    ever see the lightweight metadata from user_response)."""
+    parsed_id = parse_uuid(employee_id)
+    employee = await users_repo.get_employee_in_company(db, parsed_id, company_id) if parsed_id else None
+    if not employee or not employee.cv_storage_path:
+        raise HTTPException(status_code=404, detail="No CV on file for this employee")
+    response = _cv_response(employee)
+    response["data"] = f"data:{employee.cv_mime_type};base64,{download_base64(employee.cv_storage_path)}"
+    return response
+
+
+async def delete_employee_cv(db: AsyncSession, company_id, employee_id: str) -> dict:
+    parsed_id = parse_uuid(employee_id)
+    employee = await users_repo.get_employee_in_company(db, parsed_id, company_id) if parsed_id else None
+    if not employee or not employee.cv_storage_path:
+        raise HTTPException(status_code=404, detail="No CV on file for this employee")
+    storage_delete(employee.cv_storage_path)
+    employee.cv_storage_path = None
+    employee.cv_original_filename = None
+    employee.cv_mime_type = None
+    employee.cv_file_size = None
+    employee.cv_uploaded_at = None
+    employee.cv_uploaded_by = None
+    await db.flush()
+    return {"message": "CV deleted successfully"}
+
+
 async def delete_employee(db: AsyncSession, company_id, employee_id: str) -> dict:
     parsed_id = parse_uuid(employee_id)
     employee = await users_repo.get_employee_in_company(db, parsed_id, company_id) if parsed_id else None
@@ -106,6 +220,22 @@ async def delete_employee(db: AsyncSession, company_id, employee_id: str) -> dic
     # section for why this isn't a behavior change.
     employee.deleted_at = datetime.now(timezone.utc)
     await db.flush()
+
+    company = await companies_repo.get_by_id(db, company_id)
+    if company:
+        await notifications_service.publish(
+            db,
+            user_id=company.owner_id,
+            company_id=company_id,
+            category=notifications_service.CATEGORY_SYSTEM,
+            type="employee_deleted",
+            title="تم حذف موظف",
+            message=f"تم حذف الموظف {employee.name} من الشركة",
+            entity_type="user",
+            entity_id=employee.id,
+            action_url="/company-owner/employees",
+        )
+
     return {"message": "Employee deleted successfully"}
 
 

@@ -7,8 +7,26 @@ import { Label } from '@/components/ui/label';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
 import api from '@/utils/api';
 import { t } from '@/utils/translations';
-import { Plus, Pencil, Trash2, Users as UsersIcon } from 'lucide-react';
+import { Plus, Pencil, Trash2, Users as UsersIcon, FileText, UploadCloud, Download, Eye, X as XIcon } from 'lucide-react';
 import { toast } from 'sonner';
+
+const CV_ACCEPT = '.pdf,.doc,.docx,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+
+const formatFileSize = (bytes) => {
+  if (!bytes && bytes !== 0) return '';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+};
+
+const formatCvDate = (iso) => iso ? new Date(iso).toLocaleDateString('ar-EG', { dateStyle: 'medium' }) : '-';
+
+const readFileAsUpload = (file) => new Promise((resolve, reject) => {
+  const reader = new FileReader();
+  reader.onload = () => resolve({ filename: file.name, mime_type: file.type || 'application/octet-stream', data: reader.result });
+  reader.onerror = reject;
+  reader.readAsDataURL(file);
+});
 
 const OwnerEmployees = ({ onLogout, language, setLanguage }) => {
   const [employees, setEmployees] = useState([]);
@@ -19,6 +37,12 @@ const OwnerEmployees = ({ onLogout, language, setLanguage }) => {
     name: '', email: '', phone: '', password: '',
     department: '', position: '', role: 'employee'
   });
+  // Employee CV (create mode: staged locally, uploaded together with the
+  // employee; edit mode: uploads/deletes immediately via dedicated
+  // endpoints, same pattern as message/calendar attachments elsewhere).
+  const [cvFile, setCvFile] = useState(null);
+  const [employeeCv, setEmployeeCv] = useState(null);
+  const [cvBusy, setCvBusy] = useState(false);
 
   useEffect(() => { fetchEmployees(); }, []);
 
@@ -34,6 +58,8 @@ const OwnerEmployees = ({ onLogout, language, setLanguage }) => {
   const resetForm = () => {
     setForm({ name: '', email: '', phone: '', password: '', department: '', position: '', role: 'employee' });
     setEditingId(null);
+    setCvFile(null);
+    setEmployeeCv(null);
   };
 
   const openAdd = () => { resetForm(); setDialogOpen(true); };
@@ -44,6 +70,8 @@ const OwnerEmployees = ({ onLogout, language, setLanguage }) => {
       name: emp.name || '', email: emp.email || '', phone: emp.phone || '',
       password: '', department: emp.department || '', position: emp.position || '', role: 'employee'
     });
+    setCvFile(null);
+    setEmployeeCv(emp.cv || null);
     setDialogOpen(true);
   };
 
@@ -57,7 +85,7 @@ const OwnerEmployees = ({ onLogout, language, setLanguage }) => {
         await api.put(`/owner/employees/${editingId}`, updates);
         toast.success('تم التحديث بنجاح');
       } else {
-        await api.post('/owner/employees', form);
+        await api.post('/owner/employees', cvFile ? { ...form, cv: cvFile } : form);
         toast.success('تمت الإضافة بنجاح');
       }
       setDialogOpen(false);
@@ -75,6 +103,78 @@ const OwnerEmployees = ({ onLogout, language, setLanguage }) => {
       toast.success('تم الحذف بنجاح');
       fetchEmployees();
     } catch (e) { toast.error('حدث خطأ'); }
+  };
+
+  // ---- Employee CV (Part 1) ----
+  const validateCvFile = (file) => {
+    const ext = file.name.includes('.') ? file.name.split('.').pop().toLowerCase() : '';
+    if (!['pdf', 'doc', 'docx'].includes(ext)) {
+      toast.error('صيغة الملف غير مدعومة - يجب أن تكون PDF أو DOC أو DOCX');
+      return false;
+    }
+    if (file.size > 10 * 1024 * 1024) {
+      toast.error('حجم الملف يتجاوز الحد الأقصى (10 ميجابايت)');
+      return false;
+    }
+    return true;
+  };
+
+  const handleCvFileChange = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file || !validateCvFile(file)) return;
+    const upload = await readFileAsUpload(file);
+    if (!editingId) {
+      // Create mode: staged locally, sent together with the new employee.
+      setCvFile(upload);
+      return;
+    }
+    setCvBusy(true);
+    try {
+      const res = await api.post(`/owner/employees/${editingId}/cv`, upload);
+      setEmployeeCv(res.data);
+      toast.success(employeeCv ? 'تم استبدال السيرة الذاتية' : 'تم رفع السيرة الذاتية');
+      fetchEmployees();
+    } catch (err) {
+      toast.error(err.response?.data?.detail || 'تعذر رفع الملف');
+    }
+    setCvBusy(false);
+  };
+
+  const handleCvDelete = async () => {
+    if (!editingId) { setCvFile(null); return; }
+    if (!window.confirm('هل أنت متأكد من حذف السيرة الذاتية؟')) return;
+    setCvBusy(true);
+    try {
+      await api.delete(`/owner/employees/${editingId}/cv`);
+      setEmployeeCv(null);
+      toast.success('تم حذف السيرة الذاتية');
+      fetchEmployees();
+    } catch (err) {
+      toast.error('تعذر حذف الملف');
+    }
+    setCvBusy(false);
+  };
+
+  const handleCvPreview = async (employeeId) => {
+    try {
+      const res = await api.get(`/owner/employees/${employeeId}/cv`);
+      window.open(res.data.data, '_blank');
+    } catch (err) {
+      toast.error('تعذر فتح الملف');
+    }
+  };
+
+  const handleCvDownload = async (employeeId, filename) => {
+    try {
+      const res = await api.get(`/owner/employees/${employeeId}/cv`);
+      const link = document.createElement('a');
+      link.href = res.data.data;
+      link.download = filename;
+      link.click();
+    } catch (err) {
+      toast.error('تعذر تحميل الملف');
+    }
   };
 
   return (
@@ -110,6 +210,7 @@ const OwnerEmployees = ({ onLogout, language, setLanguage }) => {
                     <th className="text-start px-6 py-3 text-xs font-medium text-gray-500 uppercase tracking-wider">الهاتف</th>
                     <th className="text-start px-6 py-3 text-xs font-medium text-gray-500 uppercase tracking-wider">القسم</th>
                     <th className="text-start px-6 py-3 text-xs font-medium text-gray-500 uppercase tracking-wider">المنصب</th>
+                    <th className="text-start px-6 py-3 text-xs font-medium text-gray-500 uppercase tracking-wider">السيرة الذاتية</th>
                     <th className="text-start px-6 py-3 text-xs font-medium text-gray-500 uppercase tracking-wider">الإجراءات</th>
                   </tr>
                 </thead>
@@ -121,6 +222,23 @@ const OwnerEmployees = ({ onLogout, language, setLanguage }) => {
                       <td className="px-6 py-4 text-gray-600">{emp.phone}</td>
                       <td className="px-6 py-4 text-gray-600">{emp.department || '-'}</td>
                       <td className="px-6 py-4 text-gray-600">{emp.position || '-'}</td>
+                      <td className="px-6 py-4">
+                        {emp.cv ? (
+                          <div className="flex items-center gap-1.5">
+                            <span className="flex items-center gap-1 text-xs text-gray-600 max-w-[120px] truncate" title={emp.cv.filename}>
+                              <FileText className="w-3.5 h-3.5 text-[#0033A0] flex-shrink-0" /> {emp.cv.filename}
+                            </span>
+                            <Button variant="ghost" size="sm" onClick={() => handleCvPreview(emp.id)} title="معاينة" data-testid={`cv-preview-${emp.id}`}>
+                              <Eye className="w-3.5 h-3.5" />
+                            </Button>
+                            <Button variant="ghost" size="sm" onClick={() => handleCvDownload(emp.id, emp.cv.filename)} title="تحميل" data-testid={`cv-download-${emp.id}`}>
+                              <Download className="w-3.5 h-3.5" />
+                            </Button>
+                          </div>
+                        ) : (
+                          <span className="text-xs text-gray-400">لا توجد</span>
+                        )}
+                      </td>
                       <td className="px-6 py-4">
                         <div className="flex gap-2">
                           <Button variant="ghost" size="sm" onClick={() => openEdit(emp)} data-testid={`edit-employee-${emp.id}`}>
@@ -171,6 +289,56 @@ const OwnerEmployees = ({ onLogout, language, setLanguage }) => {
                 <Label>المنصب</Label>
                 <Input data-testid="emp-position-input" value={form.position} onChange={(e) => setForm({ ...form, position: e.target.value })} />
               </div>
+
+              <div className="border-t border-gray-100 pt-4">
+                <Label className="flex items-center gap-1.5 mb-2">
+                  <FileText className="w-3.5 h-3.5 text-gray-500" /> السيرة الذاتية (اختياري)
+                </Label>
+
+                {editingId && employeeCv && (
+                  <div className="flex items-center justify-between gap-2 p-3 border border-gray-200 rounded-sm bg-gray-50 mb-2" data-testid="employee-cv-info">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <FileText className="w-5 h-5 text-[#0033A0] flex-shrink-0" />
+                      <div className="min-w-0">
+                        <p className="text-sm font-medium text-[#0A0A0A] truncate">{employeeCv.filename}</p>
+                        <p className="text-xs text-gray-500">{formatCvDate(employeeCv.uploaded_at)} · {formatFileSize(employeeCv.size_bytes)}</p>
+                      </div>
+                    </div>
+                    <div className="flex gap-1 flex-shrink-0">
+                      <Button type="button" variant="ghost" size="sm" onClick={() => handleCvPreview(editingId)} title="معاينة" data-testid="cv-preview-btn">
+                        <Eye className="w-4 h-4" />
+                      </Button>
+                      <Button type="button" variant="ghost" size="sm" onClick={() => handleCvDownload(editingId, employeeCv.filename)} title="تحميل" data-testid="cv-download-btn">
+                        <Download className="w-4 h-4" />
+                      </Button>
+                      <Button type="button" variant="ghost" size="sm" onClick={handleCvDelete} className="text-red-600 hover:bg-red-50" title="حذف" data-testid="cv-delete-btn">
+                        <Trash2 className="w-4 h-4" />
+                      </Button>
+                    </div>
+                  </div>
+                )}
+
+                {!editingId && cvFile && (
+                  <div className="flex items-center justify-between gap-2 p-3 border border-gray-200 rounded-sm bg-gray-50 mb-2" data-testid="employee-cv-staged">
+                    <span className="flex items-center gap-2 text-sm text-[#0A0A0A] truncate min-w-0">
+                      <FileText className="w-4 h-4 text-[#0033A0] flex-shrink-0" /> <span className="truncate">{cvFile.filename}</span>
+                    </span>
+                    <Button type="button" variant="ghost" size="sm" onClick={() => setCvFile(null)} data-testid="cv-remove-staged-btn">
+                      <XIcon className="w-4 h-4" />
+                    </Button>
+                  </div>
+                )}
+
+                <label
+                  className={`flex items-center justify-center gap-2 border border-dashed border-gray-300 rounded-sm py-3 text-sm text-gray-500 cursor-pointer hover:border-[#0033A0] hover:text-[#0033A0] transition-colors ${cvBusy ? 'opacity-50 pointer-events-none' : ''}`}
+                  data-testid="cv-upload-label"
+                >
+                  <UploadCloud className="w-4 h-4" />
+                  {cvBusy ? 'جارِ الرفع...' : (employeeCv || cvFile) ? 'استبدال الملف' : 'رفع ملف (PDF, DOC, DOCX - حتى 10MB)'}
+                  <input type="file" accept={CV_ACCEPT} className="hidden" onChange={handleCvFileChange} data-testid="cv-file-input" />
+                </label>
+              </div>
+
               <DialogFooter>
                 <Button type="button" variant="outline" onClick={() => setDialogOpen(false)} data-testid="cancel-emp-btn">{t('cancel', language)}</Button>
                 <Button type="submit" className="bg-[#0033A0] hover:bg-[#002277]" data-testid="save-emp-btn">{t('save', language)}</Button>

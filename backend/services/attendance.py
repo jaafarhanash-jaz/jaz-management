@@ -11,6 +11,7 @@ import repositories.audit_logs as audit_logs_repo
 import repositories.companies as companies_repo
 import repositories.users as users_repo
 import services.holidays as holidays_service
+import services.notifications as notifications_service
 from services.admin import parse_uuid
 from services.qr import generate_qr_code
 
@@ -214,6 +215,23 @@ async def check_in(db: AsyncSession, current_user: dict, data) -> dict:
     else:
         await attendance_repo.create(db, employee_id=employee_id, **fields)
     await db.flush()
+
+    if attendance_status == "late":
+        if company:
+            await notifications_service.publish(
+                db,
+                user_id=company.owner_id,
+                company_id=company.id,
+                category=notifications_service.CATEGORY_ATTENDANCE,
+                type="late_check_in",
+                title="تسجيل حضور متأخر",
+                message=f"سجّل الموظف {current_user['name']} حضوره متأخراً اليوم",
+                entity_type="user",
+                entity_id=employee_id,
+                action_url="/company-owner/attendance",
+                sender_id=employee_id,
+                sender_name=current_user["name"],
+            )
 
     return {"message": "Checked in successfully", "status": attendance_status}
 

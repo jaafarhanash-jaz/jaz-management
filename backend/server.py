@@ -2,13 +2,15 @@ from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from dateutil.relativedelta import relativedelta
+import asyncio
+import json
 import os
 import logging
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict, EmailStr
-from typing import List, Optional, Dict, Any
+from typing import List, Literal, Optional, Dict, Any
 import uuid
 from datetime import datetime, timezone, timedelta, date
 from passlib.context import CryptContext
@@ -18,10 +20,11 @@ from io import BytesIO
 import base64
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database import engine, get_db
+from database import engine, get_db, SessionLocal
 import repositories.companies as companies_repo
 import repositories.users as users_repo
 import services.admin as admin_service
+import services.announcements as announcements_service
 import services.attendance as attendance_service
 import services.auth as auth_service
 import services.calendar as calendar_service
@@ -31,6 +34,7 @@ import services.employees as employees_service
 import services.heartbeat as heartbeat_service
 import services.messages as messages_service
 import services.notifications as notifications_service
+import services.realtime as realtime_service
 import services.reports as reports_service
 import services.seed as seed_service
 import services.subscriptions as subscriptions_service
@@ -39,6 +43,8 @@ from services.admin import parse_uuid
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
+
+ENVIRONMENT = os.environ.get('ENVIRONMENT', 'development')
 
 # Security
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -172,6 +178,20 @@ class LoginResponse(BaseModel):
     user: Dict[str, Any]
     role: str
 
+class CvUploadRequest(BaseModel):
+    filename: str
+    mime_type: str
+    data: str  # base64, same client-side-encode contract as message/calendar attachments
+
+class PhotoUploadRequest(BaseModel):
+    filename: str
+    mime_type: str
+    data: str  # base64, same client-side-encode contract as CV/message/calendar attachments
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
 class UserCreate(BaseModel):
     email: EmailStr
     phone: str
@@ -181,6 +201,9 @@ class UserCreate(BaseModel):
     company_id: Optional[str] = None
     department: Optional[str] = None
     position: Optional[str] = None
+    # Employee CV (Part 1) - optional, uploaded in the same request as
+    # employee creation when the owner attaches one right away.
+    cv: Optional[CvUploadRequest] = None
 
 class UserResponse(BaseModel):
     id: str
@@ -193,6 +216,8 @@ class UserResponse(BaseModel):
     status: str = "active"
     department: Optional[str] = None
     position: Optional[str] = None
+    cv: Optional[Dict[str, Any]] = None
+    photo: Optional[Dict[str, Any]] = None
 
 class CompanyCreate(BaseModel):
     name: str
@@ -280,6 +305,24 @@ class TaskCreate(BaseModel):
     due_time: Optional[str] = None
     attachments: Optional[List[Dict[str, str]]] = None
     requires_proof: bool = False
+    # Scheduled Task (Part 3) - optional future activation. Omitted/blank
+    # scheduled_date means "activate immediately", exactly today's behavior.
+    scheduled_date: Optional[str] = None
+    scheduled_time: Optional[str] = None
+
+class TaskWorkflowCreate(BaseModel):
+    """Sequential Workflow (Part 4) - same shape as TaskCreate but
+    `employee_order` replaces the single `assigned_to`: one task row per
+    employee, activated one at a time in this exact order."""
+    title: str
+    description: str
+    priority: str
+    employee_order: List[str]
+    due_date: Optional[str] = None
+    due_time: Optional[str] = None
+    requires_proof: bool = False
+    scheduled_date: Optional[str] = None
+    scheduled_time: Optional[str] = None
 
 class TaskUpdate(BaseModel):
     title: Optional[str] = None
@@ -310,6 +353,7 @@ class TaskResponse(BaseModel):
     # calendar/message attachments, stored directly on the task document.
     attachments: List[Dict[str, Any]] = []
     created_by: str
+    created_by_name: Optional[str] = None
     created_at: str
     completed_at: Optional[str] = None
     # New, optional fields for daily/urgent tasks - always absent/None on
@@ -330,6 +374,37 @@ class TaskResponse(BaseModel):
     completed_by: Optional[str] = None
     completed_by_name: Optional[str] = None
     batch_id: Optional[str] = None
+    scheduled_activation_at: Optional[str] = None
+    sequence_order: Optional[int] = None
+
+class TaskWorkflowCreateResponse(BaseModel):
+    batch_id: str
+    steps: List[TaskResponse]
+
+class TaskWorkflowStepProgress(BaseModel):
+    task_id: str
+    employee_id: str
+    employee_name: Optional[str] = None
+    sequence_order: int
+    status: str
+
+class TaskWorkflowProgressResponse(BaseModel):
+    batch_id: str
+    title: str
+    steps: List[TaskWorkflowStepProgress]
+
+class AnnouncementCreate(BaseModel):
+    title: str
+    message: str
+
+class AnnouncementResponse(BaseModel):
+    id: str
+    company_id: str
+    created_by: str
+    created_by_name: str
+    title: str
+    message: str
+    created_at: str
 
 class DailyTaskCreate(BaseModel):
     title: str
@@ -451,10 +526,37 @@ class NotificationResponse(BaseModel):
     user_id: str
     company_id: Optional[str] = None
     type: str
+    category: str
     title: str
     message: str
     read_status: bool
+    entity_type: Optional[str] = None
+    entity_id: Optional[str] = None
+    action_url: Optional[str] = None
+    sender_id: Optional[str] = None
+    sender_name: Optional[str] = None
     created_at: str
+
+class UnreadCountResponse(BaseModel):
+    count: int
+
+class DashboardWidgetLayout(BaseModel):
+    key: str
+    visible: bool
+    order: int
+    size: Literal["sm", "md", "lg"] = "lg"
+    # Granular sub-element visibility within this widget (title, action
+    # button, individual charts, etc.) - keys are widget-specific, defined
+    # by the frontend's WIDGET_SECTIONS registry. Absent/missing key means
+    # visible (backward compatible with layouts saved before this field
+    # existed - no migration needed since `layout` is schemaless JSONB).
+    sections: Optional[Dict[str, bool]] = None
+
+class DashboardLayoutRequest(BaseModel):
+    layout: List[DashboardWidgetLayout]
+
+class DashboardLayoutResponse(BaseModel):
+    layout: List[DashboardWidgetLayout]
 
 class DepartmentCreate(BaseModel):
     name: str
@@ -808,7 +910,7 @@ async def get_employees(current_user: dict = Depends(get_current_user), pg: Asyn
 async def create_employee(employee: UserCreate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     if current_user["role"] != UserRole.COMPANY_OWNER:
         raise HTTPException(status_code=403, detail="Access denied")
-    return await employees_service.create_employee(pg, current_user["company_id"], employee)
+    return await employees_service.create_employee(pg, current_user["company_id"], current_user["id"], employee)
 
 @api_router.put("/owner/employees/{employee_id}")
 async def update_employee(employee_id: str, updates: dict, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
@@ -822,11 +924,59 @@ async def delete_employee(employee_id: str, current_user: dict = Depends(get_cur
         raise HTTPException(status_code=403, detail="Access denied")
     return await employees_service.delete_employee(pg, current_user["company_id"], employee_id)
 
+@api_router.post("/owner/employees/{employee_id}/cv")
+async def upload_employee_cv(employee_id: str, cv: CvUploadRequest, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    """Upload or Replace (Edit Employee) - same endpoint covers both, the
+    previous file is deleted from storage automatically when one exists."""
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await employees_service.upload_employee_cv(pg, current_user["company_id"], employee_id, current_user["id"], cv)
+
+@api_router.get("/owner/employees/{employee_id}/cv")
+async def get_employee_cv(employee_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    """Preview/Download - returns the file inline as base64, same contract
+    as message/calendar attachments."""
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await employees_service.get_employee_cv(pg, current_user["company_id"], employee_id)
+
+@api_router.delete("/owner/employees/{employee_id}/cv")
+async def delete_employee_cv(employee_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await employees_service.delete_employee_cv(pg, current_user["company_id"], employee_id)
+
 @api_router.get("/owner/tasks", response_model=List[TaskResponse])
 async def get_tasks(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     if current_user["role"] != UserRole.COMPANY_OWNER:
         raise HTTPException(status_code=403, detail="Access denied")
     return await tasks_service.list_tasks_for_owner(pg, current_user["company_id"])
+
+@api_router.get("/owner/tasks/history", response_model=List[TaskResponse])
+async def get_task_history(
+    current_user: dict = Depends(get_current_user),
+    pg: AsyncSession = Depends(get_db),
+    search: Optional[str] = None,
+    employee_id: Optional[str] = None,
+    created_by: Optional[str] = None,
+    priority: Optional[str] = None,
+    created_from: Optional[str] = None,
+    created_to: Optional[str] = None,
+    completed_from: Optional[str] = None,
+    completed_to: Optional[str] = None,
+    sort: Optional[str] = None,
+):
+    """Task History: the permanent completed-tasks archive, read straight
+    off the same tasks table (no new table, no copy) - see
+    services.tasks.list_completed_tasks_for_owner."""
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await tasks_service.list_completed_tasks_for_owner(
+        pg, current_user["company_id"],
+        search=search, employee_id=employee_id, created_by=created_by, priority=priority,
+        created_from=created_from, created_to=created_to,
+        completed_from=completed_from, completed_to=completed_to, sort=sort,
+    )
 
 @api_router.post("/owner/tasks", response_model=TaskResponse)
 async def create_task(task: TaskCreate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
@@ -851,6 +1001,18 @@ async def cancel_task(task_id: str, current_user: dict = Depends(get_current_use
     if current_user["role"] != UserRole.COMPANY_OWNER:
         raise HTTPException(status_code=403, detail="Access denied")
     return await tasks_service.cancel_task(pg, current_user["company_id"], task_id)
+
+@api_router.post("/owner/tasks/workflow", response_model=TaskWorkflowCreateResponse)
+async def create_task_workflow(workflow: TaskWorkflowCreate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await tasks_service.create_task_workflow(pg, current_user["company_id"], current_user["id"], workflow)
+
+@api_router.get("/owner/tasks/workflows", response_model=List[TaskWorkflowProgressResponse])
+async def get_task_workflows(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await tasks_service.get_workflow_progress(pg, parse_uuid(current_user["company_id"]))
 
 # ---- Daily Recurring Tasks (templates) ----
 
@@ -1049,15 +1211,110 @@ async def update_profile(updates: dict, current_user: dict = Depends(get_current
     # progress report.
     return await employees_service.update_own_profile(pg, current_user["id"], updates)
 
+# ============ User Profile & Account Settings (any authenticated role) ============
+# Deliberately under a role-neutral /profile prefix (unlike the legacy
+# /employee/profile route above, which despite its name already works for
+# every role) - self-service, current_user-scoped only, matching the same
+# "no role check needed" shape since every user may only ever act on their
+# own account here.
+
+@api_router.post("/profile/photo", response_model=Dict[str, Any])
+async def upload_own_photo(photo: PhotoUploadRequest, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    """Upload or Replace - same endpoint covers both, the previous photo is
+    deleted from storage automatically when one exists."""
+    return await auth_service.upload_own_photo(pg, current_user["id"], photo)
+
+@api_router.get("/profile/photo", response_model=Dict[str, Any])
+async def get_own_photo(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    """Preview - returns the photo inline as base64, same contract as
+    every other attachment type in this app."""
+    return await auth_service.get_own_photo(pg, current_user["id"])
+
+@api_router.delete("/profile/photo")
+async def delete_own_photo(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await auth_service.delete_own_photo(pg, current_user["id"])
+
+@api_router.put("/profile/password")
+async def change_own_password(body: ChangePasswordRequest, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await auth_service.change_password(pg, current_user["id"], body.current_password, body.new_password)
+
 # ============ Common Routes ============
 
 @api_router.get("/notifications", response_model=List[NotificationResponse])
 async def get_notifications(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     return await notifications_service.get_notifications(pg, current_user)
 
+@api_router.get("/notifications/unread-count", response_model=UnreadCountResponse)
+async def get_unread_notification_count(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await notifications_service.get_unread_count(pg, current_user)
+
 @api_router.put("/notifications/{notification_id}/read")
 async def mark_notification_read(notification_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     return await notifications_service.mark_notification_read(pg, current_user, notification_id)
+
+@api_router.put("/notifications/read-all")
+async def mark_all_notifications_read(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await notifications_service.mark_all_notifications_read(pg, current_user)
+
+@api_router.get("/notifications/stream")
+async def stream_notifications(token: str):
+    """Server-Sent Events push channel - the primary real-time delivery
+    path for the Notification Center (see services/realtime.py). Auth is a
+    query param, not the usual Authorization header, because the browser
+    EventSource API cannot set custom headers. Deliberately does NOT use
+    the shared `get_db` request dependency: a StreamingResponse's body can
+    outlive the dependency teardown that happens once this function
+    returns, so the DB session used for the one-time auth check is opened
+    and closed here explicitly, before entering the generator - nothing in
+    the streaming loop below touches the database again."""
+    async with SessionLocal() as session:
+        current_user = await auth_service.get_current_user(session, token)
+    user_id = current_user["id"]
+
+    async def event_stream():
+        queue = realtime_service.subscribe(user_id)
+        try:
+            yield "retry: 3000\n\n"
+            while True:
+                try:
+                    payload = await asyncio.wait_for(queue.get(), timeout=15)
+                    yield f"data: {json.dumps(payload)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": heartbeat\n\n"
+        finally:
+            realtime_service.unsubscribe(user_id, queue)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
+
+@api_router.get("/dashboard/layout", response_model=DashboardLayoutResponse)
+async def get_dashboard_layout(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await dashboard_service.get_dashboard_layout(pg, current_user)
+
+@api_router.put("/dashboard/layout", response_model=DashboardLayoutResponse)
+async def save_dashboard_layout(body: DashboardLayoutRequest, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await dashboard_service.save_dashboard_layout(pg, current_user, [w.model_dump() for w in body.layout])
+
+# ============ Announcements ============
+
+@api_router.post("/owner/announcements", response_model=AnnouncementResponse)
+async def create_announcement(body: AnnouncementCreate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await announcements_service.create_announcement(pg, current_user, body)
+
+@api_router.get("/owner/announcements", response_model=List[AnnouncementResponse])
+async def list_owner_announcements(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await announcements_service.list_announcements(pg, current_user)
+
+@api_router.get("/employee/announcements", response_model=List[AnnouncementResponse])
+async def list_employee_announcements(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.EMPLOYEE:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await announcements_service.list_announcements(pg, current_user)
 
 @api_router.get("/company/{company_id}/qr")
 async def get_company_qr(company_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
@@ -1396,15 +1653,20 @@ async def create_weekly_holiday_pattern(data: WeeklyHolidayPatternCreate, curren
     reference-number/participant/notification/activity-log logic."""
     return await calendar_service.create_weekly_holiday_pattern(pg, current_user, data)
 
-# ============ Seed Data (For Testing) ============
+# ============ Seed Data (dev/test bootstrap only - disabled in production) ============
 
 @api_router.post("/seed")
 async def seed_data(pg: AsyncSession = Depends(get_db)):
-    # Postgres-backed: super admin, demo plan, demo company+owner, demo
-    # employees. Idempotent via business keys (email / plan name) - see
-    # services/seed.py. The old Mongo demo departments/tasks seeding was
-    # removed per the cleanup-first migration policy; it gets reintroduced
-    # in seed_service as those modules migrate to Postgres.
+    # Intentionally unauthenticated (bootstraps the very first super_admin
+    # account into an empty database, before any credentials exist to log
+    # in with) - the automated test suite's session-scoped autouse fixture
+    # also depends on calling this with no auth (see tests/conftest.py).
+    # That combination is only safe in dev/test, where the seeded
+    # credentials below are throwaway - a real deployment must 404 here
+    # rather than let anyone create a super_admin with a known password.
+    # See services/seed.py for what it creates.
+    if ENVIRONMENT == "production":
+        raise HTTPException(status_code=404, detail="Not Found")
     await seed_service.seed_identity_data(pg)
     return {"message": "Seed data created successfully", "admin_email": "admin@jaz.com", "admin_password": "admin123", "owner_email": "owner@demo.com", "owner_password": "owner123", "employee_email": "employee1@demo.com", "employee_password": "emp123"}
 

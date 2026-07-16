@@ -65,6 +65,23 @@ class User(Base, TimestampMixin, SoftDeleteMixin):
     status: Mapped[str] = mapped_column(String, nullable=False, server_default="active")
     avatar: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     last_seen_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Employee CV (Part 1): a single optional attachment per employee - flat
+    # columns rather than a child table, since it's strictly 1:1 (unlike
+    # task/message/calendar attachments, which are 1:many). Same object
+    # storage architecture as every other attachment in this app (metadata
+    # here, bytes in the S3-compatible bucket via services/storage.py).
+    cv_storage_path: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    cv_original_filename: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    cv_mime_type: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    cv_file_size: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    cv_uploaded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    cv_uploaded_by: Mapped[Optional[uuid.UUID]] = fk_uuid("users.id", nullable=True)
+    # Profile photo (User Profile & Account Settings) - same object-storage
+    # pattern as the CV fields above, deliberately kept separate from the
+    # pre-existing, never-populated `avatar` column rather than repurposing
+    # its contract for existing/future consumers.
+    avatar_storage_path: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    avatar_mime_type: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
     __table_args__ = (
         CheckConstraint("role IN ('super_admin','company_owner','employee')", name="ck_users_role"),
@@ -190,11 +207,26 @@ class Task(Base, TimestampMixin, SoftDeleteMixin):
     seen_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_by: Mapped[Optional[uuid.UUID]] = fk_uuid("users.id", nullable=True)
     batch_id: Mapped[Optional[uuid.UUID]] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    # Future-activation ("Scheduled Task"): a task created today that stays
+    # invisible to its assignee (status='scheduled') until this timestamp,
+    # at which point self-heal-on-read flips it to 'new' - same house
+    # pattern as message/calendar reminders, no scheduler process. NULL for
+    # every ordinary task.
+    scheduled_activation_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Sequential Workflow: N task rows share one `batch_id`, each carrying
+    # its position here (0-based). Only the row at the current position is
+    # ever visible to its assignee (status='new'/etc); every later row sits
+    # at status='pending_sequence' until the row before it completes, at
+    # which point the service layer flips it to 'new' and notifies. NULL
+    # for every task not part of a sequential workflow (including the
+    # existing parallel "urgent task to N employees" use of batch_id, which
+    # never sets this column).
+    sequence_order: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
     __table_args__ = (
         CheckConstraint("priority IN ('critical','high','medium','low')", name="ck_tasks_priority"),
         CheckConstraint(
-            "status IN ('new','received','seen','in_progress','pending_review','completed','rejected','overdue','cancelled')",
+            "status IN ('new','received','seen','in_progress','pending_review','completed','rejected','overdue','cancelled','scheduled','pending_sequence')",
             name="ck_tasks_status",
         ),
         CheckConstraint("task_category IN ('urgent','daily') OR task_category IS NULL", name="ck_tasks_category"),
@@ -309,15 +341,36 @@ class Report(Base, TimestampMixin):
 # ============ Notifications ============
 
 class Notification(Base, TimestampMixin):
+    """Single reusable table for every notification in the platform, across
+    every role and module (present and future) - every module writes through
+    services.notifications.publish(), never this table directly. `category`
+    is the broad, extensible grouping used for icon/color/filtering (e.g.
+    "tasks", "attendance", "payments"); `type` is the existing fine-grained
+    subtype used for per-event copy. `entity_type`/`entity_id` point at the
+    record this is about (nullable); `action_url` is the frontend route to
+    navigate to on click. `sender_id`/`sender_name` are an optional
+    denormalized snapshot of who triggered it, same precedent as
+    Report.employee_name / Attendance.employee_department."""
     __tablename__ = "notifications"
 
     id: Mapped[uuid.UUID] = uuid_pk()
     user_id: Mapped[uuid.UUID] = fk_uuid("users.id")
     company_id: Mapped[Optional[uuid.UUID]] = fk_uuid("companies.id", nullable=True)
     type: Mapped[str] = mapped_column(String, nullable=False)
+    category: Mapped[str] = mapped_column(String, nullable=False, server_default="system")
     title: Mapped[str] = mapped_column(String, nullable=False)
     message: Mapped[str] = mapped_column(Text, nullable=False)
     read_status: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    entity_type: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    entity_id: Mapped[Optional[uuid.UUID]] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    action_url: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    sender_id: Mapped[Optional[uuid.UUID]] = fk_uuid("users.id", nullable=True)
+    sender_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+
+    __table_args__ = (
+        Index("ix_notifications_user_created", "user_id", "created_at"),
+        Index("ix_notifications_user_unread", "user_id", "read_status"),
+    )
 
 
 # ============ Work Messaging ============
@@ -616,3 +669,45 @@ class AuditLog(Base):
     ip_address: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     user_agent: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+# ============ Dashboard customization ============
+
+class DashboardLayout(Base, TimestampMixin):
+    """One row per user. `layout` is a JSONB array of
+    {"key": str, "visible": bool, "order": int} - one entry per widget the
+    user has ever seen. Deliberately schemaless on the widget-identity side
+    (no FK, no CHECK, no fixed enum of keys): the frontend owns the set of
+    valid widget keys in its own registry, so shipping a brand-new widget is
+    a frontend-only change - any key not yet present in a user's saved
+    layout is simply appended as visible/default-ordered by the frontend at
+    render time, no migration or backend change required."""
+
+    __tablename__ = "dashboard_layouts"
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    user_id: Mapped[uuid.UUID] = fk_uuid("users.id", nullable=False)
+    layout: Mapped[list] = mapped_column(JSONB, nullable=False, server_default="[]")
+
+    __table_args__ = (
+        UniqueConstraint("user_id", name="uq_dashboard_layouts_user"),
+    )
+
+
+# ============ Announcements ============
+
+class Announcement(Base, TimestampMixin):
+    """Deliberately minimal - a company-wide broadcast message, not a full
+    CMS entry (no attachments, no scheduling, no per-employee read state).
+    Publishing one fans out a real notification (category='announcements')
+    to every employee in the company via the existing notification
+    framework - see services/announcements.py."""
+
+    __tablename__ = "announcements"
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id")
+    created_by: Mapped[uuid.UUID] = fk_uuid("users.id")
+    created_by_name: Mapped[str] = mapped_column(String, nullable=False)
+    title: Mapped[str] = mapped_column(String, nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)

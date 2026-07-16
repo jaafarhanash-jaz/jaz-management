@@ -6,17 +6,56 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 import repositories.attendance as attendance_repo
 import repositories.companies as companies_repo
+import repositories.dashboard_layouts as dashboard_layouts_repo
 import repositories.daily_tasks as daily_tasks_repo
 import repositories.notifications as notifications_repo
 import repositories.reports as reports_repo
 import repositories.tasks as tasks_repo
 import repositories.users as users_repo
+import services.attendance as attendance_service
 import services.calendar as calendar_service
 import services.holidays as holidays_service
+import services.messages as messages_service
 import services.notifications as notifications_service
+import services.tasks as tasks_service
 from services.admin import parse_uuid
 
+# Employee Workspace (Part 2) - "Focus Now" priority order, exactly as
+# specified: Critical > Urgent > High > nearest due date. Only tasks the
+# employee still needs to act on are candidates - 'pending_review' (already
+# done their part, waiting on the owner) and terminal statuses are excluded.
+FOCUS_CANDIDATE_STATUSES = ("new", "received", "seen", "in_progress", "rejected", "overdue")
+
+
+def _due_sort_key(task: dict):
+    due = task.get("due_date")
+    return (due is None, due or "", task.get("due_time") or "")
+
+
+def _pick_focus_task(tasks: list):
+    candidates = [t for t in tasks if t["status"] in FOCUS_CANDIDATE_STATUSES]
+    if not candidates:
+        return None, None
+    critical = [t for t in candidates if t["priority"] == "critical"]
+    if critical:
+        return sorted(critical, key=_due_sort_key)[0], "critical"
+    urgent = [t for t in candidates if t["task_category"] == "urgent"]
+    if urgent:
+        return sorted(urgent, key=_due_sort_key)[0], "urgent"
+    high = [t for t in candidates if t["priority"] == "high"]
+    if high:
+        return sorted(high, key=_due_sort_key)[0], "high"
+    return sorted(candidates, key=_due_sort_key)[0], "nearest_due"
+
 OPEN_STATUSES = ("new", "seen", "in_progress")
+# Scheduled Tasks not yet activated, and later steps of a Sequential
+# Workflow not yet reached - both real tasks, but per the explicit "does
+# not affect dashboards" requirement they are excluded from every
+# owner-facing count/chart until self-heal (activate_due_tasks) or the
+# workflow cascade actually activates them. The owner still sees them in
+# the plain Tasks list (they need to manage/cancel them), just not counted
+# here.
+HIDDEN_TASK_STATUSES = ("scheduled", "pending_sequence")
 
 
 def compute_star_rating(score: float) -> str:
@@ -44,6 +83,7 @@ async def get_owner_dashboard(db: AsyncSession, current_user: dict) -> dict:
     today = datetime.now(timezone.utc).date()
     today_holiday = await holidays_service.get_day_off_info(db, company_id, today)
     working_hours = await companies_repo.get_working_hours(db, company_id)
+    await tasks_service.activate_due_tasks(db, company_id)
 
     # Scope attendance stats to CURRENT employees only, deduped per employee -
     # counting raw attendance rows would let orphaned rows (from deleted
@@ -68,7 +108,7 @@ async def get_owner_dashboard(db: AsyncSession, current_user: dict) -> dict:
     checked_out_today = len(checked_out_ids)
     attendance_percentage = min(100.0, round((present_today + late_today) / total_employees * 100, 1)) if total_employees > 0 else 0
 
-    all_tasks = await tasks_repo.list_by_company(db, company_id)
+    all_tasks = [t for t in await tasks_repo.list_by_company(db, company_id) if t.status not in HIDDEN_TASK_STATUSES]
     open_tasks = sum(1 for t in all_tasks if t.status in OPEN_STATUSES)
     completed_tasks = sum(1 for t in all_tasks if t.status == "completed")
     overdue_tasks = sum(1 for t in all_tasks if t.status == "overdue")
@@ -122,8 +162,9 @@ async def get_owner_analytics(db: AsyncSession, current_user: dict) -> dict:
         raise HTTPException(status_code=403, detail="Access denied")
 
     company_id = parse_uuid(current_user["company_id"])
+    await tasks_service.activate_due_tasks(db, company_id)
     employees = await users_repo.list_employees_by_company(db, company_id)
-    all_tasks = await tasks_repo.list_by_company(db, company_id)
+    all_tasks = [t for t in await tasks_repo.list_by_company(db, company_id) if t.status not in HIDDEN_TASK_STATUSES]
 
     today = datetime.now(timezone.utc).date()
     week_start = today - timedelta(days=today.weekday())
@@ -276,15 +317,48 @@ async def get_employee_dashboard(db: AsyncSession, current_user: dict) -> dict:
     employee_id = parse_uuid(current_user["id"])
     company_id = parse_uuid(current_user["company_id"])
     today = datetime.now(timezone.utc).date()
+    await tasks_service.activate_due_tasks(db, company_id)
 
-    tasks = await tasks_repo.list_for_employee(db, employee_id)
-    total_tasks = len(tasks)
-    completed_tasks = sum(1 for t in tasks if t.status == "completed")
-    pending_tasks = sum(1 for t in tasks if t.status in ("new", "in_progress"))
+    tasks_raw = await tasks_repo.list_for_employee(db, employee_id)
+    total_tasks = len(tasks_raw)
+    completed_tasks = sum(1 for t in tasks_raw if t.status == "completed")
+    pending_tasks = sum(1 for t in tasks_raw if t.status in ("new", "in_progress"))
     completion_rate = (completed_tasks / total_tasks * 100) if total_tasks > 0 else 0
 
-    attendance = await attendance_repo.get_for_employee_on_date(db, employee_id, today)
+    # My Tasks / Focus Now (Part 2): everything except completed/cancelled -
+    # the active workspace, not the archive. created_by resolved so each
+    # card can show its creator, per the Employee Workspace spec.
+    active_raw = [t for t in tasks_raw if t.status not in ("completed", "cancelled")]
+    creator_ids = {t.created_by for t in active_raw}
+    names = await users_repo.get_names_by_ids(db, creator_ids)
+    active_tasks = [
+        tasks_service.task_response(t, assigned_to_name=current_user["name"], created_by_name=names.get(str(t.created_by)))
+        for t in active_raw
+    ]
+    focus_task, focus_reason = _pick_focus_task(active_tasks)
 
+    attendance = await attendance_repo.get_for_employee_on_date(db, employee_id, today)
+    attendance_widget = attendance_service.attendance_response(attendance) if attendance else None
+
+    # Messages widget: reuses the exact same unread-inbox query the sidebar
+    # badge and the Work Messages page already use - no new message-listing
+    # logic, just a small page_size for a preview.
+    inbox = await messages_service.get_inbox(
+        db, current_user, page=1, page_size=3, subject=None, priority=None, tags=None,
+        status=None, sender=None, date_from=None, date_to=None, unread_only=True,
+    )
+    messages_widget = {
+        "unread_conversations": inbox["total"],
+        "recent": [
+            {"sender_name": m["sender_name"], "subject": m["subject"], "preview": (m["body"] or "")[:140]}
+            for m in inbox["items"]
+        ],
+    }
+
+    # latest_notification kept for backward compatibility (pre-existing
+    # field) - the redesigned dashboard's Notifications widget uses the
+    # real-time useNotifications() hook instead (same one NotificationBell
+    # already uses), not a second notification-fetch path here.
     notifications = await notifications_repo.list_for_user(db, employee_id, limit=1)
     latest_notification = notifications_service.notification_response(notifications[0]) if notifications else None
 
@@ -295,6 +369,11 @@ async def get_employee_dashboard(db: AsyncSession, current_user: dict) -> dict:
         "completion_rate": round(completion_rate, 1),
         "checked_in": attendance is not None and attendance.check_in_time is not None,
         "checked_out": attendance is not None and attendance.check_out_time is not None,
+        "tasks": active_tasks,
+        "focus_task": focus_task,
+        "focus_reason": focus_reason,
+        "attendance": attendance_widget,
+        "messages_widget": messages_widget,
         "latest_notification": latest_notification,
         "calendar_widgets": await calendar_service.compute_calendar_dashboard_widgets(db, current_user, is_owner=False),
         "today_is_holiday": today_holiday is not None,
@@ -332,3 +411,19 @@ async def get_employee_performance(db: AsyncSession, current_user: dict) -> dict
         "late_days": late_days, "absent_days": absent_days, "attendance_rate": round(attendance_rate, 1),
         "performance_score": round(performance_score, 1),
     }
+
+
+async def get_dashboard_layout(db: AsyncSession, current_user: dict) -> dict:
+    """Per-user widget layout for the customizable dashboard (Part 2). Not
+    role-gated - any authenticated user has exactly one layout row. Missing
+    row (first login, or first time a user reaches a customizable
+    dashboard) returns an empty layout; the frontend's WIDGET_REGISTRY
+    fills in defaults for every widget key absent from the saved list, so
+    a brand-new widget shipped later needs no backend change here."""
+    row = await dashboard_layouts_repo.get_by_user(db, parse_uuid(current_user["id"]))
+    return {"layout": row.layout if row else []}
+
+
+async def save_dashboard_layout(db: AsyncSession, current_user: dict, layout: list) -> dict:
+    row = await dashboard_layouts_repo.upsert(db, parse_uuid(current_user["id"]), layout)
+    return {"layout": row.layout}

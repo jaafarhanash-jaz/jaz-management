@@ -1,4 +1,5 @@
 import { useEffect, useState, useRef, useCallback } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { Layout } from '@/components/Layout';
 import { Card } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
@@ -105,7 +106,12 @@ function MapRecenter({ position }) {
 }
 
 const OwnerAttendance = ({ onLogout, language, setLanguage }) => {
-  const [activeTab, setActiveTab] = useState('records');
+  // Dashboard widgets deep-link here (Part 1) - e.g. clicking "Late Today"
+  // lands directly on the Records tab pre-filtered to today + status=late.
+  // Reading these once on mount is enough; the filter controls below take
+  // over from there exactly as before.
+  const [searchParams] = useSearchParams();
+  const [activeTab, setActiveTab] = useState(searchParams.get('tab') || 'records');
   const [employees, setEmployees] = useState([]);
 
   // Records tab
@@ -113,8 +119,10 @@ const OwnerAttendance = ({ onLogout, language, setLanguage }) => {
   const [recordsLoading, setRecordsLoading] = useState(true);
   const [stats, setStats] = useState(null);
   const [filters, setFilters] = useState({
-    search: '', employee_id: '', department: '', status: '',
-    date_from: todayStr(), date_to: todayStr(),
+    search: '', employee_id: '', department: '',
+    status: searchParams.get('status') || '',
+    date_from: searchParams.get('date_from') || todayStr(),
+    date_to: searchParams.get('date_to') || todayStr(),
   });
   const [editing, setEditing] = useState(null);
   const [editForm, setEditForm] = useState({ check_in_time: '', check_out_time: '', status: '' });

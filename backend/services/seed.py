@@ -11,15 +11,12 @@ from services.qr import generate_qr_code
 
 
 async def seed_identity_data(db: AsyncSession) -> None:
-    """Postgres-backed portion of /api/seed: super admin, the demo
-    subscription plan, the demo company+owner (mutual deferred FK, resolved
-    at commit), and the two demo employees. Idempotent via business keys
-    (email / plan name) rather than the old fixed literal ids, since ids are
-    now real UUIDs generated fresh on first creation (plan decision #1).
-
-    Departments/tasks demo data stay on the old Mongo-backed code path in
-    server.py until the Employees/Tasks modules migrate - not touched here.
-    """
+    """Dev/test bootstrap data for /api/seed (disabled in production - see
+    the route in server.py): a super admin, one subscription plan, one
+    company+owner (mutual deferred FK, resolved at commit), and two
+    employees. Idempotent via business keys (email / plan name) rather than
+    fixed literal ids, since ids are real UUIDs generated fresh on first
+    creation."""
     admin = await users_repo.get_by_email(db, "admin@jaz.com")
     if not admin:
         await users_repo.create(

@@ -3,9 +3,11 @@ from typing import List
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-import repositories.notifications as notifications_repo
 import repositories.tasks as tasks_repo
 import repositories.users as users_repo
+import services.notifications as notifications_service
+import services.tasks as tasks_service
+from services.admin import parse_uuid
 
 
 async def pending_critical_tasks(db: AsyncSession, current_user: dict) -> List[dict]:
@@ -15,7 +17,11 @@ async def pending_critical_tasks(db: AsyncSession, current_user: dict) -> List[d
     heartbeats (multiple tabs) fire the 'delivered' notification exactly
     once. Response shape matches the old Mongo implementation field for
     field; attachments stay [] until the Tasks module migrates the
-    attachment pipeline to object storage."""
+    attachment pipeline to object storage. Also piggybacks Scheduled Task
+    activation (Part 3) - the heartbeat is the tightest poll cycle any
+    employee session already has (20s), so this is the fastest an
+    activation can be felt without new infrastructure."""
+    await tasks_service.activate_due_tasks(db, parse_uuid(current_user["company_id"]))
     pending = await tasks_repo.get_pending_critical_for_employee(db, current_user["id"])
 
     creator_names = await users_repo.get_names_by_ids(db, {t.created_by for t in pending if t.created_by})
@@ -26,13 +32,19 @@ async def pending_critical_tasks(db: AsyncSession, current_user: dict) -> List[d
         if not task.alert_delivered_at:
             if await tasks_repo.claim_alert_delivery(db, task.id, now):
                 task.alert_delivered_at = now
-                await notifications_repo.create(
+                await notifications_service.publish(
                     db,
                     user_id=task.created_by,
                     company_id=current_user["company_id"],
+                    category=notifications_service.CATEGORY_CRITICAL_TASKS,
                     type="critical_task_delivered",
                     title="تم تسليم مهمة عاجلة",
                     message=f"تم عرض تنبيه المهمة العاجلة على الموظف {current_user['name']} للمهمة: {task.title}",
+                    entity_type="task",
+                    entity_id=task.id,
+                    action_url="/company-owner/tasks",
+                    sender_id=parse_uuid(current_user["id"]),
+                    sender_name=current_user["name"],
                 )
         results.append({
             "id": str(task.id),

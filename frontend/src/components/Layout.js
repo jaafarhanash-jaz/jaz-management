@@ -15,9 +15,12 @@ import {
   Radio,
   CalendarDays,
   CalendarOff,
+  Megaphone,
+  UserCircle,
 } from 'lucide-react';import { useState, useEffect } from 'react';
 import { t } from '@/utils/translations';
 import api from '@/utils/api';
+import { NotificationBell } from '@/components/NotificationBell';
 
 export const Layout = ({ children, userRole, onLogout, language, setLanguage }) => {
   const location = useLocation();
@@ -46,6 +49,7 @@ export const Layout = ({ children, userRole, onLogout, language, setLanguage }) 
         { icon: LayoutDashboard, label: t('dashboard', language), path: '/super-admin/dashboard' },
         { icon: Building2, label: t('companies', language), path: '/super-admin/companies' },
         { icon: CreditCard, label: t('plans', language), path: '/super-admin/plans' },
+        { icon: UserCircle, label: t('profile', language), path: '/super-admin/profile' },
       ];
     } else if (userRole === 'company_owner') {
       return [
@@ -60,7 +64,9 @@ export const Layout = ({ children, userRole, onLogout, language, setLanguage }) 
         { icon: CalendarOff, label: 'عطلات الشركة', path: '/company-owner/company-holidays' },
         { icon: FileText, label: t('reports', language), path: '/company-owner/reports' },
         { icon: Building2, label: t('departments', language), path: '/company-owner/departments' },
+        { icon: Megaphone, label: 'الإعلانات', path: '/company-owner/announcements' },
         { icon: CreditCard, label: 'الاشتراك', path: '/company-owner/subscription' },
+        { icon: UserCircle, label: t('profile', language), path: '/company-owner/profile' },
       ];
     } else if (userRole === 'employee') {
       return [
@@ -69,8 +75,10 @@ export const Layout = ({ children, userRole, onLogout, language, setLanguage }) 
         { icon: Clock, label: t('attendance', language), path: '/employee/attendance' },
         { icon: Mail, label: 'رسائل العمل', path: '/employee/messages', badge: unreadMessages },
         { icon: CalendarDays, label: 'التقويم', path: '/employee/calendar' },
+        { icon: Megaphone, label: 'الإعلانات', path: '/employee/announcements' },
         { icon: FileText, label: t('performance', language), path: '/employee/performance' },
         { icon: FileText, label: t('reports', language), path: '/employee/reports' },
+        { icon: UserCircle, label: t('profile', language), path: '/employee/profile' },
       ];
     }
     return [];
@@ -166,7 +174,8 @@ export const Layout = ({ children, userRole, onLogout, language, setLanguage }) 
               <Menu className="w-6 h-6" />
             </button>
             
-            <div className="flex items-center gap-4">
+            <div className="flex items-center gap-2 sm:gap-4">
+              <NotificationBell userRole={userRole} language={language} />
               <Button
                 onClick={() => setLanguage(language === 'ar' ? 'en' : 'ar')}
                 data-testid="language-toggle-btn"
@@ -180,8 +189,10 @@ export const Layout = ({ children, userRole, onLogout, language, setLanguage }) 
           </div>
         </header>
 
-        {/* Page Content */}
-        <main className="flex-1 p-6 md:p-8 lg:p-12">{children}</main>
+        {/* Page Content - keyed by pathname (not full location, so
+            in-page filter/query changes don't retrigger it) for a smooth
+            page transition on real navigation between pages. */}
+        <main key={location.pathname} className="flex-1 p-6 md:p-8 lg:p-12 animate-in fade-in slide-in-from-top-1 duration-300">{children}</main>
       </div>
     </div>
   );

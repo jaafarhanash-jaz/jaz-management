@@ -14,9 +14,9 @@ import repositories.calendar_event_reminders as calendar_reminders_repo
 import repositories.calendar_events as calendar_events_repo
 import repositories.companies as companies_repo
 import repositories.counters as counters_repo
-import repositories.notifications as notifications_repo
 import repositories.users as users_repo
 import services.messages as messages_service
+import services.notifications as notifications_service
 from services.admin import parse_uuid
 from services.calendar_occurrences import combine_event_datetime, count_raw_occurrences_before, expand_event_occurrences
 from services.storage import classify_attachment_type, decode_and_validate, download_base64, upload
@@ -290,9 +290,12 @@ async def notify_for_calendar_event(db: AsyncSession, event, verb: str, particip
     recipients.discard(actor_id)
 
     for user_id in recipients:
-        await notifications_repo.create(
-            db, user_id=user_id, company_id=event.company_id, type=f"calendar_{verb}",
+        await notifications_service.publish(
+            db, user_id=user_id, company_id=event.company_id,
+            category=notifications_service.CATEGORY_CALENDAR, type=f"calendar_{verb}",
             title=title_template, message=message_template.format(title=event.title or "", actor_name=(actor or {}).get("name", "")),
+            entity_type="calendar_event", entity_id=event.id, action_url="/company-owner/calendar",
+            sender_id=actor_id, sender_name=(actor or {}).get("name"),
         )
 
 

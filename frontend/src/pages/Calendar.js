@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
+import { useNavigate } from 'react-router-dom';
 import {
   format, startOfMonth, endOfMonth, startOfWeek, endOfWeek, eachDayOfInterval,
   addMonths, subMonths, addWeeks, subWeeks, addDays, subDays, isSameDay, isSameMonth, isToday, parseISO,
@@ -15,8 +16,10 @@ import api from '@/utils/api';
 import {
   ChevronRight, ChevronLeft, CalendarDays, Search, Plus, MapPin, Video, Building2,
   Users, AlertTriangle, Paperclip, Bell, Repeat, X, Download, CheckCircle2, XCircle, HelpCircle,
+  CalendarPlus, CheckSquare,
 } from 'lucide-react';
 import { toast } from 'sonner';
+import CreateTaskDialog from '@/components/CreateTaskDialog';
 
 const CATEGORY_LABELS = {
   meeting: 'اجتماع', company_holiday: 'عطلة رسمية', training: 'تدريب', task_deadline: 'موعد نهائي لمهمة',
@@ -42,6 +45,7 @@ const emptyCompose = () => ({
 const selectClass = 'h-9 w-full rounded-md border border-input bg-white px-3 text-sm';
 
 const CalendarPage = ({ onLogout, language, setLanguage, userRole }) => {
+  const navigate = useNavigate();
   const [view, setView] = useState('month');
   const [currentDate, setCurrentDate] = useState(new Date());
   const [events, setEvents] = useState([]);
@@ -62,6 +66,14 @@ const CalendarPage = ({ onLogout, language, setLanguage, userRole }) => {
   const [pendingReminders, setPendingReminders] = useState([]);
   const [saving, setSaving] = useState(false);
 
+  // Create Task from Calendar (owner only) - reuses the same CreateTaskDialog
+  // as the Tasks page, no second implementation. The chooser only decides
+  // which existing dialog to open.
+  const [tasks, setTasks] = useState([]);
+  const [chooserOpen, setChooserOpen] = useState(false);
+  const [chooserDate, setChooserDate] = useState(null);
+  const [taskDialogOpen, setTaskDialogOpen] = useState(false);
+
   const [detailOpen, setDetailOpen] = useState(false);
   const [detailEvent, setDetailEvent] = useState(null);
   const knownEventIds = useRef(null);
@@ -72,6 +84,15 @@ const CalendarPage = ({ onLogout, language, setLanguage, userRole }) => {
   useEffect(() => {
     api.get('/owner/employees').then((res) => setEmployees(res.data)).catch(() => {});
   }, []);
+
+  // Tasks-on-Calendar (owner only) - lightweight day-cell markers computed
+  // client-side from the same /owner/tasks list the Tasks page already uses;
+  // no new backend linkage between tasks and calendar events.
+  const fetchTasks = useCallback(() => {
+    if (!isOwner) return;
+    api.get('/owner/tasks').then((res) => setTasks(res.data)).catch(() => {});
+  }, [isOwner]);
+  useEffect(() => { fetchTasks(); }, [fetchTasks]);
 
   const viewRange = useCallback(() => {
     if (view === 'month') return { start: startOfWeek(startOfMonth(currentDate)), end: endOfWeek(endOfMonth(currentDate)) };
@@ -158,6 +179,25 @@ const CalendarPage = ({ onLogout, language, setLanguage, userRole }) => {
   };
 
   // ---- Compose ----
+  // Entry point for every "create new" trigger (month cell, week/day "+"
+  // button, header button). Owners get the Event/Task chooser; employees
+  // keep today's behavior unchanged (event composer only).
+  const handleCreateClick = (prefillDate = null) => {
+    if (!isOwner) { openCompose(prefillDate); return; }
+    setChooserDate(prefillDate);
+    setChooserOpen(true);
+  };
+
+  const chooseCreateEvent = () => {
+    setChooserOpen(false);
+    openCompose(chooserDate);
+  };
+
+  const chooseCreateTask = () => {
+    setChooserOpen(false);
+    setTaskDialogOpen(true);
+  };
+
   const openCompose = (prefillDate = null) => {
     const form = emptyCompose();
     if (prefillDate) {
@@ -339,6 +379,25 @@ const CalendarPage = ({ onLogout, language, setLanguage, userRole }) => {
 
   // ---- Rendering helpers ----
   const eventsOnDay = (day) => events.filter((ev) => isSameDay(new Date(ev.occurrence_start), day));
+  const tasksOnDay = (day) => tasks.filter((task) => task.due_date === format(day, 'yyyy-MM-dd'));
+
+  const TASK_PRIORITY_ACCENT = { critical: 'border-s-4 border-red-600', high: 'border-s-4 border-amber-500', medium: '', low: 'border-s-4 border-gray-300' };
+
+  // Visually distinct from EventChip (checkmark icon, dashed background) so
+  // tasks read as "due here" rather than a scheduled appointment. Clicking
+  // navigates to the existing Tasks page rather than duplicating task detail UI.
+  const TaskChip = ({ task }) => (
+    <button
+      onClick={(e) => { e.stopPropagation(); navigate('/company-owner/tasks'); }}
+      data-testid={`task-chip-${task.id}`}
+      title={task.title}
+      className={`w-full text-start text-xs px-1.5 py-0.5 rounded-sm mb-0.5 truncate bg-indigo-50 text-indigo-700 flex items-center gap-1 ${TASK_PRIORITY_ACCENT[task.priority] || ''}`}
+    >
+      <CheckSquare className="w-3 h-3 shrink-0" />
+      {task.due_time && <span className="font-medium">{task.due_time} </span>}
+      {task.title}
+    </button>
+  );
 
   const EventChip = ({ ev }) => (
     <button
@@ -363,7 +422,7 @@ const CalendarPage = ({ onLogout, language, setLanguage, userRole }) => {
           <div key={d} className="bg-gray-50 text-center text-xs font-medium text-gray-500 py-2">{d}</div>
         ))}
         {days.map((day) => (
-          <div key={day.toISOString()} onClick={() => openCompose(day)}
+          <div key={day.toISOString()} onClick={() => handleCreateClick(day)}
             data-testid={`month-cell-${format(day, 'yyyy-MM-dd')}`}
             className={`bg-white min-h-[100px] p-1 cursor-pointer hover:bg-gray-50 ${!isSameMonth(day, currentDate) ? 'opacity-40' : ''}`}>
             <p className={`text-xs mb-1 ${isToday(day) ? 'w-5 h-5 flex items-center justify-center rounded-full bg-[#0033A0] text-white' : 'text-gray-500'}`}>
@@ -371,6 +430,8 @@ const CalendarPage = ({ onLogout, language, setLanguage, userRole }) => {
             </p>
             {eventsOnDay(day).slice(0, 3).map((ev) => <EventChip key={ev.id + ev.occurrence_date} ev={ev} />)}
             {eventsOnDay(day).length > 3 && <p className="text-[10px] text-gray-400">+{eventsOnDay(day).length - 3} أخرى</p>}
+            {isOwner && tasksOnDay(day).slice(0, 2).map((task) => <TaskChip key={task.id} task={task} />)}
+            {isOwner && tasksOnDay(day).length > 2 && <p className="text-[10px] text-gray-400">+{tasksOnDay(day).length - 2} مهام</p>}
           </div>
         ))}
       </div>
@@ -388,7 +449,8 @@ const CalendarPage = ({ onLogout, language, setLanguage, userRole }) => {
               {format(day, 'EEE d')}
             </p>
             {eventsOnDay(day).map((ev) => <EventChip key={ev.id + ev.occurrence_date} ev={ev} />)}
-            <button onClick={() => openCompose(day)} className="text-xs text-gray-400 hover:text-[#0033A0] mt-1">+ إضافة</button>
+            {isOwner && tasksOnDay(day).map((task) => <TaskChip key={task.id} task={task} />)}
+            <button onClick={() => handleCreateClick(day)} className="text-xs text-gray-400 hover:text-[#0033A0] mt-1">+ إضافة</button>
           </div>
         ))}
       </div>
@@ -420,7 +482,7 @@ const CalendarPage = ({ onLogout, language, setLanguage, userRole }) => {
             <h1 className="text-4xl font-bold text-[#0A0A0A]" data-testid="calendar-title">التقويم</h1>
             <p className="text-gray-600 mt-2">تقويم الشركة الذكي</p>
           </div>
-          <Button onClick={() => openCompose()} className="bg-[#0033A0] hover:bg-[#002277] rounded-sm" data-testid="new-event-btn">
+          <Button onClick={() => handleCreateClick()} className="bg-[#0033A0] hover:bg-[#002277] rounded-sm" data-testid="new-event-btn">
             <Plus className="w-4 h-4 me-2" /> موعد جديد
           </Button>
         </div>
@@ -795,6 +857,43 @@ const CalendarPage = ({ onLogout, language, setLanguage, userRole }) => {
             )}
           </DialogContent>
         </Dialog>
+
+        {/* ============ Create Event/Task Chooser (owner only) ============ */}
+        <Dialog open={chooserOpen} onOpenChange={setChooserOpen}>
+          <DialogContent className="max-w-sm" data-testid="create-chooser-dialog">
+            <DialogHeader><DialogTitle>ماذا تريد إنشاء؟</DialogTitle></DialogHeader>
+            <div className="grid grid-cols-1 gap-3">
+              <button
+                type="button" onClick={chooseCreateEvent} data-testid="chooser-create-event-btn"
+                className="flex items-center gap-3 p-4 border border-gray-200 rounded-md hover:border-[#0033A0] hover:bg-blue-50 transition-colors text-start"
+              >
+                <CalendarPlus className="w-6 h-6 text-[#0033A0] shrink-0" />
+                <div>
+                  <p className="font-medium text-[#0A0A0A]">إنشاء موعد</p>
+                  <p className="text-xs text-gray-500">اجتماع، تذكير، أو حدث في التقويم</p>
+                </div>
+              </button>
+              <button
+                type="button" onClick={chooseCreateTask} data-testid="chooser-create-task-btn"
+                className="flex items-center gap-3 p-4 border border-gray-200 rounded-md hover:border-[#0033A0] hover:bg-blue-50 transition-colors text-start"
+              >
+                <CheckSquare className="w-6 h-6 text-[#0033A0] shrink-0" />
+                <div>
+                  <p className="font-medium text-[#0A0A0A]">إنشاء مهمة</p>
+                  <p className="text-xs text-gray-500">تعيين مهمة لموظف أو أكثر</p>
+                </div>
+              </button>
+            </div>
+          </DialogContent>
+        </Dialog>
+
+        <CreateTaskDialog
+          open={taskDialogOpen}
+          onOpenChange={setTaskDialogOpen}
+          employees={employees}
+          onCreated={fetchTasks}
+          defaultDueDate={chooserDate ? format(chooserDate, 'yyyy-MM-dd') : null}
+        />
       </div>
     </Layout>
   );
