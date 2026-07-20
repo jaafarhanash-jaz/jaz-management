@@ -9,7 +9,7 @@ import json
 import os
 import logging
 from pathlib import Path
-from pydantic import BaseModel, Field, ConfigDict, EmailStr
+from pydantic import BaseModel, Field, ConfigDict, EmailStr, field_validator
 from typing import List, Literal, Optional, Dict, Any
 import uuid
 from datetime import datetime, timezone, timedelta, date
@@ -450,6 +450,23 @@ class UrgentTaskCreate(BaseModel):
     due_date: Optional[str] = None
     due_time: Optional[str] = None
     requires_proof: bool = False
+
+class TaskProofUpload(BaseModel):
+    """Layer 1 of the proof-upload hardening (defense in depth - see
+    the incident report): a malformed body (missing/null/empty/
+    whitespace-only file_url) is now rejected here, before it ever
+    reaches the service or repository layers. Previously this endpoint
+    accepted a raw untyped dict, and a None file_url flowed all the
+    way to `array_append(Task.proof_files, NULL)`, corrupting the
+    column and breaking TaskResponse serialization for that task."""
+    file_url: str
+
+    @field_validator("file_url")
+    @classmethod
+    def file_url_must_be_meaningful(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("file_url must not be empty or whitespace-only")
+        return value
 
 class AttendanceCheckIn(BaseModel):
     qr_code: str
@@ -1161,7 +1178,7 @@ async def receive_critical_task(task_id: str, current_user: dict = Depends(get_c
     return await tasks_service.receive_critical_task(pg, current_user, current_user["company_id"], task_id)
 
 @api_router.post("/employee/tasks/{task_id}/proof")
-async def upload_task_proof(task_id: str, proof: dict, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+async def upload_task_proof(task_id: str, proof: TaskProofUpload, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     if current_user["role"] != UserRole.EMPLOYEE:
         raise HTTPException(status_code=403, detail="Access denied")
     return await tasks_service.upload_task_proof(pg, current_user["id"], task_id, proof)

@@ -199,7 +199,18 @@ async def get_daily_instance(db: AsyncSession, daily_task_id, employee_id, occur
 
 
 async def append_proof_file(db: AsyncSession, task_id, employee_id, file_url: str) -> bool:
-    """Array append, equivalent to the old Mongo $push onto proof_files."""
+    """Array append, equivalent to the old Mongo $push onto proof_files.
+
+    Layer 3 of the proof-upload hardening (defense in depth - see the
+    incident report): this is the last line of defense before the
+    write. A blank/whitespace-only file_url must never reach
+    array_append - raising here (rather than silently returning False,
+    which would be misread as "task not found" by the caller) makes a
+    contract violation from any future/bypassing caller loud and
+    traceable instead of silently corrupting the column again."""
+    if not file_url or not file_url.strip():
+        raise ValueError("append_proof_file: file_url must not be empty or whitespace-only")
+
     result = await db.execute(
         update(Task)
         .where(Task.id == task_id, Task.assigned_to == employee_id)

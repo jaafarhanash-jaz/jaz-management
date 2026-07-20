@@ -230,6 +230,11 @@ class Task(Base, TimestampMixin, SoftDeleteMixin):
             name="ck_tasks_status",
         ),
         CheckConstraint("task_category IN ('urgent','daily') OR task_category IS NULL", name="ck_tasks_category"),
+        # Defense in depth, Layer 4 (see the proof-upload incident report,
+        # migration f587f273218b) - `array_position` is Postgres's
+        # NULL-aware array search; this only ever rejects a real NULL
+        # element, never an empty array.
+        CheckConstraint("array_position(proof_files, NULL) IS NULL", name="ck_tasks_proof_files_no_null"),
     )
 
 

@@ -33,6 +33,8 @@ def _constraint_error_detail(exc: IntegrityError, default: str) -> str:
         return "Invalid priority value"
     if constraint and ("assigned_to" in constraint or "employee_id" in constraint):
         return "assigned_to does not reference an existing user"
+    if constraint == "ck_tasks_proof_files_no_null":
+        return "file_url must not be empty or whitespace-only"
     return default
 
 
@@ -836,9 +838,43 @@ async def receive_critical_task(db: AsyncSession, employee, company_id, task_id:
     return {"message": "Task received successfully", "received_at": received_at.isoformat()}
 
 
-async def upload_task_proof(db: AsyncSession, employee_id, task_id: str, proof: dict) -> dict:
+async def upload_task_proof(db: AsyncSession, employee_id, task_id: str, proof) -> dict:
+    # Layer 2 of the proof-upload hardening (defense in depth - see the
+    # incident report): re-validated here even though the route's
+    # TaskProofUpload model (Layer 1) already rejects a missing/empty/
+    # whitespace-only file_url - this service function must never trust
+    # that every caller went through that route, now or in the future.
+    file_url = (proof.file_url or "").strip()
+    if not file_url:
+        raise HTTPException(status_code=400, detail="file_url must not be empty or whitespace-only")
+
     parsed_id = parse_uuid(task_id)
-    if not parsed_id or not await tasks_repo.append_proof_file(db, parsed_id, employee_id, proof.get("file_url")):
+    try:
+        appended = parsed_id and await tasks_repo.append_proof_file(db, parsed_id, employee_id, file_url)
+    except ValueError as exc:
+        # The repository's Layer-3 guard (see the incident report) raises
+        # ValueError rather than returning False, so a contract violation
+        # from any future/bypassing caller is loud instead of silently
+        # misread as "task not found". No route here ever lets an
+        # invalid file_url reach this point today (Layers 1-2 already
+        # reject it), but nothing in this project catches a bare
+        # ValueError - left uncaught, it would fall through FastAPI's
+        # default handler as an unstructured 500. Converted to the
+        # project's standard validation-error response instead.
+        raise HTTPException(status_code=400, detail=str(exc))
+    except IntegrityError as exc:
+        # Layer 4's DB constraint (ck_tasks_proof_files_no_null,
+        # migration f587f273218b) is unreachable through this function
+        # today - Layers 1-3 already guarantee file_url is non-empty
+        # before this statement runs. Handled anyway, the same way
+        # every other CHECK-constraint violation in this file is
+        # (_constraint_error_detail), so a future change to this
+        # function can never turn a constraint violation into an
+        # unhandled 500 by omission.
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=_constraint_error_detail(exc, "Invalid proof data"))
+
+    if not appended:
         raise HTTPException(status_code=404, detail="Task not found")
     return {"message": "Proof uploaded successfully"}
 
