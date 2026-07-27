@@ -174,7 +174,7 @@ async def _store_attachments(db: AsyncSession, task_id, company_id, uploaded_by,
         return
     for a in attachments:
         filename, mime_type, data = a.get("filename"), a.get("mime_type"), a.get("data")
-        decoded = decode_and_validate(data, filename)
+        decoded = decode_and_validate(data, filename, mime_type)
         storage_path, checksum = upload(decoded, prefix=f"tasks/{task_id}")
         await attachments_repo.create(
             db,
@@ -341,13 +341,13 @@ async def create_task_workflow(db: AsyncSession, company_id, created_by, data) -
     }
 
 
-async def list_tasks_for_owner(db: AsyncSession, company_id) -> List[dict]:
+async def list_tasks_for_owner(db: AsyncSession, company_id, limit: int = None, offset: int = None) -> List[dict]:
     """Active Tasks view (Task History feature): everything except
     completed tasks, which live in the separate permanent archive - see
     list_completed_tasks_for_owner. No task is ever deleted or moved to get
     there; this is purely a different filter over the same table."""
     await activate_due_tasks(db, company_id)
-    tasks = await tasks_repo.list_active_by_company(db, company_id)
+    tasks = await tasks_repo.list_active_by_company(db, company_id, limit=limit, offset=offset)
     assignee_ids = {t.assigned_to for t in tasks}
     completer_ids = {t.completed_by for t in tasks if t.completed_by}
     names = await users_repo.get_names_by_ids(db, assignee_ids | completer_ids)
@@ -752,6 +752,13 @@ async def update_task_status(db: AsyncSession, employee, company_id, task_id: st
     task = await tasks_repo.get_for_employee(db, parsed_id, employee["id"]) if parsed_id else None
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
+
+    if new_status == "completed" and task.requires_proof and not task.proof_files:
+        # The web UI only checks this client-side (trivially bypassed by
+        # calling this endpoint directly) - `complete_task` already
+        # enforces it server-side, but this generic status endpoint is
+        # a second path to "completed" that must enforce it too.
+        raise HTTPException(status_code=400, detail="Photo proof is required before this task can be completed")
 
     task.status = new_status
     if new_status == "completed":

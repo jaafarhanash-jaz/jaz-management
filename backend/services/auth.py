@@ -1,4 +1,6 @@
+import hashlib
 import os
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -8,13 +10,25 @@ from passlib.context import CryptContext
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import repositories.companies as companies_repo
+import repositories.refresh_tokens as refresh_tokens_repo
 import repositories.users as users_repo
 from services.storage import decode_and_validate, delete as storage_delete, download_base64, upload as storage_upload
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-SECRET_KEY = os.environ.get("JWT_SECRET_KEY", "your-secret-key-change-in-production")
+SECRET_KEY = os.environ.get("JWT_SECRET_KEY")
+if not SECRET_KEY:
+    raise RuntimeError(
+        "JWT_SECRET_KEY environment variable must be set - refusing to start "
+        "with an insecure default signing key."
+    )
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours
+# Short-lived on purpose now that refresh tokens exist to keep sessions
+# alive silently - a leaked access token is only useful for an hour,
+# vs. the old 24h. Both web and mobile clients must be deployed with
+# their refresh-on-401 interceptor before this ships, or users get
+# logged out every hour instead of silently refreshed.
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+REFRESH_TOKEN_EXPIRE_DAYS = 30
 
 SUBSCRIPTION_ACTIVE = "active"
 SUBSCRIPTION_EXPIRED = "expired"
@@ -35,6 +49,16 @@ MAX_PHOTO_BYTES = 5 * 1024 * 1024
 MIN_PASSWORD_LENGTH = 6
 
 
+def validate_password_strength(password: str) -> None:
+    """Applied everywhere a password is ever set (self-service change,
+    employee creation/update, company/owner creation, admin resets) - the
+    minimum was previously only enforced on the self-service change-
+    password path, letting an owner or super_admin set an account up
+    with an empty or single-character password with no guardrail at all."""
+    if len(password) < MIN_PASSWORD_LENGTH:
+        raise HTTPException(status_code=400, detail=f"Password must be at least {MIN_PASSWORD_LENGTH} characters")
+
+
 def hash_password(password: str) -> str:
     return pwd_context.hash(password)
 
@@ -48,6 +72,66 @@ def create_access_token(data: dict) -> str:
     expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def _hash_token(raw_token: str) -> str:
+    """Only the hash is ever persisted - a DB leak alone can't be replayed
+    as a live session, same principle as password hashing."""
+    return hashlib.sha256(raw_token.encode()).hexdigest()
+
+
+async def _issue_refresh_token(db: AsyncSession, user_id: str) -> str:
+    raw_token = secrets.token_urlsafe(32)
+    expires_at = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    await refresh_tokens_repo.create(db, user_id, _hash_token(raw_token), expires_at)
+    return raw_token
+
+
+async def rotate_refresh_token(db: AsyncSession, raw_token: str) -> dict:
+    """Verifies a refresh token, rotates it (old one revoked, a fresh one
+    issued), and returns a new access+refresh token pair - same response
+    shape as `login()`. Presenting an already-revoked token is treated as
+    reuse/theft: every active token for that user is revoked defensively,
+    forcing a full re-login everywhere."""
+    token_hash = _hash_token(raw_token)
+    stored = await refresh_tokens_repo.get_by_hash(db, token_hash)
+    if not stored:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+    if stored.revoked_at is not None:
+        # Commit before raising - `get_db` rolls back the session on any
+        # exception, which would otherwise silently discard this
+        # defensive revoke-everything the moment it's needed most.
+        await refresh_tokens_repo.revoke_all_for_user(db, stored.user_id)
+        await db.commit()
+        raise HTTPException(status_code=401, detail="Refresh token already used")
+
+    if stored.expires_at < datetime.now(timezone.utc):
+        raise HTTPException(status_code=401, detail="Refresh token expired")
+
+    user = await users_repo.get_by_id(db, str(stored.user_id))
+    if user is None:
+        raise HTTPException(status_code=401, detail="User not found")
+
+    user_dict = user_to_dict(user)
+    await enforce_company_access(db, user_dict)
+
+    new_raw_token = secrets.token_urlsafe(32)
+    new_expires_at = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    new_row = await refresh_tokens_repo.create(db, stored.user_id, _hash_token(new_raw_token), new_expires_at)
+    await refresh_tokens_repo.revoke(db, stored, replaced_by_id=new_row.id)
+
+    access_token = create_access_token({"sub": user_dict["id"], "role": user_dict["role"]})
+    public_user = {k: v for k, v in user_dict.items() if k != "password"}
+    return {"token": access_token, "refresh_token": new_raw_token, "user": public_user, "role": user_dict["role"]}
+
+
+async def revoke_refresh_token(db: AsyncSession, raw_token: str) -> None:
+    """Logout - idempotent no-op if the token is already gone/unknown, so
+    the client can always call this safely without checking state first."""
+    stored = await refresh_tokens_repo.get_by_hash(db, _hash_token(raw_token))
+    if stored and stored.revoked_at is None:
+        await refresh_tokens_repo.revoke(db, stored)
 
 
 def _photo_response(user) -> Optional[dict]:
@@ -70,6 +154,7 @@ def user_to_dict(user) -> dict:
         "company_id": str(user.company_id) if user.company_id else None,
         "department": user.department,
         "position": user.position,
+        "schedule_id": str(user.schedule_id) if user.schedule_id else None,
         "status": user.status,
         "avatar": user.avatar,
         "photo": _photo_response(user),
@@ -121,10 +206,11 @@ async def login(db: AsyncSession, email_or_phone: str, password: str) -> dict:
     await enforce_company_access(db, user_dict)
 
     token = create_access_token({"sub": user_dict["id"], "role": user_dict["role"]})
+    refresh_token = await _issue_refresh_token(db, user.id)
     # Never return the password hash to the client - matches the original
     # Mongo implementation's explicit strip before building the response.
     public_user = {k: v for k, v in user_dict.items() if k != "password"}
-    return {"token": token, "user": public_user, "role": user_dict["role"]}
+    return {"token": token, "refresh_token": refresh_token, "user": public_user, "role": user_dict["role"]}
 
 
 async def get_current_user(db: AsyncSession, token: str) -> dict:
@@ -202,8 +288,7 @@ async def change_password(db: AsyncSession, user_id: str, current_password: str,
         raise HTTPException(status_code=404, detail="User not found")
     if not verify_password(current_password, user.password):
         raise HTTPException(status_code=400, detail="Current password is incorrect")
-    if len(new_password) < MIN_PASSWORD_LENGTH:
-        raise HTTPException(status_code=400, detail=f"New password must be at least {MIN_PASSWORD_LENGTH} characters")
+    validate_password_strength(new_password)
     user.password = hash_password(new_password)
     await db.flush()
     return {"message": "Password changed successfully"}

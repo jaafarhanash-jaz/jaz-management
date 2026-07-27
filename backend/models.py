@@ -20,7 +20,7 @@ from sqlalchemy import (
 )
 from sqlalchemy import text
 from sqlalchemy.dialects.postgresql import ARRAY as PG_ARRAY, JSONB, UUID as PG_UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column
 
 from database import Base
 
@@ -29,11 +29,12 @@ def uuid_pk():
     return mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
 
 
-def fk_uuid(target: str, nullable: bool = False, deferrable: bool = False, ondelete: str = None):
+def fk_uuid(target: str, nullable: bool = False, deferrable: bool = False, ondelete: str = None, index: bool = False):
     return mapped_column(
         PG_UUID(as_uuid=True),
         ForeignKey(target, deferrable=deferrable, initially="DEFERRED" if deferrable else None, ondelete=ondelete),
         nullable=nullable,
+        index=index,
     )
 
 
@@ -59,9 +60,15 @@ class User(Base, TimestampMixin, SoftDeleteMixin):
     password: Mapped[str] = mapped_column(String, nullable=False)
     name: Mapped[str] = mapped_column(String, nullable=False)
     role: Mapped[str] = mapped_column(String, nullable=False)
-    company_id: Mapped[Optional[uuid.UUID]] = fk_uuid("companies.id", nullable=True, deferrable=True)
+    company_id: Mapped[Optional[uuid.UUID]] = fk_uuid("companies.id", nullable=True, deferrable=True, index=True)
     department: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     position: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    # Work Schedule assignment - null means "use the company's default
+    # schedule" (see services/schedule_resolution.py). Deliberately not
+    # gated by WorkSchedule.is_active: an assigned schedule keeps working
+    # for whoever it's assigned to even if it's later hidden from
+    # assignment pickers - see WorkSchedule.is_active's own comment.
+    schedule_id: Mapped[Optional[uuid.UUID]] = fk_uuid("work_schedules.id", nullable=True)
     status: Mapped[str] = mapped_column(String, nullable=False, server_default="active")
     avatar: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     last_seen_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -122,6 +129,10 @@ class Company(Base, TimestampMixin, SoftDeleteMixin):
     attendance_settings_updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     attendance_settings_updated_by: Mapped[Optional[uuid.UUID]] = fk_uuid("users.id", nullable=True)
     attendance_settings_updated_by_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    # Deliberately separate from attendance_settings_updated_at above, which
+    # is also bumped by plain location/radius/qr_enabled edits - conflating
+    # the two would make a radius tweak falsely look like a QR regeneration.
+    qr_generated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # working_hours, flattened per plan decision #5
     working_days: Mapped[List[int]] = mapped_column(ARRAY(Integer), nullable=False, server_default="{0,1,2,3,4}")
@@ -159,7 +170,7 @@ class Department(Base, TimestampMixin, SoftDeleteMixin):
     __tablename__ = "departments"
 
     id: Mapped[uuid.UUID] = uuid_pk()
-    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id")
+    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id", index=True)
     name: Mapped[str] = mapped_column(String, nullable=False)
     head_id: Mapped[Optional[uuid.UUID]] = fk_uuid("users.id", nullable=True)
 
@@ -178,8 +189,8 @@ class Task(Base, TimestampMixin, SoftDeleteMixin):
     __tablename__ = "tasks"
 
     id: Mapped[uuid.UUID] = uuid_pk()
-    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id")
-    assigned_to: Mapped[uuid.UUID] = fk_uuid("users.id")
+    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id", index=True)
+    assigned_to: Mapped[uuid.UUID] = fk_uuid("users.id", index=True)
     title: Mapped[str] = mapped_column(String, nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False)
     priority: Mapped[str] = mapped_column(String, nullable=False)
@@ -242,7 +253,7 @@ class DailyTask(Base, TimestampMixin):
     __tablename__ = "daily_tasks"
 
     id: Mapped[uuid.UUID] = uuid_pk()
-    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id")
+    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id", index=True)
     title: Mapped[str] = mapped_column(String, nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False)
     execution_time: Mapped[Optional[str]] = mapped_column(String(5), nullable=True)
@@ -266,7 +277,7 @@ class DailyTaskAssignee(Base):
     # rather than leaving the delete blocked or requiring the caller to
     # clean them up first.
     daily_task_id: Mapped[uuid.UUID] = fk_uuid("daily_tasks.id", ondelete="CASCADE")
-    employee_id: Mapped[uuid.UUID] = fk_uuid("users.id")
+    employee_id: Mapped[uuid.UUID] = fk_uuid("users.id", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
@@ -281,7 +292,7 @@ class TaskAttachment(Base):
 
     id: Mapped[uuid.UUID] = uuid_pk()
     task_id: Mapped[uuid.UUID] = fk_uuid("tasks.id")
-    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id")
+    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id", index=True)
     storage_path: Mapped[str] = mapped_column(String, nullable=False)
     original_filename: Mapped[str] = mapped_column(String, nullable=False)
     mime_type: Mapped[Optional[str]] = mapped_column(String, nullable=True)
@@ -292,16 +303,57 @@ class TaskAttachment(Base):
     uploaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+# ============ Work Schedules ============
+
+class WorkSchedule(Base, TimestampMixin):
+    __tablename__ = "work_schedules"
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    # Already indexed in the DB (ix_work_schedules_company / a partial
+    # unique on (company_id, is_default) - see __table_args__ below) - not
+    # `index=True` here to avoid a duplicate, differently-named index.
+    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id")
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    start_time: Mapped[str] = mapped_column(String(5), nullable=False)
+    end_time: Mapped[str] = mapped_column(String(5), nullable=False)
+    break_start_time: Mapped[Optional[str]] = mapped_column(String(5), nullable=True)
+    break_end_time: Mapped[Optional[str]] = mapped_column(String(5), nullable=True)
+    required_hours: Mapped[float] = mapped_column(Float, nullable=False)
+    # 0=Sunday..6=Saturday, same convention as Company.working_days.
+    working_days: Mapped[List[int]] = mapped_column(ARRAY(Integer), nullable=False)
+    is_default: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    # Gates only future assignment/default pickers - does NOT gate
+    # schedule_resolution.get_effective_schedule_for_employee, so an
+    # employee already on this schedule (directly or via company default)
+    # keeps calculating normally after it's deactivated. The service layer
+    # additionally blocks deactivating a schedule that is still the
+    # company default or still assigned to any employee (see
+    # services/work_schedules.py) - is_active alone is not the enforcement
+    # mechanism for "nobody's using this schedule anymore".
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
+
+    __table_args__ = (
+        CheckConstraint("required_hours > 0", name="ck_work_schedules_required_hours"),
+        CheckConstraint("array_length(working_days, 1) > 0", name="ck_work_schedules_working_days_nonempty"),
+        # Both already exist in the DB (created outside the declarative
+        # model originally) - declared here so autogenerate stops proposing
+        # to drop them just because the model didn't know about them.
+        Index("ix_work_schedules_company", "company_id"),
+        Index("uq_work_schedules_company_default", "company_id", unique=True, postgresql_where=text("is_default = true")),
+    )
+
+
 # ============ Attendance ============
 
 class Attendance(Base, TimestampMixin):
     __tablename__ = "attendance"
 
     id: Mapped[uuid.UUID] = uuid_pk()
-    employee_id: Mapped[uuid.UUID] = fk_uuid("users.id")
+    employee_id: Mapped[uuid.UUID] = fk_uuid("users.id", index=True)
     # Denormalized snapshot, intentionally not live-joined - matches existing semantics.
     employee_department: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id")
+    employee_position: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id", index=True)
     date: Mapped[str] = mapped_column(Date, nullable=False)
     check_in_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     check_out_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -322,8 +374,70 @@ class Attendance(Base, TimestampMixin):
     device_info: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     status: Mapped[str] = mapped_column(String, nullable=False)
 
+    # Work Schedule snapshot - denormalized at check-in time (same rationale
+    # as employee_department above): editing or deleting a schedule later
+    # must never rewrite the calculated history of a past attendance
+    # record. schedule_id itself is kept only for traceability/debugging,
+    # never live-joined for calculation - see services/attendance_calc_engine.py.
+    schedule_id: Mapped[Optional[uuid.UUID]] = fk_uuid("work_schedules.id", nullable=True)
+    scheduled_start_time: Mapped[Optional[str]] = mapped_column(String(5), nullable=True)
+    scheduled_end_time: Mapped[Optional[str]] = mapped_column(String(5), nullable=True)
+    scheduled_break_minutes: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    required_minutes: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # Computed at check-in - knowable immediately from check-in time vs.
+    # the snapshot above.
+    late_minutes: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    early_arrival_minutes: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # Computed at check-out only - stay null until then, exactly like
+    # working_duration_minutes above (never fabricate a "missing hours"
+    # figure for a shift still in progress).
+    overtime_minutes: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    missing_minutes: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    early_leave_minutes: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    net_minutes: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
     __table_args__ = (
         CheckConstraint("status IN ('present','late','absent')", name="ck_attendance_status"),
+    )
+
+
+class AttendanceEvent(Base):
+    """Audit trail of every QR-scan attempt - success AND failure - kept
+    separate from Attendance (which stores only the resolved daily record).
+    For troubleshooting: "why didn't my check-in work" needs the failed
+    attempts, not just the successful ones. Never live-joined for
+    calculation - see services/attendance_calc_engine.py."""
+    __tablename__ = "attendance_events"
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    # Null on a failed attempt - no Attendance row is created/updated then.
+    attendance_record_id: Mapped[Optional[uuid.UUID]] = fk_uuid("attendance.id", nullable=True)
+    employee_id: Mapped[uuid.UUID] = fk_uuid("users.id", index=True)
+    # Not `index=True` here - already covered by the composite
+    # ix_attendance_events_company_date below (company_id is its leftmost
+    # column).
+    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id")
+    action_type: Mapped[str] = mapped_column(String, nullable=False)
+    event_date: Mapped[str] = mapped_column(Date, nullable=False)
+    event_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    latitude: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    longitude: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # Nullable: None means "not evaluated" (e.g. GPS is never checked once
+    # the QR itself has already failed) - a real third state, distinct
+    # from True/False.
+    qr_valid: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    gps_valid: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    failure_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    device_platform: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint("action_type IN ('check_in','check_out')", name="ck_attendance_events_action_type"),
+        # Both already exist in the DB (created outside the declarative
+        # model originally) - declared here so autogenerate stops proposing
+        # to drop them just because the model didn't know about them.
+        Index("ix_attendance_events_company_date", "company_id", "event_date"),
+        Index("ix_attendance_events_record", "attendance_record_id"),
     )
 
 
@@ -333,9 +447,9 @@ class Report(Base, TimestampMixin):
     __tablename__ = "reports"
 
     id: Mapped[uuid.UUID] = uuid_pk()
-    employee_id: Mapped[uuid.UUID] = fk_uuid("users.id")
+    employee_id: Mapped[uuid.UUID] = fk_uuid("users.id", index=True)
     employee_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id")
+    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id", index=True)
     title: Mapped[str] = mapped_column(String, nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False)
     files: Mapped[List[str]] = mapped_column(ARRAY(String), nullable=False, server_default="{}")
@@ -360,7 +474,7 @@ class Notification(Base, TimestampMixin):
 
     id: Mapped[uuid.UUID] = uuid_pk()
     user_id: Mapped[uuid.UUID] = fk_uuid("users.id")
-    company_id: Mapped[Optional[uuid.UUID]] = fk_uuid("companies.id", nullable=True)
+    company_id: Mapped[Optional[uuid.UUID]] = fk_uuid("companies.id", nullable=True, index=True)
     type: Mapped[str] = mapped_column(String, nullable=False)
     category: Mapped[str] = mapped_column(String, nullable=False, server_default="system")
     title: Mapped[str] = mapped_column(String, nullable=False)
@@ -385,11 +499,11 @@ class Message(Base, TimestampMixin):
 
     id: Mapped[uuid.UUID] = uuid_pk()
     reference_number: Mapped[str] = mapped_column(String, nullable=False)
-    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id")
+    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id", index=True)
     thread_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
     parent_message_id: Mapped[Optional[uuid.UUID]] = fk_uuid("messages.id", nullable=True)
     forwarded_from_id: Mapped[Optional[uuid.UUID]] = fk_uuid("messages.id", nullable=True)
-    sender_id: Mapped[uuid.UUID] = fk_uuid("users.id")
+    sender_id: Mapped[uuid.UUID] = fk_uuid("users.id", index=True)
     sender_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     subject: Mapped[str] = mapped_column(String, nullable=False)
     body: Mapped[str] = mapped_column(Text, nullable=False)
@@ -432,8 +546,8 @@ class MessageRecipient(Base):
 
     id: Mapped[uuid.UUID] = uuid_pk()
     thread_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
-    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id")
-    recipient_id: Mapped[uuid.UUID] = fk_uuid("users.id")
+    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id", index=True)
+    recipient_id: Mapped[uuid.UUID] = fk_uuid("users.id", index=True)
     recipient_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     role: Mapped[str] = mapped_column(String, nullable=False)
     status: Mapped[str] = mapped_column(String, nullable=False, server_default="delivered")
@@ -460,7 +574,7 @@ class MessageAttachment(Base):
     id: Mapped[uuid.UUID] = uuid_pk()
     message_id: Mapped[uuid.UUID] = fk_uuid("messages.id")
     thread_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
-    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id")
+    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id", index=True)
     storage_path: Mapped[str] = mapped_column(String, nullable=False)
     original_filename: Mapped[str] = mapped_column(String, nullable=False)
     mime_type: Mapped[Optional[str]] = mapped_column(String, nullable=True)
@@ -476,8 +590,8 @@ class MessageReminder(Base):
 
     id: Mapped[uuid.UUID] = uuid_pk()
     message_id: Mapped[uuid.UUID] = fk_uuid("messages.id")
-    user_id: Mapped[uuid.UUID] = fk_uuid("users.id")
-    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id")
+    user_id: Mapped[uuid.UUID] = fk_uuid("users.id", index=True)
+    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id", index=True)
     remind_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     notified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -490,7 +604,7 @@ class CalendarEvent(Base, TimestampMixin):
 
     id: Mapped[uuid.UUID] = uuid_pk()
     reference_number: Mapped[str] = mapped_column(String, nullable=False)
-    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id")
+    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id", index=True)
     series_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
     title: Mapped[str] = mapped_column(String, nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
@@ -557,7 +671,7 @@ class CalendarEventParticipant(Base):
 
     id: Mapped[uuid.UUID] = uuid_pk()
     event_id: Mapped[uuid.UUID] = fk_uuid("calendar_events.id")
-    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id")
+    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id", index=True)
     participant_id: Mapped[uuid.UUID] = fk_uuid("users.id")
     participant_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     department: Mapped[Optional[str]] = mapped_column(String, nullable=True)
@@ -599,7 +713,7 @@ class CalendarAttachment(Base):
 
     id: Mapped[uuid.UUID] = uuid_pk()
     event_id: Mapped[uuid.UUID] = fk_uuid("calendar_events.id")
-    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id")
+    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id", index=True)
     storage_path: Mapped[str] = mapped_column(String, nullable=False)
     original_filename: Mapped[str] = mapped_column(String, nullable=False)
     mime_type: Mapped[Optional[str]] = mapped_column(String, nullable=True)
@@ -615,8 +729,8 @@ class CalendarEventReminder(Base):
 
     id: Mapped[uuid.UUID] = uuid_pk()
     event_id: Mapped[uuid.UUID] = fk_uuid("calendar_events.id")
-    user_id: Mapped[uuid.UUID] = fk_uuid("users.id")
-    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id")
+    user_id: Mapped[uuid.UUID] = fk_uuid("users.id", index=True)
+    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id", index=True)
     remind_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     notified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -642,8 +756,8 @@ class PaymentTransaction(Base, TimestampMixin):
 
     id: Mapped[uuid.UUID] = uuid_pk()
     session_id: Mapped[str] = mapped_column(String, unique=True, nullable=False)
-    user_id: Mapped[uuid.UUID] = fk_uuid("users.id")
-    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id")
+    user_id: Mapped[uuid.UUID] = fk_uuid("users.id", index=True)
+    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id", index=True)
     plan_id: Mapped[uuid.UUID] = fk_uuid("subscription_plans.id")
     amount: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
     currency: Mapped[str] = mapped_column(String, nullable=False)
@@ -664,7 +778,7 @@ class AuditLog(Base):
     __tablename__ = "audit_logs"
 
     id: Mapped[uuid.UUID] = uuid_pk()
-    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id")
+    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id", index=True)
     user_id: Mapped[Optional[uuid.UUID]] = fk_uuid("users.id", nullable=True)
     entity_type: Mapped[str] = mapped_column(String, nullable=False)
     entity_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
@@ -699,6 +813,62 @@ class DashboardLayout(Base, TimestampMixin):
     )
 
 
+# ============ Push notifications ============
+
+class DeviceToken(Base, TimestampMixin):
+    """One row per physical app install, not per user - `token` (the FCM
+    registration token) is unique platform-wide, so a device re-registering
+    under a different account (logout/login as someone else on the same
+    phone) reassigns `user_id` on the existing row via upsert-by-token
+    rather than creating a duplicate (see repositories/device_tokens.py's
+    `upsert()`). Deliberately hard-deleted (no SoftDeleteMixin) on explicit
+    unregister and on FCM reporting the token as unregistered/invalid -
+    unlike Tasks/Companies/etc., a dead push token has no audit-trail value
+    once it can no longer receive anything. `last_seen_at` is bumped on
+    every register/refresh call, independent of `updated_at` (which only
+    changes when a mapped column's value actually changes), so it stays a
+    reliable "last confirmed live" signal even when nothing else changed."""
+
+    __tablename__ = "device_tokens"
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    user_id: Mapped[uuid.UUID] = fk_uuid("users.id", nullable=False)
+    token: Mapped[str] = mapped_column(String, nullable=False)
+    platform: Mapped[str] = mapped_column(String, nullable=False)
+    app_version: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("token", name="uq_device_tokens_token"),
+        Index("ix_device_tokens_user", "user_id"),
+        CheckConstraint("platform IN ('ios', 'android', 'web')", name="ck_device_tokens_platform"),
+    )
+
+
+class RefreshToken(Base):
+    """One row per issued refresh token - only the sha256 hash is stored,
+    never the raw token, so a DB leak alone can't be used to mint
+    sessions. Rotated on every use (`services/auth.rotate_refresh_token`):
+    presenting a token marks it `revoked_at` and issues a new row linked
+    via `replaced_by_id`, so the chain is auditable. Presenting an
+    already-revoked token is treated as a signal of token theft/reuse -
+    the whole chain for that user is revoked defensively."""
+
+    __tablename__ = "refresh_tokens"
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    user_id: Mapped[uuid.UUID] = fk_uuid("users.id", ondelete="CASCADE", index=True)
+    token_hash: Mapped[str] = mapped_column(String, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    replaced_by_id: Mapped[Optional[uuid.UUID]] = fk_uuid("refresh_tokens.id", nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("token_hash", name="uq_refresh_tokens_token_hash"),
+    )
+
+
 # ============ Announcements ============
 
 class Announcement(Base, TimestampMixin):
@@ -711,7 +881,7 @@ class Announcement(Base, TimestampMixin):
     __tablename__ = "announcements"
 
     id: Mapped[uuid.UUID] = uuid_pk()
-    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id")
+    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id", index=True)
     created_by: Mapped[uuid.UUID] = fk_uuid("users.id")
     created_by_name: Mapped[str] = mapped_column(String, nullable=False)
     title: Mapped[str] = mapped_column(String, nullable=False)

@@ -16,6 +16,7 @@ from services.auth import (
     SUBSCRIPTION_SUSPENDED,
     hash_password,
     resolve_subscription_status,
+    validate_password_strength,
 )
 
 EXPIRING_SOON_DAYS = 7
@@ -217,6 +218,7 @@ async def create_company(db: AsyncSession, data) -> dict:
     qr_token = uuid.uuid4().hex
     qr_code = generate_qr_code(qr_token)
 
+    validate_password_strength(data.owner_password)
     await users_repo.create(
         db,
         id=owner_id,
@@ -295,6 +297,7 @@ async def update_company(db: AsyncSession, company_id: str, updates) -> dict:
     if updates.owner_password or updates.owner_password_confirm:
         if updates.owner_password != updates.owner_password_confirm:
             raise HTTPException(status_code=400, detail={"field": "owner_password_confirm", "message": "Passwords do not match"})
+        validate_password_strength(updates.owner_password)
         owner_changes["password"] = hash_password(updates.owner_password)
 
     if not company_changes and not owner_changes:

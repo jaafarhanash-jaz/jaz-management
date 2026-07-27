@@ -209,6 +209,146 @@ class TestAttendance:
         assert r.status_code == 200
         assert isinstance(r.json(), list)
 
+    def test_history_includes_work_schedule_calculation_fields(self, api_client, employee_headers):
+        # Confirms the response *shape* is wired end-to-end (schedule
+        # resolution -> calc engine -> persisted columns -> API response).
+        # The calculation *values* themselves (late/overtime/missing/etc.
+        # arithmetic) are covered deterministically by
+        # tests/test_attendance_calc_engine.py's pure unit tests - this
+        # test can't control wall-clock check-in/out time the way those
+        # can, so it only asserts the new fields are present with the
+        # right types, not specific numbers.
+        r = api_client.get(f"{BASE_URL}/api/employee/attendance/history", headers=employee_headers)
+        assert r.status_code == 200
+        records = r.json()
+        if not records:
+            return
+        record = records[0]
+        for field in (
+            "required_minutes", "scheduled_break_minutes", "net_minutes",
+            "overtime_minutes", "missing_minutes", "late_minutes",
+            "early_arrival_minutes", "early_leave_minutes",
+        ):
+            assert field in record
+            assert record[field] is None or isinstance(record[field], (int, float))
+
+
+# ============ WORK SCHEDULES ============
+class TestWorkSchedules:
+    _schedule_id = None
+
+    def test_create_schedule(self, api_client, owner_headers):
+        payload = {
+            "name": f"TEST_Schedule_{uuid.uuid4().hex[:6]}",
+            "start_time": "08:00", "end_time": "16:00",
+            "break_start_time": "12:00", "break_end_time": "12:30",
+            "required_hours": 7.5, "working_days": [0, 1, 2, 3, 4],
+            "is_default": False,
+        }
+        r = api_client.post(f"{BASE_URL}/api/owner/work-schedules", json=payload, headers=owner_headers)
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["name"] == payload["name"]
+        assert data["is_active"] is True
+        TestWorkSchedules._schedule_id = data["id"]
+
+    def test_list_schedules_includes_created(self, api_client, owner_headers):
+        r = api_client.get(f"{BASE_URL}/api/owner/work-schedules", headers=owner_headers)
+        assert r.status_code == 200
+        ids = [s["id"] for s in r.json()]
+        assert TestWorkSchedules._schedule_id in ids
+
+    def test_invalid_time_format_rejected(self, api_client, owner_headers):
+        payload = {
+            "name": "TEST_Bad", "start_time": "8am", "end_time": "16:00",
+            "required_hours": 8, "working_days": [0],
+        }
+        r = api_client.post(f"{BASE_URL}/api/owner/work-schedules", json=payload, headers=owner_headers)
+        assert r.status_code == 400
+
+    def test_empty_working_days_rejected(self, api_client, owner_headers):
+        payload = {
+            "name": "TEST_Bad2", "start_time": "08:00", "end_time": "16:00",
+            "required_hours": 8, "working_days": [],
+        }
+        r = api_client.post(f"{BASE_URL}/api/owner/work-schedules", json=payload, headers=owner_headers)
+        assert r.status_code == 400
+
+    def test_employee_cannot_manage_schedules(self, api_client, employee_headers):
+        r = api_client.get(f"{BASE_URL}/api/owner/work-schedules", headers=employee_headers)
+        assert r.status_code == 403
+
+    def test_assign_schedule_to_employee(self, api_client, owner_headers, employee_headers):
+        me = api_client.get(f"{BASE_URL}/api/auth/me", headers=employee_headers).json()
+        r = api_client.put(
+            f"{BASE_URL}/api/owner/employees/{me['id']}",
+            json={"schedule_id": TestWorkSchedules._schedule_id}, headers=owner_headers,
+        )
+        assert r.status_code == 200, r.text
+        me_after = api_client.get(f"{BASE_URL}/api/auth/me", headers=employee_headers).json()
+        assert me_after["schedule_id"] == TestWorkSchedules._schedule_id
+
+        # Unassign again so this test is repeatable and doesn't leave the
+        # demo employee permanently pinned to a throwaway TEST_ schedule.
+        api_client.put(f"{BASE_URL}/api/owner/employees/{me['id']}", json={"schedule_id": None}, headers=owner_headers)
+
+    def test_assign_nonexistent_schedule_rejected(self, api_client, owner_headers, employee_headers):
+        me = api_client.get(f"{BASE_URL}/api/auth/me", headers=employee_headers).json()
+        r = api_client.put(
+            f"{BASE_URL}/api/owner/employees/{me['id']}",
+            json={"schedule_id": "00000000-0000-0000-0000-000000000000"}, headers=owner_headers,
+        )
+        assert r.status_code == 404
+
+    def test_cannot_deactivate_default_schedule(self, api_client, owner_headers):
+        schedules = api_client.get(f"{BASE_URL}/api/owner/work-schedules", headers=owner_headers).json()
+        default_schedule = next((s for s in schedules if s["is_default"]), None)
+        if not default_schedule:
+            return
+        r = api_client.post(
+            f"{BASE_URL}/api/owner/work-schedules/{default_schedule['id']}/deactivate", headers=owner_headers,
+        )
+        assert r.status_code == 400
+
+    def test_deactivate_and_reactivate_unassigned_schedule(self, api_client, owner_headers):
+        r = api_client.post(
+            f"{BASE_URL}/api/owner/work-schedules/{TestWorkSchedules._schedule_id}/deactivate",
+            headers=owner_headers,
+        )
+        assert r.status_code == 200, r.text
+        r = api_client.post(
+            f"{BASE_URL}/api/owner/work-schedules/{TestWorkSchedules._schedule_id}/reactivate",
+            headers=owner_headers,
+        )
+        assert r.status_code == 200, r.text
+
+    def test_employee_stats_all_ranges(self, api_client, owner_headers, employee_headers):
+        me = api_client.get(f"{BASE_URL}/api/auth/me", headers=employee_headers).json()
+        for range_ in ("today", "week", "month", "year"):
+            r = api_client.get(
+                f"{BASE_URL}/api/owner/attendance/employees/{me['id']}/stats?range={range_}",
+                headers=owner_headers,
+            )
+            assert r.status_code == 200, r.text
+            data = r.json()
+            assert data["range"] == range_
+            assert data["date_from"] <= data["date_to"]
+            assert 0 <= data["attendance_percentage"] <= 100
+
+    def test_employee_stats_custom_range_requires_dates(self, api_client, owner_headers, employee_headers):
+        me = api_client.get(f"{BASE_URL}/api/auth/me", headers=employee_headers).json()
+        r = api_client.get(
+            f"{BASE_URL}/api/owner/attendance/employees/{me['id']}/stats?range=custom", headers=owner_headers,
+        )
+        assert r.status_code == 400
+
+    def test_employee_stats_invalid_range_rejected(self, api_client, owner_headers, employee_headers):
+        me = api_client.get(f"{BASE_URL}/api/auth/me", headers=employee_headers).json()
+        r = api_client.get(
+            f"{BASE_URL}/api/owner/attendance/employees/{me['id']}/stats?range=bogus", headers=owner_headers,
+        )
+        assert r.status_code == 400
+
 
 # ============ EMPLOYEE REPORTS ============
 class TestReports:
@@ -388,9 +528,33 @@ class TestSmartQRAttendance:
             assert key in data["settings"]
         TestSmartQRAttendance._token = data["qr_token"]
 
-    def test_regenerate_endpoint_removed(self, api_client, owner_headers):
+    def test_regenerate_creates_new_token_and_invalidates_old(self, api_client, owner_headers, employee_headers):
+        # Part 2 of the QR Attendance System spec requires a working
+        # Regenerate button - this endpoint is no longer removed, it's a
+        # required feature. Confirms: a fresh token/QR image/timestamp are
+        # issued, settings reflect them, and the old token is immediately
+        # rejected on the next scan (no separate invalidation step exists -
+        # it's just no longer an exact match).
+        old_token = TestSmartQRAttendance._token
+
         r = api_client.post(f"{BASE_URL}/api/owner/attendance/qr/regenerate", headers=owner_headers)
-        assert r.status_code in (404, 405)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["qr_code"].startswith("data:image/png;base64,")
+        assert body["qr_generated_at"]
+
+        new_settings = self._settings(api_client, owner_headers)
+        new_token = new_settings["qr_token"]
+        assert new_token != old_token
+        assert new_settings["settings"]["qr_generated_at"] == body["qr_generated_at"]
+
+        r = api_client.post(f"{BASE_URL}/api/employee/attendance/check-in",
+                            json={"qr_code": old_token, "latitude": 24.7, "longitude": 46.6},
+                            headers=employee_headers)
+        assert r.status_code == 400
+        assert "رمز" in r.json()["detail"]
+
+        TestSmartQRAttendance._token = new_token
 
     def test_company_qr_endpoint_requires_auth(self, api_client):
         r = requests.get(f"{BASE_URL}/api/company/company-001/qr")
@@ -422,6 +586,16 @@ class TestSmartQRAttendance:
                                 json={"email_or_phone": payload["email"], "password": "testpass123"})
         assert login.status_code == 200
         TestSmartQRAttendance._emp_headers = {"Authorization": f"Bearer {login.json()['token']}"}
+
+    def test_check_out_without_check_in_rejected(self, api_client):
+        # This employee was just created and has never checked in today -
+        # check-out must be rejected with the dedicated message, not treated
+        # as an "already checked out" case.
+        r = api_client.post(f"{BASE_URL}/api/employee/attendance/check-out",
+                            json={"qr_code": TestSmartQRAttendance._token, "latitude": 24.7, "longitude": 46.6},
+                            headers=TestSmartQRAttendance._emp_headers)
+        assert r.status_code == 400
+        assert "no check-in record found" in r.json()["detail"].lower()
 
     def test_check_in_requires_gps(self, api_client):
         r = api_client.post(f"{BASE_URL}/api/employee/attendance/check-in",
@@ -488,7 +662,7 @@ class TestSmartQRAttendance:
                             json={"qr_code": TestSmartQRAttendance._token, "latitude": 24.7, "longitude": 46.6},
                             headers=TestSmartQRAttendance._emp_headers)
         assert r.status_code == 400
-        assert "Already checked in" in r.json()["detail"]
+        assert "already checked in" in r.json()["detail"].lower()
 
     def test_fake_gps_impossible_velocity_rejected(self, api_client):
         # Seconds after checking in at 24.7, a checkout from ~111km away is
@@ -595,10 +769,11 @@ class TestSmartQRAttendance:
         assert 0 <= qa_dept["attendance_rate"] <= 100
         assert data["average_distance_meters"] is not None
 
-    def test_legacy_qr_token_still_works_after_refinements(self, api_client, owner_headers):
-        # The token established in test_settings_shape_and_token_exists at the
-        # start of this class must still be the live one - nothing in this
-        # round of refinements may rotate it.
+    def test_qr_token_stable_after_regeneration(self, api_client, owner_headers):
+        # The token is rotated exactly once in this class, by
+        # test_regenerate_creates_new_token_and_invalidates_old - every test
+        # since then (and this one) must see that same post-regeneration
+        # token, not a further, unexpected rotation.
         current = self._settings(api_client, owner_headers)
         assert current["qr_token"] == TestSmartQRAttendance._token
 
@@ -1847,3 +2022,122 @@ class TestCompanyHolidayManagement:
 
     def test_cleanup(self, api_client, owner_headers):
         api_client.post(f"{BASE_URL}/api/calendar/events/{TestCompanyHolidayManagement._holiday_id}/cancel?scope=entire_series", headers=owner_headers)
+
+
+class TestDeviceTokens:
+    """Covers push-notification device registration: register/refresh
+    (upsert-by-token, same row updated in place), reassignment when a
+    different account registers the same token (same physical device,
+    different login - the row's owner changes rather than a duplicate
+    being created), ownership-scoped listing/deletion, platform
+    validation, and the super_admin debug-listing endpoint. Rows are
+    hard-deleted (models.DeviceToken has no soft-delete column), so every
+    token registered here is explicitly unregistered before the test ends
+    rather than left as permanent debris."""
+
+    def test_register_creates_and_refresh_updates_in_place(self, api_client, employee_headers):
+        unique = uuid.uuid4().hex[:12]
+        token = f"TEST_fcm_token_{unique}"
+        r = api_client.post(f"{BASE_URL}/api/devices", json={"token": token, "platform": "android"}, headers=employee_headers)
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["platform"] == "android"
+        assert data["app_version"] is None
+        device_id = data["id"]
+
+        try:
+            # Refresh: same token, new app_version - updates the existing
+            # row (same id), never creates a second one.
+            r2 = api_client.post(
+                f"{BASE_URL}/api/devices", json={"token": token, "platform": "android", "app_version": "1.2.3"}, headers=employee_headers
+            )
+            assert r2.status_code == 200
+            assert r2.json()["id"] == device_id
+            assert r2.json()["app_version"] == "1.2.3"
+
+            listed = api_client.get(f"{BASE_URL}/api/devices", headers=employee_headers).json()
+            assert sum(1 for d in listed if d["id"] == device_id) == 1
+        finally:
+            api_client.delete(f"{BASE_URL}/api/devices", params={"token": token}, headers=employee_headers)
+
+    def test_invalid_platform_rejected(self, api_client, employee_headers):
+        r = api_client.post(f"{BASE_URL}/api/devices", json={"token": "TEST_invalid_platform", "platform": "windows"}, headers=employee_headers)
+        assert r.status_code == 422
+
+    def test_reassignment_on_relogin_different_account(self, api_client, employee_headers, owner_headers):
+        unique = uuid.uuid4().hex[:12]
+        token = f"TEST_fcm_shared_device_{unique}"
+        r1 = api_client.post(f"{BASE_URL}/api/devices", json={"token": token, "platform": "ios"}, headers=employee_headers)
+        assert r1.status_code == 200
+        device_id = r1.json()["id"]
+
+        try:
+            emp_list = api_client.get(f"{BASE_URL}/api/devices", headers=employee_headers).json()
+            assert any(d["id"] == device_id for d in emp_list)
+
+            # Same physical device, a different account logs in and
+            # registers the same token - reassigns the existing row.
+            r2 = api_client.post(f"{BASE_URL}/api/devices", json={"token": token, "platform": "ios"}, headers=owner_headers)
+            assert r2.status_code == 200
+            assert r2.json()["id"] == device_id
+
+            emp_list_after = api_client.get(f"{BASE_URL}/api/devices", headers=employee_headers).json()
+            assert not any(d["id"] == device_id for d in emp_list_after)
+            owner_list = api_client.get(f"{BASE_URL}/api/devices", headers=owner_headers).json()
+            assert any(d["id"] == device_id for d in owner_list)
+        finally:
+            api_client.delete(f"{BASE_URL}/api/devices", params={"token": token}, headers=owner_headers)
+
+    def test_delete_scoped_to_owner(self, api_client, employee_headers, owner_headers):
+        unique = uuid.uuid4().hex[:12]
+        token = f"TEST_fcm_owned_by_employee_{unique}"
+        r = api_client.post(f"{BASE_URL}/api/devices", json={"token": token, "platform": "android"}, headers=employee_headers)
+        assert r.status_code == 200
+
+        # A different account can't delete a token it doesn't own, even
+        # knowing the exact token string.
+        forbidden = api_client.delete(f"{BASE_URL}/api/devices", params={"token": token}, headers=owner_headers)
+        assert forbidden.status_code == 404
+
+        ok = api_client.delete(f"{BASE_URL}/api/devices", params={"token": token}, headers=employee_headers)
+        assert ok.status_code == 200
+
+        already_gone = api_client.delete(f"{BASE_URL}/api/devices", params={"token": token}, headers=employee_headers)
+        assert already_gone.status_code == 404
+
+    def test_admin_can_list_user_devices_forbidden_for_others(self, api_client, employee_headers, owner_headers, admin_headers, employee_user):
+        unique = uuid.uuid4().hex[:12]
+        token = f"TEST_fcm_admin_view_{unique}"
+        api_client.post(f"{BASE_URL}/api/devices", json={"token": token, "platform": "web"}, headers=employee_headers)
+
+        try:
+            r = api_client.get(f"{BASE_URL}/api/admin/users/{employee_user['id']}/devices", headers=admin_headers)
+            assert r.status_code == 200
+            assert any(d["platform"] == "web" for d in r.json())
+
+            forbidden = api_client.get(f"{BASE_URL}/api/admin/users/{employee_user['id']}/devices", headers=owner_headers)
+            assert forbidden.status_code == 403
+        finally:
+            api_client.delete(f"{BASE_URL}/api/devices", params={"token": token}, headers=employee_headers)
+
+    def test_publish_still_succeeds_with_a_device_registered(self, api_client, employee_headers, owner_headers, employee_user):
+        """publish() (services/notifications.py) now also calls
+        services.push.send_push_to_user() - this proves that call path
+        doesn't break notification-producing actions even with a real
+        token on file and no Firebase credentials configured (push
+        degrades to a silent no-op, per the file's own docstring)."""
+        unique = uuid.uuid4().hex[:12]
+        token = f"TEST_fcm_publish_smoke_{unique}"
+        api_client.post(f"{BASE_URL}/api/devices", json={"token": token, "platform": "android"}, headers=employee_headers)
+
+        try:
+            r = api_client.post(f"{BASE_URL}/api/owner/tasks", json={
+                "title": "TEST_PushSmokeTask", "description": "verifies publish() tolerates a registered device token",
+                "priority": "low", "assigned_to": employee_user["id"], "due_date": "2030-01-01",
+            }, headers=owner_headers)
+            assert r.status_code == 200, r.text
+            task_id = r.json()["id"]
+            assert r.json()["status"] == "new"
+            api_client.delete(f"{BASE_URL}/api/owner/tasks/{task_id}", headers=owner_headers)
+        finally:
+            api_client.delete(f"{BASE_URL}/api/devices", params={"token": token}, headers=employee_headers)

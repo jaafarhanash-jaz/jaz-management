@@ -21,8 +21,8 @@ def department_response(department, head_name=None) -> dict:
     return data
 
 
-async def list_departments(db: AsyncSession, company_id) -> List[dict]:
-    departments = await departments_repo.list_by_company(db, company_id)
+async def list_departments(db: AsyncSession, company_id, limit: int = None, offset: int = None) -> List[dict]:
+    departments = await departments_repo.list_by_company(db, company_id, limit=limit, offset=offset)
     head_ids = {d.head_id for d in departments if d.head_id}
     names = await users_repo.get_names_by_ids(db, head_ids)
     return [department_response(d, names.get(str(d.head_id))) for d in departments]

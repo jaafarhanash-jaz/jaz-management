@@ -40,19 +40,20 @@ async def list_by_company(db: AsyncSession, company_id) -> List[Task]:
     return list(result.scalars().all())
 
 
-async def list_active_by_company(db: AsyncSession, company_id) -> List[Task]:
+async def list_active_by_company(db: AsyncSession, company_id, limit: int = None, offset: int = None) -> List[Task]:
     """Task History feature: the Owner Tasks page's main list now shows
     only active work - every task except those already completed. Same
     Task table/rows as list_by_company, just one extra status exclusion;
     completed tasks aren't deleted or moved, they simply belong to the
     separate Task History archive read (list_completed_by_company)."""
-    result = await db.execute(
-        select(Task).where(
-            Task.company_id == company_id,
-            Task.deleted_at.is_(None),
-            Task.status != "completed",
-        )
-    )
+    query = select(Task).where(
+        Task.company_id == company_id,
+        Task.deleted_at.is_(None),
+        Task.status != "completed",
+    ).order_by(Task.created_at)
+    if limit is not None:
+        query = query.limit(limit).offset(offset or 0)
+    result = await db.execute(query)
     return list(result.scalars().all())
 
 

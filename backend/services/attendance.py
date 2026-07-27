@@ -7,13 +7,17 @@ from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import repositories.attendance as attendance_repo
+import repositories.attendance_events as attendance_events_repo
 import repositories.audit_logs as audit_logs_repo
 import repositories.companies as companies_repo
 import repositories.users as users_repo
+import services.attendance_calc_engine as calc_engine
 import services.holidays as holidays_service
 import services.notifications as notifications_service
+import services.schedule_resolution as schedule_resolution
 from services.admin import parse_uuid
 from services.qr import generate_qr_code
+from services.attendance_calc_engine import ScheduleSnapshot
 
 DEFAULT_ATTENDANCE_RADIUS_METERS = 50.0
 # Above this implied speed between two consecutive attendance points the
@@ -51,6 +55,7 @@ def attendance_settings_for(company) -> dict:
         "updated_at": _iso(company.attendance_settings_updated_at),
         "updated_by": str(company.attendance_settings_updated_by) if company.attendance_settings_updated_by else None,
         "updated_by_name": company.attendance_settings_updated_by_name,
+        "qr_generated_at": _iso(company.qr_generated_at),
     }
 
 
@@ -62,8 +67,31 @@ async def ensure_qr_token(db: AsyncSession, company) -> str:
         token = uuid.uuid4().hex
         company.qr_token = token
         company.qr_code = generate_qr_code(token)
+        company.qr_generated_at = datetime.now(timezone.utc)
         await db.flush()
     return company.qr_token
+
+
+async def regenerate_qr_token(db: AsyncSession, current_user: dict) -> dict:
+    """Owner-triggered regeneration. The old token stops validating the
+    instant this flushes - `validate_qr_attendance`'s exact-match check
+    against the (now different) `qr_token` is the only "invalidation"
+    needed, there is nothing else referencing the old value."""
+    company = await companies_repo.get_by_id(db, parse_uuid(current_user["company_id"]))
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+
+    token = uuid.uuid4().hex
+    company.qr_token = token
+    company.qr_code = generate_qr_code(token)
+    company.qr_generated_at = datetime.now(timezone.utc)
+    await db.flush()
+
+    return {
+        "message": "QR code regenerated",
+        "qr_code": company.qr_code,
+        "qr_generated_at": _iso(company.qr_generated_at),
+    }
 
 
 async def detect_fake_gps(db: AsyncSession, employee_id, latitude: float, longitude: float, accuracy: Optional[float]) -> Optional[str]:
@@ -103,6 +131,35 @@ async def detect_fake_gps(db: AsyncSession, employee_id, latitude: float, longit
     return None
 
 
+def _tag(exc: HTTPException, *, qr_valid: Optional[bool] = None, gps_valid: Optional[bool] = None) -> HTTPException:
+    """Attaches unofficial attributes to a raised HTTPException so the
+    check_in/check_out wrapper can log an accurate Attendance Event without
+    string-matching `detail` (fragile - breaks the moment a message is
+    edited). Attributes left as None (the default) mean "not applicable /
+    not a QR-or-GPS-specific failure" (e.g. company-not-found), and the
+    wrapper's own getattr default (True) only kicks in for exceptions
+    raised entirely outside this function, past the point QR+GPS already
+    passed."""
+    exc.qr_valid = qr_valid
+    exc.gps_valid = gps_valid
+    return exc
+
+
+def _normalize_platform(device_info: Optional[str]) -> Optional[str]:
+    """The Flutter client sends `defaultTargetPlatform.name` verbatim as
+    `device_info` ("android" / "iOS") - a substring match is enough and
+    stays robust to that casing, without over-parsing a field that's
+    otherwise free-text."""
+    if not device_info:
+        return None
+    lowered = device_info.lower()
+    if "android" in lowered:
+        return "android"
+    if "ios" in lowered:
+        return "ios"
+    return "other"
+
+
 async def validate_qr_attendance(db: AsyncSession, current_user: dict, qr_code, latitude, longitude, accuracy):
     """Shared server-side gate for check-in AND check-out. Returns
     (company, settings, distance_from_company_meters); raises a clear 400
@@ -118,26 +175,32 @@ async def validate_qr_attendance(db: AsyncSession, current_user: dict, qr_code, 
 
     settings = attendance_settings_for(company)
     if not settings["qr_enabled"]:
-        raise HTTPException(status_code=400, detail="تسجيل الحضور عبر QR معطل حالياً من قبل إدارة الشركة.")
+        raise _tag(HTTPException(status_code=400, detail="تسجيل الحضور عبر QR معطل حالياً من قبل إدارة الشركة."), qr_valid=False)
 
     token = await ensure_qr_token(db, company)
     if qr_code != token:
-        raise HTTPException(status_code=400, detail="رمز QR غير صالح. يرجى مسح رمز الشركة الصحيح.")
+        raise _tag(HTTPException(status_code=400, detail="رمز QR غير صالح. يرجى مسح رمز الشركة الصحيح."), qr_valid=False)
 
     if latitude is None or longitude is None:
-        raise HTTPException(status_code=400, detail="خدمة الموقع (GPS) مطلوبة لتسجيل الحضور. يرجى السماح بالوصول إلى موقعك والمحاولة مجدداً.")
+        raise _tag(
+            HTTPException(status_code=400, detail="خدمة الموقع (GPS) مطلوبة لتسجيل الحضور. يرجى السماح بالوصول إلى موقعك والمحاولة مجدداً."),
+            qr_valid=True, gps_valid=False,
+        )
 
     rejection = await detect_fake_gps(db, parse_uuid(current_user["id"]), latitude, longitude, accuracy)
     if rejection:
-        raise HTTPException(status_code=400, detail=rejection)
+        raise _tag(HTTPException(status_code=400, detail=rejection), qr_valid=True, gps_valid=False)
 
     distance = None
     if settings["latitude"] is not None and settings["longitude"] is not None:
         distance = round(haversine_meters(latitude, longitude, settings["latitude"], settings["longitude"]), 1)
         if distance > settings["radius_meters"]:
-            raise HTTPException(
-                status_code=400,
-                detail=f"أنت خارج النطاق المسموح للشركة (المسافة الحالية {int(distance)} متر والمسموح {int(settings['radius_meters'])} متر)."
+            raise _tag(
+                HTTPException(
+                    status_code=400,
+                    detail=f"أنت خارج النطاق المسموح للشركة (المسافة الحالية {int(distance)} متر والمسموح {int(settings['radius_meters'])} متر)."
+                ),
+                qr_valid=True, gps_valid=False,
             )
 
     return company, settings, distance
@@ -165,6 +228,7 @@ def attendance_response(record, *, employee_name=None) -> dict:
         "employee_id": str(record.employee_id),
         "employee_name": employee_name,
         "employee_department": record.employee_department,
+        "employee_position": record.employee_position,
         "company_id": str(record.company_id),
         "date": _iso(record.date),
         "check_in_time": _iso(record.check_in_time),
@@ -175,46 +239,136 @@ def attendance_response(record, *, employee_name=None) -> dict:
         "check_out_distance_meters": record.check_out_distance_meters,
         "working_duration_minutes": record.working_duration_minutes if record.working_duration_minutes is not None
         else _duration_minutes(record.check_in_time, record.check_out_time),
+        # Work Schedule calculation fields (Phase 7) - all None on records
+        # from before this feature shipped, or for a company that hasn't
+        # set up Work Schedules yet. required/break/net/overtime/missing
+        # are the schedule-derived figures snapshotted or computed by
+        # services/attendance_calc_engine.py; late/early_arrival are set at
+        # check-in, overtime/missing/early_leave/net only once checked out.
+        "required_minutes": record.required_minutes,
+        "scheduled_break_minutes": record.scheduled_break_minutes,
+        "net_minutes": record.net_minutes,
+        "overtime_minutes": record.overtime_minutes,
+        "missing_minutes": record.missing_minutes,
+        "late_minutes": record.late_minutes,
+        "early_arrival_minutes": record.early_arrival_minutes,
+        "early_leave_minutes": record.early_leave_minutes,
         "device_info": record.device_info,
         "created_at": _iso(record.created_at),
         "status": record.status,
     }
 
 
-async def check_in(db: AsyncSession, current_user: dict, data) -> dict:
-    company, settings, distance = await validate_qr_attendance(
-        db, current_user, data.qr_code, data.latitude, data.longitude, data.accuracy
+async def _log_attendance_event(
+    db: AsyncSession, *, employee_id, company_id, action_type: str,
+    attendance_record_id, qr_valid: bool, gps_valid: bool,
+    failure_reason: Optional[str], latitude, longitude, device_platform: Optional[str],
+) -> None:
+    await attendance_events_repo.create(
+        db,
+        employee_id=employee_id,
+        company_id=company_id,
+        action_type=action_type,
+        attendance_record_id=attendance_record_id,
+        event_date=datetime.now(timezone.utc).date(),
+        latitude=latitude,
+        longitude=longitude,
+        qr_valid=qr_valid,
+        gps_valid=gps_valid,
+        failure_reason=failure_reason,
+        device_platform=device_platform,
     )
-
-    now = datetime.now(timezone.utc)
-    today = now.date()
-    employee_id = parse_uuid(current_user["id"])
-
-    existing = await attendance_repo.get_for_employee_on_date(db, employee_id, today)
-    if existing and existing.check_in_time:
-        raise HTTPException(status_code=400, detail="Already checked in today")
-
-    attendance_status = "late" if now.hour >= 9 else "present"
-
-    fields = dict(
-        employee_department=current_user.get("department"),
-        company_id=parse_uuid(current_user["company_id"]),
-        date=today,
-        check_in_time=now,
-        check_in_latitude=data.latitude,
-        check_in_longitude=data.longitude,
-        check_in_accuracy=data.accuracy,
-        distance_from_company_meters=distance,
-        device_info=data.device_info,
-        status=attendance_status,
-    )
-
-    if existing:
-        for field, value in fields.items():
-            setattr(existing, field, value)
-    else:
-        await attendance_repo.create(db, employee_id=employee_id, **fields)
     await db.flush()
+
+
+async def check_in(db: AsyncSession, current_user: dict, data) -> dict:
+    employee_id = parse_uuid(current_user["id"])
+    company_id = parse_uuid(current_user["company_id"])
+    platform = _normalize_platform(data.device_info)
+    # Set once the day's row (if any) is fetched below, so a later
+    # "already checked in" failure can still link its event to the real
+    # record instead of leaving attendance_record_id null.
+    known_record_id = None
+
+    try:
+        company, settings, distance = await validate_qr_attendance(
+            db, current_user, data.qr_code, data.latitude, data.longitude, data.accuracy
+        )
+
+        now = datetime.now(timezone.utc)
+        today = now.date()
+
+        existing = await attendance_repo.get_for_employee_on_date(db, employee_id, today)
+        if existing:
+            known_record_id = existing.id
+        if existing and existing.check_in_time:
+            raise HTTPException(status_code=400, detail="You are already checked in.")
+
+        # Resolved and snapshotted here, once, at check-in time - see the
+        # denormalization comment on the Attendance model. Every later read
+        # (history, reports, analytics) uses these stored columns, never a
+        # fresh lookup, so editing or deleting a schedule afterwards can never
+        # rewrite this record's calculated history.
+        schedule = await schedule_resolution.get_effective_schedule_for_employee(
+            db,
+            schedule_id=parse_uuid(current_user.get("schedule_id")),
+            company_id=company_id,
+        )
+        snapshot = schedule_resolution.to_snapshot(schedule)
+        calc = calc_engine.calculate_check_in(snapshot, now)
+        attendance_status = calc["status"]
+
+        fields = dict(
+            employee_department=current_user.get("department"),
+            employee_position=current_user.get("position"),
+            company_id=company_id,
+            date=today,
+            check_in_time=now,
+            check_in_latitude=data.latitude,
+            check_in_longitude=data.longitude,
+            check_in_accuracy=data.accuracy,
+            distance_from_company_meters=distance,
+            device_info=data.device_info,
+            status=attendance_status,
+            schedule_id=schedule.id if schedule else None,
+            scheduled_start_time=snapshot.start_time if snapshot else None,
+            scheduled_end_time=snapshot.end_time if snapshot else None,
+            scheduled_break_minutes=snapshot.break_minutes if snapshot else None,
+            required_minutes=snapshot.required_minutes if snapshot else None,
+            late_minutes=calc["late_minutes"],
+            early_arrival_minutes=calc["early_arrival_minutes"],
+        )
+
+        if existing:
+            for field, value in fields.items():
+                setattr(existing, field, value)
+            record = existing
+        else:
+            record = await attendance_repo.create(db, employee_id=employee_id, **fields)
+        await db.flush()
+    except HTTPException as exc:
+        # get_db()'s request-scoped session rolls back on any exception
+        # leaving the route handler, which would silently discard this
+        # event along with everything else - commit it here, before
+        # re-raising, so the audit trail survives the failure it's
+        # recording. Safe: nothing above this point mutates a row, only
+        # reads (validate_qr_attendance, get_for_employee_on_date), so
+        # there's nothing else in the transaction to accidentally persist.
+        await _log_attendance_event(
+            db, employee_id=employee_id, company_id=company_id, action_type="check_in",
+            attendance_record_id=known_record_id,
+            qr_valid=getattr(exc, "qr_valid", True), gps_valid=getattr(exc, "gps_valid", True),
+            failure_reason=exc.detail if isinstance(exc.detail, str) else str(exc.detail),
+            latitude=data.latitude, longitude=data.longitude, device_platform=platform,
+        )
+        await db.commit()
+        raise
+
+    await _log_attendance_event(
+        db, employee_id=employee_id, company_id=company_id, action_type="check_in",
+        attendance_record_id=record.id, qr_valid=True, gps_valid=True, failure_reason=None,
+        latitude=data.latitude, longitude=data.longitude, device_platform=platform,
+    )
 
     if attendance_status == "late":
         if company:
@@ -237,27 +391,74 @@ async def check_in(db: AsyncSession, current_user: dict, data) -> dict:
 
 
 async def check_out(db: AsyncSession, current_user: dict, data) -> dict:
-    company, settings, distance = await validate_qr_attendance(
-        db, current_user, data.qr_code, data.latitude, data.longitude, data.accuracy
-    )
-
-    now = datetime.now(timezone.utc)
-    today = now.date()
     employee_id = parse_uuid(current_user["id"])
+    company_id = parse_uuid(current_user["company_id"])
+    platform = _normalize_platform(data.device_info)
+    known_record_id = None
 
-    record = await attendance_repo.get_for_employee_on_date(db, employee_id, today)
-    if not record or not record.check_in_time:
-        raise HTTPException(status_code=400, detail="Not checked in yet")
-    if record.check_out_time:
-        raise HTTPException(status_code=400, detail="Already checked out")
+    try:
+        company, settings, distance = await validate_qr_attendance(
+            db, current_user, data.qr_code, data.latitude, data.longitude, data.accuracy
+        )
 
-    record.check_out_time = now
-    record.check_out_latitude = data.latitude
-    record.check_out_longitude = data.longitude
-    record.check_out_accuracy = data.accuracy
-    record.check_out_distance_meters = distance
-    record.working_duration_minutes = _duration_minutes(record.check_in_time, now)
-    await db.flush()
+        now = datetime.now(timezone.utc)
+        today = now.date()
+
+        record = await attendance_repo.get_for_employee_on_date(db, employee_id, today)
+        if record:
+            known_record_id = record.id
+        if not record or not record.check_in_time:
+            raise HTTPException(status_code=400, detail="No check-in record found for today.")
+        if record.check_out_time:
+            raise HTTPException(status_code=400, detail="Already checked out")
+
+        record.check_out_time = now
+        record.check_out_latitude = data.latitude
+        record.check_out_longitude = data.longitude
+        record.check_out_accuracy = data.accuracy
+        record.check_out_distance_meters = distance
+        record.working_duration_minutes = _duration_minutes(record.check_in_time, now)
+
+        # Reconstructed from the columns snapshotted at check-in - never a
+        # fresh schedule lookup here, so a schedule edited/deleted between
+        # check-in and check-out still calculates against what was actually
+        # in effect this morning.
+        snapshot = (
+            ScheduleSnapshot(
+                schedule_id=str(record.schedule_id) if record.schedule_id else None,
+                start_time=record.scheduled_start_time,
+                end_time=record.scheduled_end_time,
+                break_minutes=record.scheduled_break_minutes,
+                required_minutes=record.required_minutes,
+            )
+            if record.schedule_id
+            else None
+        )
+        calc = calc_engine.calculate_check_out(snapshot, record.check_in_time, now)
+        record.overtime_minutes = calc["overtime_minutes"]
+        record.missing_minutes = calc["missing_minutes"]
+        record.early_leave_minutes = calc["early_leave_minutes"]
+        record.net_minutes = calc["net_minutes"]
+        await db.flush()
+    except HTTPException as exc:
+        # See the matching comment in check_in() - the outer session rolls
+        # back on any exception, so this event must be committed here or it
+        # never survives to be read back.
+        await _log_attendance_event(
+            db, employee_id=employee_id, company_id=company_id, action_type="check_out",
+            attendance_record_id=known_record_id,
+            qr_valid=getattr(exc, "qr_valid", True), gps_valid=getattr(exc, "gps_valid", True),
+            failure_reason=exc.detail if isinstance(exc.detail, str) else str(exc.detail),
+            latitude=data.latitude, longitude=data.longitude, device_platform=platform,
+        )
+        await db.commit()
+        raise
+
+    await _log_attendance_event(
+        db, employee_id=employee_id, company_id=company_id, action_type="check_out",
+        attendance_record_id=record.id, qr_valid=True, gps_valid=True, failure_reason=None,
+        latitude=data.latitude, longitude=data.longitude, device_platform=platform,
+    )
 
     return {"message": "Checked out successfully"}
 
@@ -268,11 +469,21 @@ async def get_attendance_history(db: AsyncSession, current_user: dict) -> List[d
 
 
 async def list_attendance_for_owner(db: AsyncSession, company_id, *, date=None, date_from=None, date_to=None,
-                                     employee_id=None, department=None, status=None, search=None) -> List[dict]:
+                                     employee_id=None, department=None, position=None, status=None,
+                                     search=None, schedule_id=None, late=None, overtime=None,
+                                     missing_hours=None, range_=None) -> List[dict]:
     company_id = parse_uuid(company_id)
     date_ = date_type.fromisoformat(date) if date else None
     from_ = date_type.fromisoformat(date_from) if date_from else None
     to_ = date_type.fromisoformat(date_to) if date_to else None
+
+    # week/month/year quick-range - reuses the same range resolver as the
+    # per-employee report (Phase 6) rather than duplicating the Sunday-start
+    # week math. Only applied when the caller hasn't already pinned an exact
+    # date or range explicitly.
+    if range_ and date_ is None and from_ is None and to_ is None:
+        from_, to_ = _resolve_stats_range(range_, None, None)
+
     if from_ is None and to_ is None and date_ is None:
         date_ = datetime.now(timezone.utc).date()
 
@@ -282,7 +493,9 @@ async def list_attendance_for_owner(db: AsyncSession, company_id, *, date=None, 
     records = await attendance_repo.list_by_company(
         db, company_id, date_=date_, date_from=from_, date_to=to_,
         employee_id=parse_uuid(employee_id) if employee_id else None,
-        checked_out=checked_out, status=status_filter,
+        checked_out=checked_out, status=status_filter, department=department,
+        schedule_id=parse_uuid(schedule_id) if schedule_id else None,
+        late=late, overtime=overtime, missing_hours=missing_hours,
     )
 
     employees = await users_repo.list_employees_by_company(db, company_id)
@@ -294,7 +507,13 @@ async def list_attendance_for_owner(db: AsyncSession, company_id, *, date=None, 
         response = attendance_response(record, employee_name=employee.name if employee else None)
         if response["employee_department"] is None and employee:
             response["employee_department"] = employee.department
-        if department and response["employee_department"] != department:
+        if response["employee_position"] is None and employee:
+            response["employee_position"] = employee.position
+        # Unlike department (filtered in SQL above), position stays a
+        # post-fetch check: the column is brand new and null on every
+        # pre-existing row, so a SQL filter would silently exclude history
+        # that only resolves via the live-employee fallback just above.
+        if position and response["employee_position"] != position:
             continue
         if search and search.strip().lower() not in (response["employee_name"] or "").lower():
             continue
@@ -302,6 +521,78 @@ async def list_attendance_for_owner(db: AsyncSession, company_id, *, date=None, 
 
     await holidays_service.annotate_holiday_dates(db, company_id, results)
     return results
+
+
+def _resolve_stats_range(range_: str, date_from: Optional[str], date_to: Optional[str]) -> tuple:
+    """Shared by the owner per-employee report (Phase 6) - one place that
+    turns "today/week/month/year/custom" into an inclusive [start, end]
+    date pair, so every consumer of get_employee_attendance_stats agrees
+    on exactly what "this month" etc. means."""
+    today = datetime.now(timezone.utc).date()
+    if range_ == "today":
+        return today, today
+    if range_ == "week":
+        # Sunday-start week, matching this codebase's own 0=Sunday..6=Saturday
+        # convention (Company.working_days / WorkSchedule.working_days) -
+        # not Python's default Monday-start ISO week.
+        days_since_sunday = (today.weekday() + 1) % 7
+        return today - timedelta(days=days_since_sunday), today
+    if range_ == "month":
+        return today.replace(day=1), today
+    if range_ == "year":
+        return today.replace(month=1, day=1), today
+    if range_ == "custom":
+        if not date_from or not date_to:
+            raise HTTPException(status_code=400, detail="date_from and date_to are required for a custom range")
+        return date_type.fromisoformat(date_from), date_type.fromisoformat(date_to)
+    raise HTTPException(status_code=400, detail="range must be one of: today, week, month, year, custom")
+
+
+async def get_employee_attendance_stats(
+    db: AsyncSession, company_id, employee_id: str, range_: str,
+    date_from: Optional[str] = None, date_to: Optional[str] = None,
+) -> dict:
+    """Phases 5 & 6: the single reusable rollup behind the owner's
+    per-employee report AND (via the same aggregate() call the dashboards
+    use for "today") daily/weekly/monthly/yearly accumulation - no bespoke
+    calculation duplicated per time window, per Phase 9's requirement."""
+    company_id = parse_uuid(company_id)
+    parsed_employee_id = parse_uuid(employee_id)
+    employee = await users_repo.get_employee_in_company(db, parsed_employee_id, company_id)
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    start, end = _resolve_stats_range(range_, date_from, date_to)
+    if start > end:
+        raise HTTPException(status_code=400, detail="date_from must be before date_to")
+
+    records = await attendance_repo.list_by_company(
+        db, company_id, employee_id=parsed_employee_id, date_from=start, date_to=end,
+    )
+    responses = [attendance_response(r, employee_name=employee.name) for r in records]
+    expected_days = (end - start).days + 1
+    stats = calc_engine.aggregate(responses, expected_days=expected_days)
+
+    return {
+        "employee_id": str(employee.id),
+        "employee_name": employee.name,
+        "range": range_,
+        "date_from": _iso(start),
+        "date_to": _iso(end),
+        "days_present": stats.days_present,
+        "days_late": stats.days_late,
+        "days_absent": stats.days_absent,
+        "total_worked_minutes": stats.total_worked_minutes,
+        "total_required_minutes": stats.total_required_minutes,
+        "total_overtime_minutes": stats.total_overtime_minutes,
+        "total_missing_minutes": stats.total_missing_minutes,
+        "total_late_minutes": stats.total_late_minutes,
+        "total_early_leave_minutes": stats.total_early_leave_minutes,
+        "late_count": stats.late_count,
+        "early_leave_count": stats.early_leave_count,
+        "average_daily_worked_minutes": stats.average_daily_worked_minutes,
+        "attendance_percentage": stats.attendance_percentage,
+    }
 
 
 async def get_attendance_settings(db: AsyncSession, company) -> dict:
@@ -399,6 +690,8 @@ async def get_attendance_analytics(db: AsyncSession, company_id, date_from: Opti
         by_date.setdefault(record.date, []).append(record)
 
     attendance_trend, late_trend, working_hours_trend = [], [], []
+    overtime_trend, missing_hours_trend = [], []
+    month_buckets = {}
     for offset in range(day_count):
         day = start_date + timedelta(days=offset)
         day_records = by_date.get(day, [])
@@ -418,11 +711,38 @@ async def get_attendance_analytics(db: AsyncSession, company_id, date_from: Opti
             "date": day.isoformat(),
             "hours": round(sum(day_durations) / len(day_durations) / 60, 2) if day_durations else 0,
         })
+        # Overtime/missing-hours trend (Phase 8): only populated for records
+        # with a resolved schedule (calc engine leaves these None otherwise),
+        # which contribute 0 - same "no schedule = no penalty" fallback as
+        # the calculation engine itself.
+        overtime_trend.append({
+            "date": day.isoformat(),
+            "hours": round(sum(r.overtime_minutes or 0 for r in day_records) / 60, 2),
+        })
+        missing_hours_trend.append({
+            "date": day.isoformat(),
+            "hours": round(sum(r.missing_minutes or 0 for r in day_records) / 60, 2),
+        })
+
+        month_key = day.strftime("%Y-%m")
+        bucket = month_buckets.setdefault(month_key, {"days": 0, "attended": 0})
+        bucket["days"] += 1
+        bucket["attended"] += day_attended
+
+    monthly_attendance_trend = [
+        {
+            "month": month,
+            "rate": round(bucket["attended"] / (bucket["days"] * total_employees) * 100, 1)
+            if total_employees > 0 and bucket["days"] > 0 else 0,
+        }
+        for month, bucket in sorted(month_buckets.items())
+    ]
 
     per_employee = {
         str(e.id): {
             "employee_id": str(e.id), "name": e.name, "department": e.department,
             "days_attended": 0, "late_count": 0, "total_minutes": 0.0, "duration_days": 0,
+            "total_overtime_minutes": 0.0, "total_late_minutes": 0.0,
         }
         for e in employees
     }
@@ -440,6 +760,10 @@ async def get_attendance_analytics(db: AsyncSession, company_id, date_from: Opti
         if duration is not None:
             stats["total_minutes"] += duration
             stats["duration_days"] += 1
+        if record.overtime_minutes:
+            stats["total_overtime_minutes"] += record.overtime_minutes
+        if record.late_minutes:
+            stats["total_late_minutes"] += record.late_minutes
 
     department_totals = {}
     for stats in per_employee.values():
@@ -473,6 +797,32 @@ async def get_attendance_analytics(db: AsyncSession, company_id, date_from: Opti
     for index, item in enumerate(ranking):
         item["rank"] = index + 1
 
+    # Most punctual: fewest late days, tie-broken by lowest average late
+    # minutes. Only employees who actually attended are eligible - an
+    # employee with zero attendance isn't "punctual", they're absent.
+    most_punctual_employees = [
+        {
+            "employee_id": s["employee_id"],
+            "name": s["name"],
+            "late_count": s["late_count"],
+            "avg_late_minutes": round(s["total_late_minutes"] / s["days_attended"], 1) if s["days_attended"] else 0,
+        }
+        for s in sorted(
+            (s for s in per_employee.values() if s["days_attended"] > 0),
+            key=lambda s: (s["late_count"], s["total_late_minutes"]),
+        )[:5]
+    ]
+
+    most_overtime_employees = [
+        {
+            "employee_id": s["employee_id"],
+            "name": s["name"],
+            "total_overtime_hours": round(s["total_overtime_minutes"] / 60, 1),
+        }
+        for s in sorted(per_employee.values(), key=lambda s: s["total_overtime_minutes"], reverse=True)
+        if s["total_overtime_minutes"] > 0
+    ][:5]
+
     return {
         "date_from": start_date.isoformat(),
         "date_to": end_date.isoformat(),
@@ -487,10 +837,15 @@ async def get_attendance_analytics(db: AsyncSession, company_id, date_from: Opti
         "average_distance_meters": average_distance_meters,
         "department_attendance": department_attendance,
         "employee_ranking": ranking,
+        "most_punctual_employees": most_punctual_employees,
+        "most_overtime_employees": most_overtime_employees,
         "charts": {
             "attendance_trend": attendance_trend,
             "late_trend": late_trend,
             "working_hours_trend": working_hours_trend,
+            "monthly_attendance_trend": monthly_attendance_trend,
+            "overtime_trend": overtime_trend,
+            "missing_hours_trend": missing_hours_trend,
         },
     }
 
@@ -574,6 +929,34 @@ async def get_attendance_audit_log(db: AsyncSession, company_id) -> List[dict]:
         entry["edited_by_name"] = editor_names.get(entry["edited_by"])
 
     return entries
+
+
+def _attendance_event_response(event) -> dict:
+    return {
+        "id": str(event.id),
+        "attendance_record_id": str(event.attendance_record_id) if event.attendance_record_id else None,
+        "employee_id": str(event.employee_id),
+        "company_id": str(event.company_id),
+        "action_type": event.action_type,
+        "event_date": _iso(event.event_date),
+        "event_time": _iso(event.event_time),
+        "latitude": event.latitude,
+        "longitude": event.longitude,
+        "qr_valid": event.qr_valid,
+        "gps_valid": event.gps_valid,
+        "failure_reason": event.failure_reason,
+        "device_platform": event.device_platform,
+        "created_at": _iso(event.created_at),
+    }
+
+
+async def get_attendance_events(db: AsyncSession, company_id, attendance_id: str) -> List[dict]:
+    parsed_id = parse_uuid(attendance_id)
+    record = await attendance_repo.get_in_company(db, parsed_id, parse_uuid(company_id)) if parsed_id else None
+    if not record:
+        raise HTTPException(status_code=404, detail="Attendance record not found")
+    events = await attendance_events_repo.list_for_record(db, record.id)
+    return [_attendance_event_response(e) for e in events]
 
 
 async def get_company_qr(db: AsyncSession, current_user: dict, company_id: str) -> dict:

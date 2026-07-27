@@ -1,6 +1,7 @@
 import os
 from datetime import datetime, timedelta, timezone
 
+import stripe
 from emergentintegrations.payments.stripe.checkout import (
     CheckoutSessionRequest,
     CheckoutSessionResponse,
@@ -24,9 +25,20 @@ def _stripe_client(webhook_url: str) -> StripeCheckout:
     return StripeCheckout(api_key=stripe_key, webhook_url=webhook_url)
 
 
+def _validate_redirect_origin(origin_url: str) -> None:
+    """`origin_url` becomes Stripe's post-payment success/cancel redirect -
+    unvalidated, a caller could point it at an arbitrary domain. Reuses the
+    same trusted-origins list CORS already enforces rather than inventing
+    a second allowlist."""
+    allowed_origins = os.environ.get("CORS_ORIGINS", "").split(",")
+    if not any(origin_url == o.strip() for o in allowed_origins if o.strip()):
+        raise HTTPException(status_code=400, detail="Invalid origin_url")
+
+
 async def create_checkout(db: AsyncSession, current_user: dict, plan_id: str, origin_url: str, host_url: str) -> dict:
     if current_user["role"] != "company_owner":
         raise HTTPException(status_code=403, detail="Only company owners can subscribe")
+    _validate_redirect_origin(origin_url)
 
     parsed_plan_id = parse_uuid(plan_id)
     plan = await subscription_plans_repo.get_by_id(db, parsed_plan_id) if parsed_plan_id else None
@@ -85,13 +97,16 @@ async def _activate_from_transaction(db: AsyncSession, tx) -> None:
         )
 
 
-async def check_payment_status(db: AsyncSession, session_id: str, host_url: str) -> dict:
+async def check_payment_status(db: AsyncSession, current_user: dict, session_id: str, host_url: str) -> dict:
+    tx = await payment_transactions_repo.get_by_session_id(db, session_id)
+    if not tx or str(tx.company_id) != current_user["company_id"]:
+        raise HTTPException(status_code=404, detail="Checkout session not found")
+
     webhook_url = f"{host_url}/api/webhook/stripe"
     stripe_checkout = _stripe_client(webhook_url)
     status_resp: CheckoutStatusResponse = await stripe_checkout.get_checkout_status(session_id)
 
-    tx = await payment_transactions_repo.get_by_session_id(db, session_id)
-    if tx and tx.payment_status != "paid" and status_resp.payment_status == "paid":
+    if tx.payment_status != "paid" and status_resp.payment_status == "paid":
         tx.payment_status = status_resp.payment_status
         tx.status = status_resp.status
         await _activate_from_transaction(db, tx)
@@ -103,14 +118,29 @@ async def check_payment_status(db: AsyncSession, session_id: str, host_url: str)
 
 
 async def stripe_webhook(db: AsyncSession, body: bytes, signature: str, host_url: str) -> dict:
-    webhook_url = f"{host_url}/api/webhook/stripe"
-    stripe_checkout = _stripe_client(webhook_url)
-    webhook_response = await stripe_checkout.handle_webhook(body, signature)
+    # The vendored StripeCheckout.handle_webhook() does NOT cryptographically
+    # verify the signature - it just json.loads()s the body (confirmed in
+    # its own source). Used as-is, this endpoint would treat any forged
+    # POST as a genuine Stripe event and could activate a company's
+    # subscription for free. Verifying with the real `stripe` SDK here
+    # instead, and failing closed (rejecting the webhook) if no real
+    # webhook secret is configured, rather than silently trusting the body.
+    webhook_secret = os.environ.get("STRIPE_WEBHOOK_SECRET")
+    if not webhook_secret:
+        raise HTTPException(status_code=503, detail="Stripe webhook not configured")
+    try:
+        event = stripe.Webhook.construct_event(body, signature, webhook_secret)
+    except (ValueError, stripe.SignatureVerificationError):
+        raise HTTPException(status_code=400, detail="Invalid webhook signature")
 
-    if webhook_response.session_id:
-        tx = await payment_transactions_repo.get_by_session_id(db, webhook_response.session_id)
-        if tx and tx.payment_status != "paid" and webhook_response.payment_status == "paid":
-            tx.payment_status = webhook_response.payment_status
+    data_object = event.get("data", {}).get("object", {})
+    session_id = data_object.get("id")
+    payment_status = data_object.get("payment_status")
+
+    if session_id:
+        tx = await payment_transactions_repo.get_by_session_id(db, session_id)
+        if tx and tx.payment_status != "paid" and payment_status == "paid":
+            tx.payment_status = payment_status
             await _activate_from_transaction(db, tx)
 
     return {"status": "received"}

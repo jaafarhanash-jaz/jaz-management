@@ -1,4 +1,3 @@
-import uuid
 from datetime import datetime, timezone
 from typing import List, Optional
 
@@ -7,12 +6,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 import repositories.companies as companies_repo
 import repositories.users as users_repo
+import repositories.work_schedules as work_schedules_repo
 import services.notifications as notifications_service
 from services.admin import parse_uuid
-from services.auth import hash_password
+from services.auth import hash_password, validate_password_strength
 from services.storage import decode_and_validate, delete as storage_delete, download_base64, upload as storage_upload
 
-UPDATE_ALLOWED_FIELDS = ["name", "phone", "department", "position", "status", "avatar"]
+UPDATE_ALLOWED_FIELDS = ["name", "phone", "department", "position", "status", "avatar", "schedule_id"]
 PROFILE_ALLOWED_FIELDS = ["name", "phone", "avatar"]
 
 # Employee CV (Part 1): PDF/DOC/DOCX only, matching the feature spec. Checked
@@ -48,7 +48,7 @@ def _cv_response(user) -> Optional[dict]:
     }
 
 
-def user_response(user) -> dict:
+def user_response(user, *, schedule_name: Optional[str] = None) -> dict:
     return {
         "id": str(user.id),
         "email": user.email,
@@ -60,13 +60,30 @@ def user_response(user) -> dict:
         "status": user.status,
         "department": user.department,
         "position": user.position,
+        "schedule_id": str(user.schedule_id) if user.schedule_id else None,
+        # Display-only: the *effective* schedule name (the employee's own
+        # assignment, or the company default if unassigned) - never the raw
+        # schedule_id's name alone, so "no explicit assignment" still shows
+        # what the employee is actually calculated against.
+        "schedule_name": schedule_name,
         "cv": _cv_response(user),
     }
 
 
-async def list_employees(db: AsyncSession, company_id) -> List[dict]:
-    employees = await users_repo.list_employees_by_company(db, company_id)
-    return [user_response(e) for e in employees]
+async def list_employees(db: AsyncSession, company_id, limit: int = None, offset: int = None) -> List[dict]:
+    employees = await users_repo.list_employees_by_company(db, company_id, limit=limit, offset=offset)
+    # One query for all of the company's schedules instead of N+1 lookups
+    # per employee.
+    schedules = await work_schedules_repo.list_by_company(db, company_id)
+    schedule_names_by_id = {s.id: s.name for s in schedules}
+    default_schedule = next((s for s in schedules if s.is_default), None)
+
+    def _effective_name(employee) -> Optional[str]:
+        if employee.schedule_id:
+            return schedule_names_by_id.get(employee.schedule_id)
+        return default_schedule.name if default_schedule else None
+
+    return [user_response(e, schedule_name=_effective_name(e)) for e in employees]
 
 
 async def _store_cv(db: AsyncSession, employee, uploaded_by, cv_data) -> None:
@@ -112,6 +129,7 @@ async def create_employee(db: AsyncSession, company_id, created_by, data) -> dic
                 detail="Employee limit reached. Please upgrade your subscription plan to add more employees.",
             )
 
+    validate_password_strength(data.password)
     employee = await users_repo.create(
         db,
         email=data.email,
@@ -144,7 +162,10 @@ async def create_employee(db: AsyncSession, company_id, created_by, data) -> dic
             action_url="/company-owner/employees",
         )
 
-    return user_response(employee)
+    # A freshly created employee has no explicit assignment yet, so the
+    # effective schedule is whatever the company's current default is.
+    default_schedule = await work_schedules_repo.get_default_for_company(db, company_id)
+    return user_response(employee, schedule_name=default_schedule.name if default_schedule else None)
 
 
 async def update_employee(db: AsyncSession, company_id, employee_id: str, updates: dict) -> dict:
@@ -152,6 +173,7 @@ async def update_employee(db: AsyncSession, company_id, employee_id: str, update
     # implementation - whitelist filtering is the only guard.
     safe_updates = {k: v for k, v in updates.items() if k in UPDATE_ALLOWED_FIELDS}
     if updates.get("password"):
+        validate_password_strength(updates["password"])
         safe_updates["password"] = hash_password(updates["password"])
     if not safe_updates:
         raise HTTPException(status_code=400, detail="No valid fields to update")
@@ -160,6 +182,21 @@ async def update_employee(db: AsyncSession, company_id, employee_id: str, update
     employee = await users_repo.get_employee_in_company(db, parsed_id, company_id) if parsed_id else None
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
+
+    # schedule_id is a cross-table FK, unlike every other field in
+    # UPDATE_ALLOWED_FIELDS (plain scalars with no referential integrity to
+    # protect) - it needs its own ownership-scoped resolution before the
+    # blind setattr below, otherwise an owner could point an employee at
+    # another company's schedule (or a typo'd/deleted id) and only find out
+    # at flush time via an opaque FK violation. `null` is allowed through
+    # unchanged - it means "fall back to the company default schedule".
+    if "schedule_id" in safe_updates and safe_updates["schedule_id"] is not None:
+        schedule = await work_schedules_repo.get_by_id_and_company(
+            db, parse_uuid(safe_updates["schedule_id"]), company_id,
+        )
+        if not schedule:
+            raise HTTPException(status_code=404, detail="Work schedule not found")
+        safe_updates["schedule_id"] = schedule.id
 
     for field, value in safe_updates.items():
         setattr(employee, field, value)

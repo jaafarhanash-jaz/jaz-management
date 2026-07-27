@@ -87,15 +87,25 @@ function App() {
     setPendingCriticalTasks((prev) => prev.filter((t) => t.id !== taskId));
   };
 
-  const handleLogin = (token, role) => {
+  const handleLogin = (token, refreshToken, role) => {
     localStorage.setItem('token', token);
+    localStorage.setItem('refresh_token', refreshToken);
     localStorage.setItem('role', role);
     setIsAuthenticated(true);
     setUserRole(role);
   };
 
   const handleLogout = () => {
+    // Best-effort - the refresh token is revoked server-side so it can't be
+    // used to mint new sessions later, but logout must still succeed
+    // locally even if this call fails (offline, already-expired access
+    // token, etc).
+    const refreshToken = localStorage.getItem('refresh_token');
+    if (refreshToken) {
+      api.post('/auth/logout', { refresh_token: refreshToken }).catch(() => {});
+    }
     localStorage.removeItem('token');
+    localStorage.removeItem('refresh_token');
     localStorage.removeItem('role');
     setIsAuthenticated(false);
     setUserRole(null);

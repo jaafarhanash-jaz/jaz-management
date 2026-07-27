@@ -17,7 +17,9 @@ import services.calendar as calendar_service
 import services.holidays as holidays_service
 import services.messages as messages_service
 import services.notifications as notifications_service
+import services.schedule_resolution as schedule_resolution
 import services.tasks as tasks_service
+import services.work_schedules as work_schedules_service
 from services.admin import parse_uuid
 
 # Employee Workspace (Part 2) - "Focus Now" priority order, exactly as
@@ -94,18 +96,26 @@ async def get_owner_dashboard(db: AsyncSession, current_user: dict) -> dict:
 
     today_rows = await attendance_repo.list_by_company(db, company_id, date_=today)
     status_by_employee = {}
+    checked_in_ids = set()
     checked_out_ids = set()
+    total_overtime_minutes_today = 0.0
     for row in today_rows:
         if row.employee_id not in employee_ids:
             continue
         status_by_employee[row.employee_id] = row.status
+        if row.check_in_time:
+            checked_in_ids.add(row.employee_id)
         if row.check_out_time:
             checked_out_ids.add(row.employee_id)
+        total_overtime_minutes_today += row.overtime_minutes or 0
 
     present_today = sum(1 for s in status_by_employee.values() if s == "present")
     late_today = 0 if today_holiday else sum(1 for s in status_by_employee.values() if s == "late")
     absent_today = 0 if today_holiday else max(0, total_employees - present_today - late_today)
     checked_out_today = len(checked_out_ids)
+    # "Working" = checked in but not yet checked out today (distinct from
+    # "Finished" = checked_out_today above) - Phase 4's daily summary.
+    employees_working_today = len(checked_in_ids - checked_out_ids)
     attendance_percentage = min(100.0, round((present_today + late_today) / total_employees * 100, 1)) if total_employees > 0 else 0
 
     all_tasks = [t for t in await tasks_repo.list_by_company(db, company_id) if t.status not in HIDDEN_TASK_STATUSES]
@@ -127,6 +137,8 @@ async def get_owner_dashboard(db: AsyncSession, current_user: dict) -> dict:
         "late_today": late_today,
         "absent_today": absent_today,
         "checked_out_today": checked_out_today,
+        "employees_working_today": employees_working_today,
+        "total_overtime_minutes_today": round(total_overtime_minutes_today, 2),
         "attendance_percentage": attendance_percentage,
         "open_tasks": open_tasks,
         "completed_tasks": completed_tasks,
@@ -340,6 +352,15 @@ async def get_employee_dashboard(db: AsyncSession, current_user: dict) -> dict:
     attendance = await attendance_repo.get_for_employee_on_date(db, employee_id, today)
     attendance_widget = attendance_service.attendance_response(attendance) if attendance else None
 
+    # Shown independently of attendance_widget (which is None until the
+    # employee actually checks in today) - the *currently* effective
+    # schedule, not a historical snapshot, since there's nothing to
+    # snapshot yet before today's check-in.
+    today_schedule_row = await schedule_resolution.get_effective_schedule_for_employee(
+        db, schedule_id=parse_uuid(current_user.get("schedule_id")), company_id=company_id,
+    )
+    today_schedule = work_schedules_service.schedule_response(today_schedule_row) if today_schedule_row else None
+
     # Messages widget: reuses the exact same unread-inbox query the sidebar
     # badge and the Work Messages page already use - no new message-listing
     # logic, just a small page_size for a preview.
@@ -373,6 +394,7 @@ async def get_employee_dashboard(db: AsyncSession, current_user: dict) -> dict:
         "focus_task": focus_task,
         "focus_reason": focus_reason,
         "attendance": attendance_widget,
+        "today_schedule": today_schedule,
         "messages_widget": messages_widget,
         "latest_notification": latest_notification,
         "calendar_widgets": await calendar_service.compute_calendar_dashboard_widgets(db, current_user, is_owner=False),

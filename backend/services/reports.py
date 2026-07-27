@@ -28,8 +28,8 @@ def report_response(report, *, employee_name=None) -> dict:
     }
 
 
-async def list_reports_for_owner(db: AsyncSession, company_id) -> List[dict]:
-    reports = await reports_repo.list_by_company(db, parse_uuid(company_id))
+async def list_reports_for_owner(db: AsyncSession, company_id, limit: int = None, offset: int = None) -> List[dict]:
+    reports = await reports_repo.list_by_company(db, parse_uuid(company_id), limit=limit, offset=offset)
     employee_ids = {r.employee_id for r in reports}
     names = await users_repo.get_names_by_ids(db, employee_ids)
     return [report_response(r, employee_name=names.get(str(r.employee_id))) for r in reports]

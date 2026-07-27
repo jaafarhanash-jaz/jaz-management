@@ -42,7 +42,8 @@ async def list_history_for_employee(db: AsyncSession, employee_id, limit: int = 
 
 
 async def list_by_company(db: AsyncSession, company_id, *, date_=None, date_from=None, date_to=None,
-                           employee_id=None, checked_out=None, status=None) -> List[Attendance]:
+                           employee_id=None, checked_out=None, status=None, department=None,
+                           schedule_id=None, late=None, overtime=None, missing_hours=None) -> List[Attendance]:
     query = select(Attendance).where(Attendance.company_id == company_id)
     if date_from is not None or date_to is not None:
         if date_from is not None:
@@ -57,6 +58,19 @@ async def list_by_company(db: AsyncSession, company_id, *, date_=None, date_from
         query = query.where(Attendance.check_out_time.is_not(None))
     elif status is not None:
         query = query.where(Attendance.status == status)
+    # employee_department is always populated at check-in (unlike the newer
+    # employee_position snapshot, which is null on every pre-existing row) -
+    # safe to filter directly, no fallback-to-live-employee gap to worry about.
+    if department is not None:
+        query = query.where(Attendance.employee_department == department)
+    if schedule_id is not None:
+        query = query.where(Attendance.schedule_id == schedule_id)
+    if late:
+        query = query.where(Attendance.late_minutes > 0)
+    if overtime:
+        query = query.where(Attendance.overtime_minutes > 0)
+    if missing_hours:
+        query = query.where(Attendance.missing_minutes > 0)
     query = query.order_by(Attendance.date.desc(), Attendance.check_in_time.desc())
     result = await db.execute(query)
     return list(result.scalars().all())

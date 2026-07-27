@@ -723,7 +723,7 @@ async def upload_calendar_attachment(db: AsyncSession, current_user: dict, event
     require_calendar_access(current_user)
     event = await get_event_for_edit(db, event_id, current_user)
 
-    decoded = decode_and_validate(data.data, data.filename)
+    decoded = decode_and_validate(data.data, data.filename, data.mime_type)
     storage_path, checksum = upload(decoded, prefix=f"calendar/{event.id}")
 
     attachment = await calendar_attachments_repo.create(

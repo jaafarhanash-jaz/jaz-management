@@ -52,9 +52,16 @@ def classify_attachment_type(mime_type: str) -> str:
     return "other"
 
 
-def decode_and_validate(data: str, filename: str) -> bytes:
+def decode_and_validate(data: str, filename: str, mime_type: str = None) -> bytes:
     if not filename or not data:
         raise HTTPException(status_code=400, detail="Each attachment requires a filename and data")
+    # mime_type is optional so callers with their own tighter allow-list
+    # (profile photo, employee CV) aren't double-validated here - generic
+    # task/message/calendar attachments pass it through and are rejected
+    # if classify_attachment_type can't place them in any known category
+    # (e.g. executables, raw HTML/scripts).
+    if mime_type is not None and classify_attachment_type(mime_type) == "other":
+        raise HTTPException(status_code=400, detail="This file type is not supported")
     raw = data.split(",", 1)[-1] if data.startswith("data:") else data
     try:
         decoded = base64.b64decode(raw, validate=False)

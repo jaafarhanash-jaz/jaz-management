@@ -691,7 +691,7 @@ async def upload_message_attachment(db: AsyncSession, current_user: dict, messag
     if not message or str(message.sender_id) != current_user["id"]:
         raise HTTPException(status_code=404, detail="Message not found")
 
-    decoded = decode_and_validate(data.data, data.filename)
+    decoded = decode_and_validate(data.data, data.filename, data.mime_type)
     storage_path, checksum = upload(decoded, prefix=f"messages/{message.id}")
 
     attachment = await attachments_repo.create(

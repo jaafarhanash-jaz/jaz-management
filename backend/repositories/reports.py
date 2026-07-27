@@ -7,10 +7,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from models import Report
 
 
-async def list_by_company(db: AsyncSession, company_id) -> List[Report]:
-    result = await db.execute(
-        select(Report).where(Report.company_id == company_id).order_by(Report.created_at.desc())
-    )
+async def list_by_company(db: AsyncSession, company_id, limit: int = None, offset: int = None) -> List[Report]:
+    query = select(Report).where(Report.company_id == company_id).order_by(Report.created_at.desc())
+    if limit is not None:
+        query = query.limit(limit).offset(offset or 0)
+    result = await db.execute(query)
     return list(result.scalars().all())
 
 

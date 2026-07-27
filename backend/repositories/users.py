@@ -1,7 +1,7 @@
 import uuid
 from typing import Dict, List, Optional
 
-from sqlalchemy import case, func, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import User
@@ -111,10 +111,12 @@ async def phone_taken(db: AsyncSession, phone: str, exclude_id=None) -> bool:
     return result.scalar_one() > 0
 
 
-async def list_employees_by_company(db: AsyncSession, company_id) -> List[User]:
-    result = await db.execute(
-        select(User).where(User.company_id == company_id, User.role == "employee", User.deleted_at.is_(None))
-    )
+async def list_employees_by_company(db: AsyncSession, company_id, limit: int = None, offset: int = None) -> List[User]:
+    query = select(User).where(User.company_id == company_id, User.role == "employee", User.deleted_at.is_(None))
+    query = query.order_by(User.created_at)
+    if limit is not None:
+        query = query.limit(limit).offset(offset or 0)
+    result = await db.execute(query)
     return list(result.scalars().all())
 
 

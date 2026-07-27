@@ -9,6 +9,7 @@ import repositories.companies as companies_repo
 import repositories.message_reminders as message_reminders_repo
 import repositories.notifications as notifications_repo
 import repositories.users as users_repo
+import services.push as push_service
 import services.realtime as realtime_service
 from services.admin import parse_uuid
 
@@ -85,13 +86,15 @@ async def publish(
 ) -> dict:
     """Create one notification for one user. Every module in the platform
     calls this - never repositories.notifications.create() directly. Also
-    pushes the notification over the realtime channel (see
-    services/realtime.py) for instant delivery to any open SSE connection -
-    the row is the source of truth, the push is a best-effort low-latency
-    shortcut on top of it. Firing before commit is intentional: the payload
-    below is a plain dict, not a lazy ORM handle, so the connected client
-    gets the exact same data whether or not this request's transaction has
-    committed yet."""
+    delivers the notification over two additional, best-effort channels on
+    top of the row (the source of truth):
+      - the realtime SSE channel (services/realtime.py), for instant
+        delivery to any open web connection;
+      - FCM push (services/push.py), for delivery to registered mobile
+        devices, including while the app is backgrounded or killed.
+    Firing before commit is intentional: the payload below is a plain
+    dict, not a lazy ORM handle, so both channels get the exact same data
+    whether or not this request's transaction has committed yet."""
     notification = await notifications_repo.create(
         db,
         user_id=user_id,
@@ -108,6 +111,17 @@ async def publish(
     )
     response = notification_response(notification)
     realtime_service.publish_to_user(str(user_id), response)
+    await push_service.send_push_to_user(
+        db,
+        user_id,
+        title=title,
+        body=message,
+        category=category,
+        type=type,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        action_url=action_url,
+    )
     return response
 
 

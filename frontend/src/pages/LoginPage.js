@@ -28,7 +28,7 @@ const LoginPage = ({ onLogin }) => {
     try {
       const response = await api.post('/auth/login', credentials);
       toast.success(t('successLogin', language));
-      onLogin(response.data.token, response.data.role);
+      onLogin(response.data.token, response.data.refresh_token, response.data.role);
     } catch (err) {
       const detail = err.response?.data?.detail;
       const status = err.response?.status;

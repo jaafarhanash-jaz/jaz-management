@@ -1,20 +1,19 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, Request
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from dateutil.relativedelta import relativedelta
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 import asyncio
 import json
 import os
 import logging
 from pathlib import Path
-from pydantic import BaseModel, Field, ConfigDict, EmailStr, field_validator
+from pydantic import BaseModel, Field, EmailStr, field_validator
 from typing import List, Literal, Optional, Dict, Any
-import uuid
-from datetime import datetime, timezone, timedelta, date
-from passlib.context import CryptContext
-from jose import JWTError, jwt
+from datetime import datetime, timezone
 import qrcode
 from io import BytesIO
 import base64
@@ -30,15 +29,18 @@ import services.auth as auth_service
 import services.calendar as calendar_service
 import services.dashboard as dashboard_service
 import services.departments as departments_service
+import services.devices as devices_service
 import services.employees as employees_service
 import services.heartbeat as heartbeat_service
 import services.messages as messages_service
 import services.notifications as notifications_service
 import services.realtime as realtime_service
 import services.reports as reports_service
+import services.schedule_resolution as schedule_resolution
 import services.seed as seed_service
 import services.subscriptions as subscriptions_service
 import services.tasks as tasks_service
+import services.work_schedules as work_schedules_service
 from services.admin import parse_uuid
 
 ROOT_DIR = Path(__file__).parent
@@ -47,14 +49,54 @@ load_dotenv(ROOT_DIR / '.env')
 ENVIRONMENT = os.environ.get('ENVIRONMENT', 'development')
 
 # Security
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
-SECRET_KEY = os.environ.get('JWT_SECRET_KEY', 'your-secret-key-change-in-production')
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours
 
 # Create the main app
-app = FastAPI()
+# Swagger/ReDoc/OpenAPI schema expose every route, model, and field name in
+# the app (including admin-only endpoints) to anyone who requests them,
+# unauthenticated - reconnaissance value with no offsetting benefit once
+# this is a real deployment rather than a team iterating against local docs.
+_docs_enabled = ENVIRONMENT != "production"
+app = FastAPI(
+    docs_url="/docs" if _docs_enabled else None,
+    redoc_url="/redoc" if _docs_enabled else None,
+    openapi_url="/openapi.json" if _docs_enabled else None,
+)
+
+# Rate limiting - keyed by client IP, applied selectively to
+# brute-force-sensitive endpoints (login) rather than globally.
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# Global request body size cap - nothing enforced this anywhere, so an
+# unauthenticated caller could send an arbitrarily large body to any
+# endpoint (even /auth/login) and force the server to buffer it entirely
+# in memory before validation ever runs, a DoS affecting every tenant.
+# 20MB comfortably covers the largest legitimate payload today (a 10MB
+# attachment, base64-inflated to ~13.3MB, plus JSON overhead).
+MAX_REQUEST_BODY_BYTES = 20 * 1024 * 1024
+
+@app.middleware("http")
+async def limit_request_body_size(request: Request, call_next):
+    content_length = request.headers.get("content-length")
+    if content_length is not None and int(content_length) > MAX_REQUEST_BODY_BYTES:
+        return JSONResponse(status_code=413, content={"detail": "Request body too large"})
+    return await call_next(request)
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    # HSTS only takes effect over a real HTTPS connection - browsers ignore
+    # it over plain HTTP, so it's harmless to always send.
+    response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    # Relevant to /docs, /redoc, and any future HTML this app ever serves -
+    # a pure-JSON response can't itself be clickjacked, but this is
+    # zero-cost defense in depth.
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    return response
 
 api_router = APIRouter(prefix="/api")
 
@@ -175,8 +217,15 @@ class LoginRequest(BaseModel):
 
 class LoginResponse(BaseModel):
     token: str
+    refresh_token: str
     user: Dict[str, Any]
     role: str
+
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str
+
+class LogoutRequest(BaseModel):
+    refresh_token: str
 
 class CvUploadRequest(BaseModel):
     filename: str
@@ -216,6 +265,8 @@ class UserResponse(BaseModel):
     status: str = "active"
     department: Optional[str] = None
     position: Optional[str] = None
+    schedule_id: Optional[str] = None
+    schedule_name: Optional[str] = None
     cv: Optional[Dict[str, Any]] = None
     photo: Optional[Dict[str, Any]] = None
 
@@ -490,6 +541,7 @@ class AttendanceResponse(BaseModel):
     employee_id: str
     employee_name: Optional[str] = None
     employee_department: Optional[str] = None
+    employee_position: Optional[str] = None
     company_id: str
     date: str
     check_in_time: Optional[str] = None
@@ -499,6 +551,14 @@ class AttendanceResponse(BaseModel):
     distance_from_company_meters: Optional[float] = None
     check_out_distance_meters: Optional[float] = None
     working_duration_minutes: Optional[float] = None
+    required_minutes: Optional[float] = None
+    scheduled_break_minutes: Optional[float] = None
+    net_minutes: Optional[float] = None
+    overtime_minutes: Optional[float] = None
+    missing_minutes: Optional[float] = None
+    late_minutes: Optional[float] = None
+    early_arrival_minutes: Optional[float] = None
+    early_leave_minutes: Optional[float] = None
     device_info: Optional[str] = None
     created_at: Optional[str] = None
     status: str
@@ -519,6 +579,33 @@ class AttendanceManualEdit(BaseModel):
     check_in_time: Optional[str] = None
     check_out_time: Optional[str] = None
     status: Optional[str] = None
+
+# ---- Work Schedules ----
+
+class WorkScheduleCreate(BaseModel):
+    name: str
+    start_time: str
+    end_time: str
+    break_start_time: Optional[str] = None
+    break_end_time: Optional[str] = None
+    required_hours: float
+    working_days: List[int]
+    is_default: bool = False
+
+class WorkScheduleUpdate(WorkScheduleCreate):
+    pass
+
+class WorkScheduleResponse(BaseModel):
+    id: str
+    name: str
+    start_time: str
+    end_time: str
+    break_start_time: Optional[str] = None
+    break_end_time: Optional[str] = None
+    required_hours: float
+    working_days: List[int]
+    is_default: bool
+    is_active: bool
 
 class ReportCreate(BaseModel):
     title: str
@@ -574,6 +661,19 @@ class DashboardLayoutRequest(BaseModel):
 
 class DashboardLayoutResponse(BaseModel):
     layout: List[DashboardWidgetLayout]
+
+class DeviceTokenRegister(BaseModel):
+    token: str
+    platform: Literal["ios", "android", "web"]
+    app_version: Optional[str] = None
+
+class DeviceTokenResponse(BaseModel):
+    id: str
+    user_id: str
+    platform: str
+    app_version: Optional[str] = None
+    last_seen_at: str
+    created_at: str
 
 class DepartmentCreate(BaseModel):
     name: str
@@ -742,19 +842,6 @@ class WeeklyHolidayPatternCreate(BaseModel):
 
 # ============ Helper Functions ============
 
-def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
-
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
-
-def create_access_token(data: dict) -> str:
-    to_encode = data.copy()
-    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
-
 def generate_qr_code(data: str) -> str:
     qr = qrcode.QRCode(version=1, box_size=10, border=5)
     qr.add_data(data)
@@ -804,14 +891,44 @@ async def get_current_user(
 # ============ Auth Routes ============
 
 @api_router.post("/auth/login", response_model=LoginResponse)
-async def login(request: LoginRequest, pg: AsyncSession = Depends(get_db)):
+@limiter.limit("60/minute")
+async def login(request: Request, body: LoginRequest, pg: AsyncSession = Depends(get_db)):
     # Postgres-backed (Auth module, migrated). See services/auth.py.
-    result = await auth_service.login(pg, request.email_or_phone, request.password)
+    # `request: Request` (not the login body) is required here - slowapi's
+    # @limiter.limit locates the request object by parameter name "request",
+    # not by type, so the two must not collide.
+    result = await auth_service.login(pg, body.email_or_phone, body.password)
     return LoginResponse(**result)
 
+@api_router.post("/auth/refresh", response_model=LoginResponse)
+@limiter.limit("60/minute")
+async def refresh_access_token(request: Request, body: RefreshTokenRequest, pg: AsyncSession = Depends(get_db)):
+    # No auth dependency - the refresh token itself is the credential here,
+    # and the whole point is to work when the access token has expired.
+    result = await auth_service.rotate_refresh_token(pg, body.refresh_token)
+    return LoginResponse(**result)
+
+@api_router.post("/auth/logout")
+async def logout(body: LogoutRequest, pg: AsyncSession = Depends(get_db)):
+    # No auth dependency either - logout must succeed even if the access
+    # token already expired; the refresh token being revoked is the point.
+    await auth_service.revoke_refresh_token(pg, body.refresh_token)
+    return {"message": "Logged out"}
+
 @api_router.get("/auth/me", response_model=UserResponse)
-async def get_me(current_user: dict = Depends(get_current_user)):
-    return UserResponse(**{k: v for k, v in current_user.items() if k != "password"})
+async def get_me(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    data = {k: v for k, v in current_user.items() if k != "password"}
+    # schedule_name is display-only and resolved fresh on every call (not
+    # cached on the JWT-derived current_user dict) so an owner reassigning
+    # someone's schedule is reflected immediately on their next profile
+    # view, without needing a fresh login.
+    schedule = await schedule_resolution.get_effective_schedule_for_employee(
+        pg,
+        schedule_id=parse_uuid(current_user.get("schedule_id")),
+        company_id=parse_uuid(current_user.get("company_id")),
+    )
+    data["schedule_name"] = schedule.name if schedule else None
+    return UserResponse(**data)
 
 @api_router.post("/heartbeat")
 async def heartbeat(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
@@ -902,6 +1019,13 @@ async def delete_subscription_plan(plan_id: str, current_user: dict = Depends(ge
     require_super_admin(current_user)
     return await admin_service.delete_plan(pg, plan_id)
 
+@api_router.get("/admin/users/{user_id}/devices", response_model=List[DeviceTokenResponse])
+async def list_user_devices(user_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    """Support/debugging view - lets a super_admin confirm whether a
+    given user has any live push registrations."""
+    require_super_admin(current_user)
+    return await devices_service.list_devices_for_user(pg, user_id)
+
 # ============ Company Owner Routes ============
 
 @api_router.get("/owner/dashboard")
@@ -918,10 +1042,19 @@ async def get_owner_analytics(current_user: dict = Depends(get_current_user), pg
     return await dashboard_service.get_owner_analytics(pg, current_user)
 
 @api_router.get("/owner/employees", response_model=List[UserResponse])
-async def get_employees(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+async def get_employees(
+    current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db),
+    page: Optional[int] = None, page_size: Optional[int] = None,
+):
+    # page/page_size are opt-in - omitting them preserves the pre-existing
+    # "return everything" behavior existing clients rely on. Passing them
+    # slices the same array response (no shape change), for callers ready
+    # to page through a large company's employee list.
     if current_user["role"] != UserRole.COMPANY_OWNER:
         raise HTTPException(status_code=403, detail="Access denied")
-    return await employees_service.list_employees(pg, current_user["company_id"])
+    limit = page_size if page is not None and page_size is not None else None
+    offset = (page - 1) * page_size if limit is not None else None
+    return await employees_service.list_employees(pg, current_user["company_id"], limit=limit, offset=offset)
 
 @api_router.post("/owner/employees", response_model=UserResponse)
 async def create_employee(employee: UserCreate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
@@ -964,10 +1097,16 @@ async def delete_employee_cv(employee_id: str, current_user: dict = Depends(get_
     return await employees_service.delete_employee_cv(pg, current_user["company_id"], employee_id)
 
 @api_router.get("/owner/tasks", response_model=List[TaskResponse])
-async def get_tasks(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+async def get_tasks(
+    current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db),
+    page: Optional[int] = None, page_size: Optional[int] = None,
+):
+    # page/page_size are opt-in - see get_employees above for the rationale.
     if current_user["role"] != UserRole.COMPANY_OWNER:
         raise HTTPException(status_code=403, detail="Access denied")
-    return await tasks_service.list_tasks_for_owner(pg, current_user["company_id"])
+    limit = page_size if page is not None and page_size is not None else None
+    offset = (page - 1) * page_size if limit is not None else None
+    return await tasks_service.list_tasks_for_owner(pg, current_user["company_id"], limit=limit, offset=offset)
 
 @api_router.get("/owner/tasks/history", response_model=List[TaskResponse])
 async def get_task_history(
@@ -1080,14 +1219,22 @@ async def get_attendance(
     date_to: Optional[str] = None,
     employee_id: Optional[str] = None,
     department: Optional[str] = None,
+    position: Optional[str] = None,
     status: Optional[str] = None,
     search: Optional[str] = None,
+    schedule_id: Optional[str] = None,
+    late: Optional[bool] = None,
+    overtime: Optional[bool] = None,
+    missing_hours: Optional[bool] = None,
+    range: Optional[str] = None,
 ):
     if current_user["role"] != UserRole.COMPANY_OWNER:
         raise HTTPException(status_code=403, detail="Access denied")
     return await attendance_service.list_attendance_for_owner(
         pg, current_user["company_id"], date=date, date_from=date_from, date_to=date_to,
-        employee_id=employee_id, department=department, status=status, search=search,
+        employee_id=employee_id, department=department, position=position, status=status,
+        search=search, schedule_id=schedule_id, late=late, overtime=overtime,
+        missing_hours=missing_hours, range_=range,
     )
 
 @api_router.get("/owner/attendance/settings")
@@ -1105,6 +1252,12 @@ async def update_attendance_settings(updates: AttendanceSettingsUpdate, current_
         raise HTTPException(status_code=403, detail="Access denied")
     return await attendance_service.update_attendance_settings(pg, current_user, updates)
 
+@api_router.post("/owner/attendance/qr/regenerate")
+async def regenerate_attendance_qr(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await attendance_service.regenerate_qr_token(pg, current_user)
+
 @api_router.get("/owner/attendance/analytics")
 async def get_attendance_analytics(
     current_user: dict = Depends(get_current_user),
@@ -1115,6 +1268,21 @@ async def get_attendance_analytics(
     if current_user["role"] != UserRole.COMPANY_OWNER:
         raise HTTPException(status_code=403, detail="Access denied")
     return await attendance_service.get_attendance_analytics(pg, current_user["company_id"], date_from, date_to)
+
+@api_router.get("/owner/attendance/employees/{employee_id}/stats")
+async def get_employee_attendance_stats(
+    employee_id: str,
+    range: str = "today",
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    current_user: dict = Depends(get_current_user),
+    pg: AsyncSession = Depends(get_db),
+):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await attendance_service.get_employee_attendance_stats(
+        pg, current_user["company_id"], employee_id, range, date_from, date_to,
+    )
 
 @api_router.patch("/owner/attendance/{attendance_id}")
 async def edit_attendance(attendance_id: str, updates: AttendanceManualEdit, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
@@ -1131,17 +1299,76 @@ async def get_attendance_audit_log(current_user: dict = Depends(get_current_user
         raise HTTPException(status_code=403, detail="Access denied")
     return await attendance_service.get_attendance_audit_log(pg, parse_uuid(current_user["company_id"]))
 
-@api_router.get("/owner/reports", response_model=List[ReportResponse])
-async def get_reports(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+@api_router.get("/owner/attendance/{attendance_id}/events")
+async def get_attendance_events(attendance_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    """Attendance Events audit trail (every QR-scan attempt, success and
+    failure) for one Attendance record - for owner troubleshooting, never
+    a replacement for the Attendance record itself."""
     if current_user["role"] != UserRole.COMPANY_OWNER:
         raise HTTPException(status_code=403, detail="Access denied")
-    return await reports_service.list_reports_for_owner(pg, current_user["company_id"])
+    return await attendance_service.get_attendance_events(pg, current_user["company_id"], attendance_id)
+
+# ---- Work Schedules ----
+
+@api_router.get("/owner/work-schedules", response_model=List[WorkScheduleResponse])
+async def list_work_schedules(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await work_schedules_service.list_schedules(pg, current_user)
+
+@api_router.post("/owner/work-schedules", response_model=WorkScheduleResponse)
+async def create_work_schedule(data: WorkScheduleCreate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await work_schedules_service.create_schedule(pg, current_user, data)
+
+@api_router.put("/owner/work-schedules/{schedule_id}", response_model=WorkScheduleResponse)
+async def update_work_schedule(schedule_id: str, data: WorkScheduleUpdate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await work_schedules_service.update_schedule(pg, current_user, schedule_id, data)
+
+@api_router.post("/owner/work-schedules/{schedule_id}/deactivate")
+async def deactivate_work_schedule(schedule_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await work_schedules_service.deactivate_schedule(pg, current_user, schedule_id)
+
+@api_router.post("/owner/work-schedules/{schedule_id}/reactivate")
+async def reactivate_work_schedule(schedule_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await work_schedules_service.reactivate_schedule(pg, current_user, schedule_id)
+
+@api_router.post("/owner/work-schedules/{schedule_id}/set-default")
+async def set_default_work_schedule(schedule_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await work_schedules_service.set_default_schedule(pg, current_user, schedule_id)
+
+@api_router.get("/owner/reports", response_model=List[ReportResponse])
+async def get_reports(
+    current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db),
+    page: Optional[int] = None, page_size: Optional[int] = None,
+):
+    # page/page_size are opt-in - see get_employees above for the rationale.
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    limit = page_size if page is not None and page_size is not None else None
+    offset = (page - 1) * page_size if limit is not None else None
+    return await reports_service.list_reports_for_owner(pg, current_user["company_id"], limit=limit, offset=offset)
 
 @api_router.get("/owner/departments", response_model=List[DepartmentResponse])
-async def get_departments(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+async def get_departments(
+    current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db),
+    page: Optional[int] = None, page_size: Optional[int] = None,
+):
+    # page/page_size are opt-in - see get_employees above for the rationale.
     if current_user["role"] != UserRole.COMPANY_OWNER:
         raise HTTPException(status_code=403, detail="Access denied")
-    return await departments_service.list_departments(pg, current_user["company_id"])
+    limit = page_size if page is not None and page_size is not None else None
+    offset = (page - 1) * page_size if limit is not None else None
+    return await departments_service.list_departments(pg, current_user["company_id"], limit=limit, offset=offset)
 
 @api_router.post("/owner/departments", response_model=DepartmentResponse)
 async def create_department(department: DepartmentCreate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
@@ -1252,7 +1479,12 @@ async def delete_own_photo(current_user: dict = Depends(get_current_user), pg: A
     return await auth_service.delete_own_photo(pg, current_user["id"])
 
 @api_router.put("/profile/password")
-async def change_own_password(body: ChangePasswordRequest, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+@limiter.limit("10/minute")
+async def change_own_password(request: Request, body: ChangePasswordRequest, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    # Without this, a stolen/leaked access token gives an attacker an
+    # unlimited-attempt oracle on the account's current password (the
+    # 400 "Current password is incorrect" response confirms/denies each
+    # guess) for as long as that token stays valid.
     return await auth_service.change_password(pg, current_user["id"], body.current_password, body.new_password)
 
 # ============ Common Routes ============
@@ -1314,6 +1546,28 @@ async def get_dashboard_layout(current_user: dict = Depends(get_current_user), p
 @api_router.put("/dashboard/layout", response_model=DashboardLayoutResponse)
 async def save_dashboard_layout(body: DashboardLayoutRequest, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     return await dashboard_service.save_dashboard_layout(pg, current_user, [w.model_dump() for w in body.layout])
+
+@api_router.post("/devices", response_model=DeviceTokenResponse)
+async def register_device(body: DeviceTokenRegister, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    """Register or refresh a push-notification device token for the
+    authenticated user. Idempotent - calling this again with the same
+    token (e.g. on every app foreground, or when FCM/APNs rotates the
+    token) is exactly how a client keeps its registration alive; there is
+    no separate "refresh" endpoint. `user_id` always comes from the
+    session, never from the body - a token can only ever be registered
+    against the account that presents it."""
+    return await devices_service.register_device(pg, current_user, body)
+
+@api_router.get("/devices", response_model=List[DeviceTokenResponse])
+async def list_own_devices(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await devices_service.list_own_devices(pg, current_user)
+
+@api_router.delete("/devices")
+async def unregister_device(token: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    """Called on logout so a signed-out device stops receiving push for
+    the account it just left. Scoped to the caller's own tokens - see
+    services/devices.py."""
+    return await devices_service.unregister_device(pg, current_user, token)
 
 # ============ Announcements ============
 
@@ -1702,7 +1956,7 @@ async def create_checkout(req: CheckoutRequest, request: Request, current_user: 
 @api_router.get("/payments/status/{session_id}")
 async def check_payment_status(session_id: str, request: Request, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     host_url = str(request.base_url).rstrip("/")
-    return await subscriptions_service.check_payment_status(pg, session_id, host_url)
+    return await subscriptions_service.check_payment_status(pg, current_user, session_id, host_url)
 
 @api_router.post("/webhook/stripe")
 async def stripe_webhook(request: Request, pg: AsyncSession = Depends(get_db)):
@@ -1724,10 +1978,17 @@ async def get_owner_subscription(current_user: dict = Depends(get_current_user),
 # Include router
 app.include_router(api_router)
 
+_cors_origins_env = os.environ.get('CORS_ORIGINS')
+if ENVIRONMENT == 'production' and not _cors_origins_env:
+    raise RuntimeError(
+        "CORS_ORIGINS must be explicitly set in production - refusing to "
+        "default to '*' (all origins) with credentials allowed."
+    )
+
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_origins=_cors_origins_env.split(',') if _cors_origins_env else ['*'],
     allow_methods=["*"],
     allow_headers=["*"],
 )
