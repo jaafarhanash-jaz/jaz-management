@@ -35,6 +35,9 @@ dist
 .env.*
 */.env
 */.env.*
+# ...but templates with no real secrets must still be committed.
+!.env.example
+!*/.env.example
 
 *token.json*
 *credentials.json*

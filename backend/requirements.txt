@@ -23,7 +23,10 @@ distro==1.9.0
 dnspython==2.8.0
 ecdsa==0.19.2
 email-validator==2.3.0
-emergentintegrations==0.2.0
+# emergentintegrations is not on public PyPI (Emergent-platform only) - a
+# functionally-equivalent stand-in is vendored directly at
+# backend/emergentintegrations/ instead of installed here. See that
+# package's own header comment and PROJECT_HANDOVER.md §9.
 execnet==2.1.2
 fastapi==0.110.1
 fastuuid==0.14.0
