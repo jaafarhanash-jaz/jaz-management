@@ -43,5 +43,11 @@ COPY nginx.conf /etc/nginx/conf.d/default.conf
 
 EXPOSE 80
 
+# 127.0.0.1, not localhost: verified directly on production that this
+# image's musl libc (Alpine) resolves "localhost" to ::1 first, and nginx
+# (plain `listen 80;`, IPv4 only) refuses that connection - the healthcheck
+# was failing every single check (FailingStreak in the thousands) with
+# "Connection refused" even though real traffic, which reaches nginx over
+# IPv4 via Docker's port publishing, was served correctly the whole time.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD wget -q -O /dev/null http://localhost/ || exit 1
+    CMD wget -q -O /dev/null http://127.0.0.1/ || exit 1
