@@ -182,11 +182,12 @@ async def resolve_subscription_status(db: AsyncSession, company) -> str:
     return company.subscription_status
 
 
-async def enforce_company_access(db: AsyncSession, user_dict: dict) -> None:
+async def enforce_company_access(db: AsyncSession, user_dict: dict, *, company=None) -> None:
     company_id = user_dict.get("company_id")
     if not company_id:
         return
-    company = await companies_repo.get_by_id(db, company_id)
+    if company is None:
+        company = await companies_repo.get_by_id(db, company_id)
     if not company:
         return
     effective_status = await resolve_subscription_status(db, company)
@@ -228,12 +229,18 @@ async def get_current_user(db: AsyncSession, token: str) -> dict:
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    user = await users_repo.get_by_id(db, user_id)
+    user, company = await users_repo.get_by_id_with_company(db, user_id)
     if user is None:
         raise HTTPException(status_code=401, detail="User not found")
 
     user_dict = user_to_dict(user)
-    await enforce_company_access(db, user_dict)
+    # This dependency runs on every single authenticated request in the
+    # app - one combined query here instead of two sequential ones
+    # (get_by_id, then companies_repo.get_by_id inside
+    # enforce_company_access) halves the fixed per-request DB round-trip
+    # cost, which is dominated by network RTT to Supabase, not query
+    # complexity.
+    await enforce_company_access(db, user_dict, company=company)
     return user_dict
 
 

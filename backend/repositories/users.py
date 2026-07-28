@@ -1,15 +1,35 @@
 import uuid
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models import User
+from models import Company, User
 
 
 async def get_by_id(db: AsyncSession, user_id) -> Optional[User]:
     result = await db.execute(select(User).where(User.id == user_id, User.deleted_at.is_(None)))
     return result.scalar_one_or_none()
+
+
+async def get_by_id_with_company(db: AsyncSession, user_id) -> Tuple[Optional[User], Optional[Company]]:
+    """Single round trip for what get_current_user needs on every request:
+    the user row plus their company row (LEFT JOIN - company_id is NULL for
+    super_admin). Replaces two sequential queries (get_by_id, then
+    companies_repo.get_by_id inside enforce_company_access) with one -
+    meaningful specifically because every network round trip to this
+    database costs a fixed ~260ms (measured: VPS in Frankfurt, DB in
+    Supabase's ap-southeast-1/Singapore), paid on every single authenticated
+    request regardless of query complexity."""
+    result = await db.execute(
+        select(User, Company)
+        .outerjoin(Company, User.company_id == Company.id)
+        .where(User.id == user_id, User.deleted_at.is_(None))
+    )
+    row = result.first()
+    if row is None:
+        return None, None
+    return row[0], row[1]
 
 
 async def get_by_email_or_phone(db: AsyncSession, identifier: str) -> Optional[User]:
