@@ -157,7 +157,7 @@ async def get_statistics(db: AsyncSession) -> dict:
     # counted here (grouped per non-deleted company, already computed by
     # _presence_by_company above) is exactly the set count_employees()'s
     # own `deleted_at IS NULL` filter would return.
-    total_employees = sum(s["employee_count"] for s in presence_map.values())
+    total_employees = sum(s["_employee_count"] for s in presence_map.values())
 
     today = datetime.now(timezone.utc).date()
     soon_cutoff = today + timedelta(days=EXPIRING_SOON_DAYS)
