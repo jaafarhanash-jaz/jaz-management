@@ -44,10 +44,20 @@ def do_run_migrations(connection):
 
 
 async def run_migrations_online() -> None:
+    # connect_args=statement_cache_size:0 - same PgBouncer-compatibility fix
+    # as backend/database.py's main app engine (see that file's comment for
+    # the full explanation), missing here until now. Reproduced live on the
+    # VPS: this engine's own dialect-detection query (`select
+    # pg_catalog.version()`, issued automatically by SQLAlchemy on first
+    # connect) hit DuplicatePreparedStatementError on container startup,
+    # exhausting the entrypoint's retry budget on an unlucky attempt and
+    # crash-looping the whole container - not a hypothetical risk, an
+    # actual production incident.
     connectable = async_engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
+        connect_args={"statement_cache_size": 0},
     )
     async with connectable.connect() as connection:
         await connection.run_sync(do_run_migrations)
