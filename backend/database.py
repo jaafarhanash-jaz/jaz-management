@@ -31,9 +31,20 @@ DATABASE_URL = os.environ['DATABASE_URL']
 # queue) pool, sized well under Supabase's pooler connection limit for a
 # single backend container, with a recycle so a connection the pooler has
 # silently dropped gets replaced instead of erroring.
+#
+# pool_pre_ping=False (TEMPORARY EXPERIMENT, see git log): measured directly
+# in production with SQLAlchemy engine events that pool_pre_ping's own
+# liveness-check query was costing ~1037ms on every single checkout - over
+# half of the ~1.8s total per-request DB cost - because it pays the same
+# round-trip cost as any other query here (statement_cache_size=0 doubles
+# each query's round trips). pool_recycle=300 is the remaining defense
+# against a connection the pooler has silently dropped; if that turns out
+# to be insufficient (connection-reset/stale-connection errors start
+# appearing), pre-ping must go back on and pool_recycle should be lowered
+# instead, not the other way around.
 engine = create_async_engine(
     DATABASE_URL,
-    pool_pre_ping=True,
+    pool_pre_ping=False,
     pool_size=5,
     max_overflow=5,
     pool_recycle=300,
