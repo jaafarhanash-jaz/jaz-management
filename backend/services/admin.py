@@ -97,20 +97,43 @@ def company_to_response(company, *, employee_count: int = 0, owner=None, presenc
 
 
 async def _presence_by_company(db: AsyncSession, companies) -> dict:
-    """Batched presence for a set of companies: one employee GROUP BY + one
-    owner lookup, replacing the old per-company find loops."""
+    """Batched presence for a set of companies - one query for every owner
+    and employee across all of them (previously two: an employee-only
+    GROUP BY aggregate, and a separate owner lookup), with the aggregation
+    done here in Python instead of in a second round trip. Company sizes in
+    this app are small (tens to low hundreds of employees per company), so
+    transferring raw rows once is cheaper than a second network round trip
+    to Supabase, whose cost is dominated by cross-region latency, not by
+    data volume."""
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(seconds=PRESENCE_TIMEOUT_SECONDS)
     company_ids = [c.id for c in companies]
-    stats = await users_repo.employee_stats_by_company(db, company_ids, cutoff)
-    owners = await users_repo.get_by_ids(db, [c.owner_id for c in companies])
+    users = await users_repo.list_owners_and_employees_by_company_ids(db, company_ids)
+
+    owners_by_company_id = {}
+    stats_by_company_id = {}
+    for u in users:
+        cid = str(u.company_id)
+        if u.role == "employee":
+            s = stats_by_company_id.setdefault(cid, {"employee_count": 0, "employees_online": 0, "max_last_seen": None})
+            s["employee_count"] += 1
+            if u.last_seen_at and u.last_seen_at >= cutoff:
+                s["employees_online"] += 1
+            if u.last_seen_at and (s["max_last_seen"] is None or u.last_seen_at > s["max_last_seen"]):
+                s["max_last_seen"] = u.last_seen_at
+        elif cid not in owners_by_company_id:
+            # An owner's own company_id always equals the company they own
+            # (set once at creation, never reassigned elsewhere) - so this
+            # is exactly the same row the old get_by_ids(company.owner_id)
+            # lookup would have found.
+            owners_by_company_id[cid] = u
 
     presence = {}
     for company in companies:
-        owner = owners.get(str(company.owner_id))
+        owner = owners_by_company_id.get(str(company.id))
         owner_last_seen = owner.last_seen_at if owner else None
         owner_online = bool(owner_last_seen and owner_last_seen >= cutoff)
-        company_stats = stats.get(str(company.id), {})
+        company_stats = stats_by_company_id.get(str(company.id), {})
         employees_online = company_stats.get("employees_online", 0)
         last_seens = [ls for ls in (owner_last_seen, company_stats.get("max_last_seen")) if ls]
         presence[str(company.id)] = {
@@ -127,8 +150,14 @@ async def _presence_by_company(db: AsyncSession, companies) -> dict:
 async def get_statistics(db: AsyncSession) -> dict:
     companies = await companies_repo.list_all(db)
     total_companies = len(companies)
-    total_employees = await users_repo.count_employees(db)
     presence_map = await _presence_by_company(db, companies)
+    # Same result as a separate global count_employees() query, without the
+    # extra round trip: soft-deleting a company cascades deleted_at to its
+    # own users (see delete_company/soft_delete_cascade), so every employee
+    # counted here (grouped per non-deleted company, already computed by
+    # _presence_by_company above) is exactly the set count_employees()'s
+    # own `deleted_at IS NULL` filter would return.
+    total_employees = sum(s["employee_count"] for s in presence_map.values())
 
     today = datetime.now(timezone.utc).date()
     soon_cutoff = today + timedelta(days=EXPIRING_SOON_DAYS)

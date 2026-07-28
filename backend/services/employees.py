@@ -71,19 +71,12 @@ def user_response(user, *, schedule_name: Optional[str] = None) -> dict:
 
 
 async def list_employees(db: AsyncSession, company_id, limit: int = None, offset: int = None) -> List[dict]:
-    employees = await users_repo.list_employees_by_company(db, company_id, limit=limit, offset=offset)
-    # One query for all of the company's schedules instead of N+1 lookups
-    # per employee.
-    schedules = await work_schedules_repo.list_by_company(db, company_id)
-    schedule_names_by_id = {s.id: s.name for s in schedules}
-    default_schedule = next((s for s in schedules if s.is_default), None)
-
-    def _effective_name(employee) -> Optional[str]:
-        if employee.schedule_id:
-            return schedule_names_by_id.get(employee.schedule_id)
-        return default_schedule.name if default_schedule else None
-
-    return [user_response(e, schedule_name=_effective_name(e)) for e in employees]
+    # One query (employees LEFT JOINed to their own schedule and,
+    # separately, the company's default schedule) instead of two (employee
+    # list, then every company schedule, joined in Python) - same
+    # own-schedule-else-company-default fallback as before.
+    rows = await users_repo.list_employees_with_schedule_names(db, company_id, limit=limit, offset=offset)
+    return [user_response(e, schedule_name=schedule_name) for e, schedule_name in rows]
 
 
 async def _store_cv(db: AsyncSession, employee, uploaded_by, cv_data) -> None:

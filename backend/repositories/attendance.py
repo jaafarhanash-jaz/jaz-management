@@ -1,10 +1,10 @@
 import uuid
 from typing import List, Optional
 
-from sqlalchemy import select
+from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models import Attendance
+from models import Attendance, User
 
 
 async def get_for_employee_on_date(db: AsyncSession, employee_id, date_) -> Optional[Attendance]:
@@ -12,6 +12,28 @@ async def get_for_employee_on_date(db: AsyncSession, employee_id, date_) -> Opti
         select(Attendance).where(Attendance.employee_id == employee_id, Attendance.date == date_)
     )
     return result.scalar_one_or_none()
+
+
+async def list_company_employees_with_attendance_on(db: AsyncSession, company_id, date_) -> List[tuple]:
+    """(User, Attendance | None) per current employee - one query replacing
+    the owner dashboard's previous two (employee list, then today's
+    attendance rows filtered against that list in Python). LEFT JOIN so an
+    employee with no check-in today still appears, with a None Attendance
+    side - same as the old "not in today_rows" case. If an employee somehow
+    has more than one attendance row for this date (no unique constraint
+    prevents it - a stray duplicate check-in), they appear once per row
+    here too; the caller must keep using the same last-one-wins dict
+    assignment the old code used, not sum/count logic, to stay
+    behaviorally identical."""
+    result = await db.execute(
+        select(User, Attendance)
+        .outerjoin(
+            Attendance,
+            and_(Attendance.employee_id == User.id, Attendance.company_id == company_id, Attendance.date == date_),
+        )
+        .where(User.company_id == company_id, User.role == "employee", User.deleted_at.is_(None))
+    )
+    return result.all()
 
 
 async def get_in_company(db: AsyncSession, attendance_id, company_id) -> Optional[Attendance]:

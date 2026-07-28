@@ -241,6 +241,16 @@ async def get_current_user(db: AsyncSession, token: str) -> dict:
     # cost, which is dominated by network RTT to Supabase, not query
     # complexity.
     await enforce_company_access(db, user_dict, company=company)
+    # Internal-only (leading underscore, not part of any response model) -
+    # lets deliver_subscription_expiry_warning (called on every
+    # /notifications and /notifications/unread-count request) reuse this
+    # same-request company fetch instead of re-querying the identical row
+    # a moment later. Contemporaneous with what that function would have
+    # fetched itself - nothing writes to a company's subscription fields
+    # between here and there in this request's lifecycle.
+    if company is not None:
+        user_dict["_company_subscription_status"] = company.subscription_status
+        user_dict["_company_subscription_end_date"] = company.subscription_end_date
     return user_dict
 
 

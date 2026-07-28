@@ -5,7 +5,6 @@ from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import repositories.calendar_event_reminders as calendar_reminders_repo
-import repositories.companies as companies_repo
 import repositories.message_reminders as message_reminders_repo
 import repositories.notifications as notifications_repo
 import repositories.users as users_repo
@@ -215,13 +214,18 @@ async def deliver_subscription_expiry_warning(db: AsyncSession, current_user: di
     of the warning window."""
     if current_user["role"] != "company_owner" or not current_user.get("company_id"):
         return
-    company_id = parse_uuid(current_user["company_id"])
-    company = await companies_repo.get_by_id(db, company_id)
-    if not company or not company.subscription_end_date or company.subscription_status != "active":
+    # Reuses the company row the auth dependency already fetched this same
+    # request (see get_current_user) instead of re-querying it here -
+    # covers the "company not found" case too, since that dependency only
+    # sets these when its own company lookup succeeded.
+    subscription_end_date = current_user.get("_company_subscription_end_date")
+    subscription_status = current_user.get("_company_subscription_status")
+    if not subscription_end_date or subscription_status != "active":
         return
+    company_id = parse_uuid(current_user["company_id"])
 
     now = datetime.now(timezone.utc)
-    days_remaining = (company.subscription_end_date - now).total_seconds() / 86400
+    days_remaining = (subscription_end_date - now).total_seconds() / 86400
     if days_remaining < 0 or days_remaining > SUBSCRIPTION_EXPIRING_SOON_DAYS:
         return
 

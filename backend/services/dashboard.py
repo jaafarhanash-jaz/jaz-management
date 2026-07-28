@@ -94,23 +94,26 @@ async def get_owner_dashboard(db: AsyncSession, current_user: dict) -> dict:
     # Scope attendance stats to CURRENT employees only, deduped per employee -
     # counting raw attendance rows would let orphaned rows (from deleted
     # employees) or a stray duplicate same-day check-in inflate the counts.
-    employees = await users_repo.list_employees_by_company(db, company_id)
-    employee_ids = {e.id for e in employees}
+    # One LEFT JOIN query (employees, each with today's attendance row if any)
+    # instead of two separate ones - the join's own filter on User already
+    # excludes any attendance row that isn't attached to a current employee,
+    # so the old manual "not in employee_ids" guard is no longer needed.
+    employee_attendance_rows = await attendance_repo.list_company_employees_with_attendance_on(db, company_id, today)
+    employee_ids = {u.id for u, _row in employee_attendance_rows}
     total_employees = len(employee_ids)
 
-    today_rows = await attendance_repo.list_by_company(db, company_id, date_=today)
     status_by_employee = {}
     checked_in_ids = set()
     checked_out_ids = set()
     total_overtime_minutes_today = 0.0
-    for row in today_rows:
-        if row.employee_id not in employee_ids:
+    for user, row in employee_attendance_rows:
+        if row is None:
             continue
-        status_by_employee[row.employee_id] = row.status
+        status_by_employee[user.id] = row.status
         if row.check_in_time:
-            checked_in_ids.add(row.employee_id)
+            checked_in_ids.add(user.id)
         if row.check_out_time:
-            checked_out_ids.add(row.employee_id)
+            checked_out_ids.add(user.id)
         total_overtime_minutes_today += row.overtime_minutes or 0
 
     present_today = sum(1 for s in status_by_employee.values() if s == "present")

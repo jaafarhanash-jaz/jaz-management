@@ -1,10 +1,11 @@
 import uuid
 from typing import Dict, List, Optional, Tuple
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
-from models import Company, User
+from models import Company, User, WorkSchedule
 
 
 async def get_by_id(db: AsyncSession, user_id) -> Optional[User]:
@@ -78,41 +79,19 @@ async def get_by_ids(db: AsyncSession, user_ids) -> Dict[str, User]:
     return {str(u.id): u for u in result.scalars().all()}
 
 
-async def count_employees(db: AsyncSession) -> int:
-    result = await db.execute(
-        select(func.count()).select_from(User).where(User.role == "employee", User.deleted_at.is_(None))
-    )
-    return result.scalar_one()
-
-
-async def employee_stats_by_company(db: AsyncSession, company_ids, online_cutoff) -> dict:
-    """One GROUP BY replacing the old per-company count_documents + per-user
-    presence loop: employee count, employees currently online (last_seen_at
-    within the presence window), and the most recent last_seen, per company."""
+async def list_owners_and_employees_by_company_ids(db: AsyncSession, company_ids) -> List[User]:
+    """One query covering both halves of company presence (previously two:
+    an employee-only GROUP BY aggregate, and a separate owner get_by_ids) -
+    owner accounts have their own company_id set to the company they own
+    (set once at creation, never reassigned - see create_company), so a
+    plain company_id-scoped fetch already contains both roles. Aggregation
+    and the owner lookup are done in the caller from this one result set."""
     if not company_ids:
-        return {}
+        return []
     result = await db.execute(
-        select(
-            User.company_id,
-            func.count().label("employee_count"),
-            func.count().filter(User.last_seen_at >= online_cutoff).label("employees_online"),
-            func.max(User.last_seen_at).label("max_last_seen"),
-        )
-        .where(
-            User.company_id.in_(list(company_ids)),
-            User.role == "employee",
-            User.deleted_at.is_(None),
-        )
-        .group_by(User.company_id)
+        select(User).where(User.company_id.in_(list(company_ids)), User.deleted_at.is_(None))
     )
-    return {
-        str(row.company_id): {
-            "employee_count": row.employee_count,
-            "employees_online": row.employees_online,
-            "max_last_seen": row.max_last_seen,
-        }
-        for row in result.all()
-    }
+    return list(result.scalars().all())
 
 
 async def email_taken(db: AsyncSession, email: str, exclude_id=None) -> bool:
@@ -138,6 +117,34 @@ async def list_employees_by_company(db: AsyncSession, company_id, limit: int = N
         query = query.limit(limit).offset(offset or 0)
     result = await db.execute(query)
     return list(result.scalars().all())
+
+
+async def list_employees_with_schedule_names(db: AsyncSession, company_id, limit: int = None, offset: int = None) -> List[tuple]:
+    """(User, effective_schedule_name) - one query replacing the employees
+    list endpoint's previous two (employees, then all of the company's
+    work schedules, joined in Python). Two LEFT JOINs to the same table:
+    the employee's own schedule if they have one, and separately the
+    company's default schedule, COALESCEd together - the DB enforces at
+    most one default per company (partial unique on (company_id,
+    is_default), see WorkSchedule), so the second join can never multiply
+    rows. This is exactly the old _effective_name fallback: own schedule's
+    name if assigned, else the company default's name, else null."""
+    own_schedule = aliased(WorkSchedule)
+    default_schedule = aliased(WorkSchedule)
+    query = (
+        select(User, func.coalesce(own_schedule.name, default_schedule.name).label("schedule_name"))
+        .outerjoin(own_schedule, User.schedule_id == own_schedule.id)
+        .outerjoin(
+            default_schedule,
+            and_(default_schedule.company_id == company_id, default_schedule.is_default.is_(True)),
+        )
+        .where(User.company_id == company_id, User.role == "employee", User.deleted_at.is_(None))
+        .order_by(User.created_at)
+    )
+    if limit is not None:
+        query = query.limit(limit).offset(offset or 0)
+    result = await db.execute(query)
+    return result.all()
 
 
 async def count_employees_by_company(db: AsyncSession, company_id) -> int:
