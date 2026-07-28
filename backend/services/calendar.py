@@ -724,7 +724,7 @@ async def upload_calendar_attachment(db: AsyncSession, current_user: dict, event
     event = await get_event_for_edit(db, event_id, current_user)
 
     decoded = decode_and_validate(data.data, data.filename, data.mime_type)
-    storage_path, checksum = upload(decoded, prefix=f"calendar/{event.id}")
+    storage_path, checksum = await upload(decoded, prefix=f"calendar/{event.id}")
 
     attachment = await calendar_attachments_repo.create(
         db, event_id=event.id, company_id=event.company_id, storage_path=storage_path,
@@ -754,7 +754,7 @@ async def get_calendar_attachment(db: AsyncSession, current_user: dict, attachme
         "filename": attachment.original_filename, "mime_type": attachment.mime_type,
         "attachment_type": attachment.attachment_type, "size_bytes": attachment.file_size,
         "uploaded_at": _iso(attachment.uploaded_at),
-        "data": f"data:{attachment.mime_type};base64,{download_base64(attachment.storage_path)}",
+        "data": f"data:{attachment.mime_type};base64,{await download_base64(attachment.storage_path)}",
     }
 
 
@@ -942,9 +942,21 @@ async def compute_calendar_dashboard_widgets(db: AsyncSession, current_user: dic
             db, company_id, today_start.date(), week_end.date(), event_ids=my_event_ids,
         ) if my_event_ids else []
 
+    # One query for every candidate event's exceptions instead of
+    # expand_event_occurrences issuing its own per-event query in the loop
+    # below - this runs on every dashboard load (owner and employee), so an
+    # upcoming-week window with N events previously cost N round trips here
+    # alone.
+    exceptions_by_event: dict = {}
+    if candidates:
+        all_exceptions = await calendar_exceptions_repo.list_for_events(db, [e.id for e in candidates])
+        for exc in all_exceptions:
+            exceptions_by_event.setdefault(exc.event_id, []).append(exc)
+
     occurrences = []
     for event in candidates:
-        for occ in await expand_event_occurrences(db, event, today_start, week_end):
+        event_exceptions = exceptions_by_event.get(event.id, [])
+        for occ in await expand_event_occurrences(db, event, today_start, week_end, exceptions=event_exceptions):
             occurrences.append({**occ, "start": datetime.fromisoformat(occ["occurrence_start"])})
     occurrences.sort(key=lambda o: o["start"])
 

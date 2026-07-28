@@ -3,6 +3,7 @@ import hashlib
 import os
 import uuid
 
+import anyio
 import boto3
 from botocore.client import Config
 from fastapi import HTTPException
@@ -72,22 +73,39 @@ def decode_and_validate(data: str, filename: str, mime_type: str = None) -> byte
     return decoded
 
 
-def upload(decoded: bytes, *, prefix: str) -> tuple:
+def _put_object_sync(storage_path: str, decoded: bytes) -> None:
+    _get_client().put_object(Bucket=_bucket(), Key=storage_path, Body=decoded)
+
+
+def _get_object_sync(storage_path: str) -> bytes:
+    obj = _get_client().get_object(Bucket=_bucket(), Key=storage_path)
+    return obj["Body"].read()
+
+
+def _delete_object_sync(storage_path: str) -> None:
+    _get_client().delete_object(Bucket=_bucket(), Key=storage_path)
+
+
+async def upload(decoded: bytes, *, prefix: str) -> tuple:
     """Uploads to object storage, returns (storage_path, checksum)."""
     checksum = hashlib.sha256(decoded).hexdigest()
     storage_path = f"{prefix}/{uuid.uuid4().hex}"
-    _get_client().put_object(Bucket=_bucket(), Key=storage_path, Body=decoded)
+    # boto3 is synchronous network I/O - calling it directly from an async
+    # endpoint would block the whole event loop (every other in-flight
+    # request on this worker) for however long the S3-compatible endpoint
+    # takes to respond, including any network hiccup or throttling.
+    await anyio.to_thread.run_sync(_put_object_sync, storage_path, decoded)
     return storage_path, checksum
 
 
-def download_base64(storage_path: str) -> str:
+async def download_base64(storage_path: str) -> str:
     """Re-fetches the file and re-encodes it inline, so the response
     contract (base64 'data' field) stays byte-identical to the old
     Mongo-era implementation that stored the base64 directly - see the
     migration plan's decision on attachment response-shape preservation."""
-    obj = _get_client().get_object(Bucket=_bucket(), Key=storage_path)
-    return base64.b64encode(obj["Body"].read()).decode()
+    raw = await anyio.to_thread.run_sync(_get_object_sync, storage_path)
+    return base64.b64encode(raw).decode()
 
 
-def delete(storage_path: str) -> None:
-    _get_client().delete_object(Bucket=_bucket(), Key=storage_path)
+async def delete(storage_path: str) -> None:
+    await anyio.to_thread.run_sync(_delete_object_sync, storage_path)

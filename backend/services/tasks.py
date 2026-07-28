@@ -105,7 +105,7 @@ async def _attachments_response(db: AsyncSession, task_id) -> List[dict]:
             "filename": row.original_filename,
             "mime_type": row.mime_type,
             "attachment_type": row.attachment_type,
-            "data": f"data:{row.mime_type};base64,{download_base64(row.storage_path)}",
+            "data": f"data:{row.mime_type};base64,{await download_base64(row.storage_path)}",
             "size_bytes": row.file_size,
         })
     return result
@@ -123,7 +123,7 @@ async def _attachments_by_task(db: AsyncSession, task_ids) -> dict:
             "filename": row.original_filename,
             "mime_type": row.mime_type,
             "attachment_type": row.attachment_type,
-            "data": f"data:{row.mime_type};base64,{download_base64(row.storage_path)}",
+            "data": f"data:{row.mime_type};base64,{await download_base64(row.storage_path)}",
             "size_bytes": row.file_size,
         })
     return grouped
@@ -175,7 +175,7 @@ async def _store_attachments(db: AsyncSession, task_id, company_id, uploaded_by,
     for a in attachments:
         filename, mime_type, data = a.get("filename"), a.get("mime_type"), a.get("data")
         decoded = decode_and_validate(data, filename, mime_type)
-        storage_path, checksum = upload(decoded, prefix=f"tasks/{task_id}")
+        storage_path, checksum = await upload(decoded, prefix=f"tasks/{task_id}")
         await attachments_repo.create(
             db,
             task_id=task_id,

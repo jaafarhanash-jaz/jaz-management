@@ -94,7 +94,7 @@ async def _store_cv(db: AsyncSession, employee, uploaded_by, cv_data) -> None:
     _validate_cv_file(cv_data.filename, cv_data.mime_type)
     decoded = decode_and_validate(cv_data.data, cv_data.filename)
     old_storage_path = employee.cv_storage_path
-    storage_path, _checksum = storage_upload(decoded, prefix=f"employees/{employee.id}/cv")
+    storage_path, _checksum = await storage_upload(decoded, prefix=f"employees/{employee.id}/cv")
     employee.cv_storage_path = storage_path
     employee.cv_original_filename = cv_data.filename
     employee.cv_mime_type = cv_data.mime_type
@@ -103,7 +103,7 @@ async def _store_cv(db: AsyncSession, employee, uploaded_by, cv_data) -> None:
     employee.cv_uploaded_by = uploaded_by
     await db.flush()
     if old_storage_path:
-        storage_delete(old_storage_path)
+        await storage_delete(old_storage_path)
 
 
 async def create_employee(db: AsyncSession, company_id, created_by, data) -> dict:
@@ -134,7 +134,7 @@ async def create_employee(db: AsyncSession, company_id, created_by, data) -> dic
         db,
         email=data.email,
         phone=data.phone,
-        password=hash_password(data.password),
+        password=await hash_password(data.password),
         name=data.name,
         role="employee",
         company_id=company_id,
@@ -174,7 +174,7 @@ async def update_employee(db: AsyncSession, company_id, employee_id: str, update
     safe_updates = {k: v for k, v in updates.items() if k in UPDATE_ALLOWED_FIELDS}
     if updates.get("password"):
         validate_password_strength(updates["password"])
-        safe_updates["password"] = hash_password(updates["password"])
+        safe_updates["password"] = await hash_password(updates["password"])
     if not safe_updates:
         raise HTTPException(status_code=400, detail="No valid fields to update")
 
@@ -225,7 +225,7 @@ async def get_employee_cv(db: AsyncSession, company_id, employee_id: str) -> dic
     if not employee or not employee.cv_storage_path:
         raise HTTPException(status_code=404, detail="No CV on file for this employee")
     response = _cv_response(employee)
-    response["data"] = f"data:{employee.cv_mime_type};base64,{download_base64(employee.cv_storage_path)}"
+    response["data"] = f"data:{employee.cv_mime_type};base64,{await download_base64(employee.cv_storage_path)}"
     return response
 
 
@@ -234,7 +234,7 @@ async def delete_employee_cv(db: AsyncSession, company_id, employee_id: str) -> 
     employee = await users_repo.get_employee_in_company(db, parsed_id, company_id) if parsed_id else None
     if not employee or not employee.cv_storage_path:
         raise HTTPException(status_code=404, detail="No CV on file for this employee")
-    storage_delete(employee.cv_storage_path)
+    await storage_delete(employee.cv_storage_path)
     employee.cv_storage_path = None
     employee.cv_original_filename = None
     employee.cv_mime_type = None

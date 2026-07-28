@@ -224,7 +224,7 @@ async def create_company(db: AsyncSession, data) -> dict:
         id=owner_id,
         email=data.owner_email,
         phone=data.owner_phone,
-        password=hash_password(data.owner_password),
+        password=await hash_password(data.owner_password),
         name=data.owner_name,
         role="company_owner",
         company_id=company_id,
@@ -298,7 +298,7 @@ async def update_company(db: AsyncSession, company_id: str, updates) -> dict:
         if updates.owner_password != updates.owner_password_confirm:
             raise HTTPException(status_code=400, detail={"field": "owner_password_confirm", "message": "Passwords do not match"})
         validate_password_strength(updates.owner_password)
-        owner_changes["password"] = hash_password(updates.owner_password)
+        owner_changes["password"] = await hash_password(updates.owner_password)
 
     if not company_changes and not owner_changes:
         raise HTTPException(status_code=400, detail="No valid fields to update")

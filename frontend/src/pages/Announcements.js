@@ -19,20 +19,20 @@ const Announcements = ({ onLogout, language, setLanguage, userRole }) => {
   const [dialogOpen, setDialogOpen] = useState(false);
   const isOwner = userRole === 'company_owner';
 
-  const fetchAnnouncements = async () => {
-    setLoading(true);
+  const fetchAnnouncements = async (silent = false) => {
+    if (!silent) setLoading(true);
     try {
       const res = await api.get(isOwner ? '/owner/announcements' : '/employee/announcements');
       setAnnouncements(res.data);
     } catch (e) {
-      toast.error('خطأ في جلب الإعلانات');
+      if (!silent) toast.error('خطأ في جلب الإعلانات');
     }
-    setLoading(false);
+    if (!silent) setLoading(false);
   };
 
   useEffect(() => {
     fetchAnnouncements();
-    const interval = setInterval(fetchAnnouncements, 15000);
+    const interval = setInterval(() => fetchAnnouncements(true), 15000);
     return () => clearInterval(interval);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 

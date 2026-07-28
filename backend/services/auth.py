@@ -4,6 +4,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+import anyio
 from fastapi import HTTPException
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -59,12 +60,17 @@ def validate_password_strength(password: str) -> None:
         raise HTTPException(status_code=400, detail=f"Password must be at least {MIN_PASSWORD_LENGTH} characters")
 
 
-def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+async def hash_password(password: str) -> str:
+    # bcrypt is deliberately CPU-slow (100ms+ per call) - calling it directly
+    # would block the single event loop for that whole duration, stalling
+    # every other in-flight request (dashboard loads, polls, everything) on
+    # this worker, not just the one doing the hashing. to_thread runs it on
+    # a worker thread instead so the loop stays free.
+    return await anyio.to_thread.run_sync(pwd_context.hash, password)
 
 
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
+async def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return await anyio.to_thread.run_sync(pwd_context.verify, plain_password, hashed_password)
 
 
 def create_access_token(data: dict) -> str:
@@ -199,7 +205,7 @@ async def enforce_company_access(db: AsyncSession, user_dict: dict) -> None:
 
 async def login(db: AsyncSession, email_or_phone: str, password: str) -> dict:
     user = await users_repo.get_by_email_or_phone(db, email_or_phone)
-    if not user or not verify_password(password, user.password):
+    if not user or not await verify_password(password, user.password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     user_dict = user_to_dict(user)
@@ -251,12 +257,12 @@ async def upload_own_photo(db: AsyncSession, user_id: str, photo_data) -> dict:
         raise HTTPException(status_code=400, detail=f"Photo exceeds the {MAX_PHOTO_BYTES // (1024*1024)}MB limit")
 
     old_storage_path = user.avatar_storage_path
-    storage_path, _checksum = storage_upload(decoded, prefix=f"users/{user.id}/avatar")
+    storage_path, _checksum = await storage_upload(decoded, prefix=f"users/{user.id}/avatar")
     user.avatar_storage_path = storage_path
     user.avatar_mime_type = photo_data.mime_type
     await db.flush()
     if old_storage_path:
-        storage_delete(old_storage_path)
+        await storage_delete(old_storage_path)
     return _photo_response(user)
 
 
@@ -267,7 +273,7 @@ async def get_own_photo(db: AsyncSession, user_id: str) -> dict:
     if not user or not user.avatar_storage_path:
         raise HTTPException(status_code=404, detail="No profile photo on file")
     response = _photo_response(user)
-    response["data"] = f"data:{user.avatar_mime_type};base64,{download_base64(user.avatar_storage_path)}"
+    response["data"] = f"data:{user.avatar_mime_type};base64,{await download_base64(user.avatar_storage_path)}"
     return response
 
 
@@ -275,7 +281,7 @@ async def delete_own_photo(db: AsyncSession, user_id: str) -> dict:
     user = await users_repo.get_by_id(db, user_id)
     if not user or not user.avatar_storage_path:
         raise HTTPException(status_code=404, detail="No profile photo on file")
-    storage_delete(user.avatar_storage_path)
+    await storage_delete(user.avatar_storage_path)
     user.avatar_storage_path = None
     user.avatar_mime_type = None
     await db.flush()
@@ -286,9 +292,9 @@ async def change_password(db: AsyncSession, user_id: str, current_password: str,
     user = await users_repo.get_by_id(db, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    if not verify_password(current_password, user.password):
+    if not await verify_password(current_password, user.password):
         raise HTTPException(status_code=400, detail="Current password is incorrect")
     validate_password_strength(new_password)
-    user.password = hash_password(new_password)
+    user.password = await hash_password(new_password)
     await db.flush()
     return {"message": "Password changed successfully"}

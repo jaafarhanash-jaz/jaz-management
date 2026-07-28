@@ -29,6 +29,25 @@ import { Toaster } from 'sonner';
 import CriticalTaskAlert from './components/CriticalTaskAlert';
 import '@/App.css';
 
+// Module-scope (not defined inside App()) so it keeps the same component
+// identity across every App re-render - e.g. the language toggle in Layout,
+// which every page renders. When this was defined inside App(), each such
+// re-render created a brand-new ProtectedRoute function reference, and
+// React remounts (not just re-renders) anything whose component identity
+// changed - tearing down and rebuilding the entire current page, including
+// its notifications SSE connection, on something as small as a language
+// click. isAuthenticated/userRole are now passed in as props instead of
+// captured via closure so this component has a stable identity.
+const ProtectedRoute = ({ children, allowedRoles, isAuthenticated, userRole }) => {
+  if (!isAuthenticated) {
+    return <Navigate to="/" replace />;
+  }
+  if (allowedRoles && !allowedRoles.includes(userRole)) {
+    return <Navigate to="/" replace />;
+  }
+  return children;
+};
+
 function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [userRole, setUserRole] = useState(null);
@@ -112,16 +131,6 @@ function App() {
     setPendingCriticalTasks([]);
   };
 
-  const ProtectedRoute = ({ children, allowedRoles }) => {
-    if (!isAuthenticated) {
-      return <Navigate to="/" replace />;
-    }
-    if (allowedRoles && !allowedRoles.includes(userRole)) {
-      return <Navigate to="/" replace />;
-    }
-    return children;
-  };
-
   return (
     <div className="App" dir={language === 'ar' ? 'rtl' : 'ltr'}>
       <BrowserRouter>
@@ -142,7 +151,7 @@ function App() {
           <Route
             path="/super-admin/dashboard"
             element={
-              <ProtectedRoute allowedRoles={['super_admin']}>
+              <ProtectedRoute isAuthenticated={isAuthenticated} userRole={userRole} allowedRoles={['super_admin']}>
                 <SuperAdminDashboard onLogout={handleLogout} language={language} setLanguage={setLanguage} />
               </ProtectedRoute>
             }
@@ -150,7 +159,7 @@ function App() {
           <Route
             path="/super-admin/companies"
             element={
-              <ProtectedRoute allowedRoles={['super_admin']}>
+              <ProtectedRoute isAuthenticated={isAuthenticated} userRole={userRole} allowedRoles={['super_admin']}>
                 <SuperAdminCompanies onLogout={handleLogout} language={language} setLanguage={setLanguage} />
               </ProtectedRoute>
             }
@@ -158,7 +167,7 @@ function App() {
           <Route
             path="/super-admin/plans"
             element={
-              <ProtectedRoute allowedRoles={['super_admin']}>
+              <ProtectedRoute isAuthenticated={isAuthenticated} userRole={userRole} allowedRoles={['super_admin']}>
                 <SuperAdminPlans onLogout={handleLogout} language={language} setLanguage={setLanguage} />
               </ProtectedRoute>
             }
@@ -166,7 +175,7 @@ function App() {
           <Route
             path="/super-admin/profile"
             element={
-              <ProtectedRoute allowedRoles={['super_admin']}>
+              <ProtectedRoute isAuthenticated={isAuthenticated} userRole={userRole} allowedRoles={['super_admin']}>
                 <Profile onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole="super_admin" />
               </ProtectedRoute>
             }
@@ -176,7 +185,7 @@ function App() {
           <Route
             path="/company-owner/dashboard"
             element={
-              <ProtectedRoute allowedRoles={['company_owner']}>
+              <ProtectedRoute isAuthenticated={isAuthenticated} userRole={userRole} allowedRoles={['company_owner']}>
                 <OwnerDashboard onLogout={handleLogout} language={language} setLanguage={setLanguage} />
               </ProtectedRoute>
             }
@@ -184,7 +193,7 @@ function App() {
           <Route
             path="/company-owner/employees"
             element={
-              <ProtectedRoute allowedRoles={['company_owner']}>
+              <ProtectedRoute isAuthenticated={isAuthenticated} userRole={userRole} allowedRoles={['company_owner']}>
                 <OwnerEmployees onLogout={handleLogout} language={language} setLanguage={setLanguage} />
               </ProtectedRoute>
             }
@@ -192,7 +201,7 @@ function App() {
           <Route
             path="/company-owner/tasks"
             element={
-              <ProtectedRoute allowedRoles={['company_owner']}>
+              <ProtectedRoute isAuthenticated={isAuthenticated} userRole={userRole} allowedRoles={['company_owner']}>
                 <OwnerTasks onLogout={handleLogout} language={language} setLanguage={setLanguage} />
               </ProtectedRoute>
             }
@@ -200,7 +209,7 @@ function App() {
           <Route
             path="/company-owner/attendance"
             element={
-              <ProtectedRoute allowedRoles={['company_owner']}>
+              <ProtectedRoute isAuthenticated={isAuthenticated} userRole={userRole} allowedRoles={['company_owner']}>
                 <OwnerAttendance onLogout={handleLogout} language={language} setLanguage={setLanguage} />
               </ProtectedRoute>
             }
@@ -208,7 +217,7 @@ function App() {
           <Route
             path="/company-owner/reports"
             element={
-              <ProtectedRoute allowedRoles={['company_owner']}>
+              <ProtectedRoute isAuthenticated={isAuthenticated} userRole={userRole} allowedRoles={['company_owner']}>
                 <OwnerReports onLogout={handleLogout} language={language} setLanguage={setLanguage} />
               </ProtectedRoute>
             }
@@ -216,7 +225,7 @@ function App() {
           <Route
             path="/company-owner/departments"
             element={
-              <ProtectedRoute allowedRoles={['company_owner']}>
+              <ProtectedRoute isAuthenticated={isAuthenticated} userRole={userRole} allowedRoles={['company_owner']}>
                 <OwnerDepartments onLogout={handleLogout} language={language} setLanguage={setLanguage} />
               </ProtectedRoute>
             }
@@ -224,7 +233,7 @@ function App() {
           <Route
             path="/company-owner/subscription"
             element={
-              <ProtectedRoute allowedRoles={['company_owner']}>
+              <ProtectedRoute isAuthenticated={isAuthenticated} userRole={userRole} allowedRoles={['company_owner']}>
                 <OwnerSubscription onLogout={handleLogout} language={language} setLanguage={setLanguage} />
               </ProtectedRoute>
             }
@@ -232,7 +241,7 @@ function App() {
           <Route
             path="/company-owner/messages"
             element={
-              <ProtectedRoute allowedRoles={['company_owner']}>
+              <ProtectedRoute isAuthenticated={isAuthenticated} userRole={userRole} allowedRoles={['company_owner']}>
                 <WorkMessages onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole="company_owner" />
               </ProtectedRoute>
             }
@@ -240,7 +249,7 @@ function App() {
           <Route
             path="/company-owner/communication-center"
             element={
-              <ProtectedRoute allowedRoles={['company_owner']}>
+              <ProtectedRoute isAuthenticated={isAuthenticated} userRole={userRole} allowedRoles={['company_owner']}>
                 <CommunicationCenter onLogout={handleLogout} language={language} setLanguage={setLanguage} />
               </ProtectedRoute>
             }
@@ -248,7 +257,7 @@ function App() {
           <Route
             path="/company-owner/calendar"
             element={
-              <ProtectedRoute allowedRoles={['company_owner']}>
+              <ProtectedRoute isAuthenticated={isAuthenticated} userRole={userRole} allowedRoles={['company_owner']}>
                 <CalendarPage onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole="company_owner" />
               </ProtectedRoute>
             }
@@ -256,7 +265,7 @@ function App() {
           <Route
             path="/company-owner/calendar-monitor"
             element={
-              <ProtectedRoute allowedRoles={['company_owner']}>
+              <ProtectedRoute isAuthenticated={isAuthenticated} userRole={userRole} allowedRoles={['company_owner']}>
                 <CalendarMonitor onLogout={handleLogout} language={language} setLanguage={setLanguage} />
               </ProtectedRoute>
             }
@@ -264,7 +273,7 @@ function App() {
           <Route
             path="/company-owner/company-holidays"
             element={
-              <ProtectedRoute allowedRoles={['company_owner']}>
+              <ProtectedRoute isAuthenticated={isAuthenticated} userRole={userRole} allowedRoles={['company_owner']}>
                 <CompanyHolidays onLogout={handleLogout} language={language} setLanguage={setLanguage} />
               </ProtectedRoute>
             }
@@ -272,7 +281,7 @@ function App() {
           <Route
             path="/company-owner/announcements"
             element={
-              <ProtectedRoute allowedRoles={['company_owner']}>
+              <ProtectedRoute isAuthenticated={isAuthenticated} userRole={userRole} allowedRoles={['company_owner']}>
                 <Announcements onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole="company_owner" />
               </ProtectedRoute>
             }
@@ -280,7 +289,7 @@ function App() {
           <Route
             path="/company-owner/profile"
             element={
-              <ProtectedRoute allowedRoles={['company_owner']}>
+              <ProtectedRoute isAuthenticated={isAuthenticated} userRole={userRole} allowedRoles={['company_owner']}>
                 <Profile onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole="company_owner" />
               </ProtectedRoute>
             }
@@ -290,7 +299,7 @@ function App() {
           <Route
             path="/employee/dashboard"
             element={
-              <ProtectedRoute allowedRoles={['employee']}>
+              <ProtectedRoute isAuthenticated={isAuthenticated} userRole={userRole} allowedRoles={['employee']}>
                 <EmployeeDashboard onLogout={handleLogout} language={language} setLanguage={setLanguage} />
               </ProtectedRoute>
             }
@@ -298,7 +307,7 @@ function App() {
           <Route
             path="/employee/tasks"
             element={
-              <ProtectedRoute allowedRoles={['employee']}>
+              <ProtectedRoute isAuthenticated={isAuthenticated} userRole={userRole} allowedRoles={['employee']}>
                 <EmployeeTasks onLogout={handleLogout} language={language} setLanguage={setLanguage} />
               </ProtectedRoute>
             }
@@ -306,7 +315,7 @@ function App() {
           <Route
             path="/employee/attendance"
             element={
-              <ProtectedRoute allowedRoles={['employee']}>
+              <ProtectedRoute isAuthenticated={isAuthenticated} userRole={userRole} allowedRoles={['employee']}>
                 <EmployeeAttendance onLogout={handleLogout} language={language} setLanguage={setLanguage} />
               </ProtectedRoute>
             }
@@ -314,7 +323,7 @@ function App() {
           <Route
             path="/employee/performance"
             element={
-              <ProtectedRoute allowedRoles={['employee']}>
+              <ProtectedRoute isAuthenticated={isAuthenticated} userRole={userRole} allowedRoles={['employee']}>
                 <EmployeePerformance onLogout={handleLogout} language={language} setLanguage={setLanguage} />
               </ProtectedRoute>
             }
@@ -322,7 +331,7 @@ function App() {
           <Route
             path="/employee/reports"
             element={
-              <ProtectedRoute allowedRoles={['employee']}>
+              <ProtectedRoute isAuthenticated={isAuthenticated} userRole={userRole} allowedRoles={['employee']}>
                 <EmployeeReports onLogout={handleLogout} language={language} setLanguage={setLanguage} />
               </ProtectedRoute>
             }
@@ -330,7 +339,7 @@ function App() {
           <Route
             path="/employee/messages"
             element={
-              <ProtectedRoute allowedRoles={['employee']}>
+              <ProtectedRoute isAuthenticated={isAuthenticated} userRole={userRole} allowedRoles={['employee']}>
                 <WorkMessages onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole="employee" />
               </ProtectedRoute>
             }
@@ -338,7 +347,7 @@ function App() {
           <Route
             path="/employee/calendar"
             element={
-              <ProtectedRoute allowedRoles={['employee']}>
+              <ProtectedRoute isAuthenticated={isAuthenticated} userRole={userRole} allowedRoles={['employee']}>
                 <CalendarPage onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole="employee" />
               </ProtectedRoute>
             }
@@ -346,7 +355,7 @@ function App() {
           <Route
             path="/employee/announcements"
             element={
-              <ProtectedRoute allowedRoles={['employee']}>
+              <ProtectedRoute isAuthenticated={isAuthenticated} userRole={userRole} allowedRoles={['employee']}>
                 <Announcements onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole="employee" />
               </ProtectedRoute>
             }
@@ -354,7 +363,7 @@ function App() {
           <Route
             path="/employee/profile"
             element={
-              <ProtectedRoute allowedRoles={['employee']}>
+              <ProtectedRoute isAuthenticated={isAuthenticated} userRole={userRole} allowedRoles={['employee']}>
                 <Profile onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole="employee" />
               </ProtectedRoute>
             }

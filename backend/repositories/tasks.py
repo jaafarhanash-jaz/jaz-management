@@ -40,6 +40,21 @@ async def list_by_company(db: AsyncSession, company_id) -> List[Task]:
     return list(result.scalars().all())
 
 
+async def count_by_status_and_category(db: AsyncSession, company_id, exclude_statuses=()) -> List[tuple]:
+    """(status, task_category, count) rows, grouped in the database instead
+    of fetching every task row to count them in Python - used by the owner
+    dashboard's summary tiles, which only ever need these totals, not the
+    underlying rows."""
+    query = select(Task.status, Task.task_category, func.count()).where(
+        Task.company_id == company_id, Task.deleted_at.is_(None),
+    )
+    if exclude_statuses:
+        query = query.where(Task.status.notin_(exclude_statuses))
+    query = query.group_by(Task.status, Task.task_category)
+    result = await db.execute(query)
+    return result.all()
+
+
 async def list_active_by_company(db: AsyncSession, company_id, limit: int = None, offset: int = None) -> List[Task]:
     """Task History feature: the Owner Tasks page's main list now shows
     only active work - every task except those already completed. Same

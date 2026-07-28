@@ -55,19 +55,29 @@ def count_raw_occurrences_before(event, cutoff: datetime) -> int:
     return count
 
 
-async def expand_event_occurrences(db: AsyncSession, event, range_start: datetime, range_end: datetime) -> list:
+async def expand_event_occurrences(
+    db: AsyncSession, event, range_start: datetime, range_end: datetime, *, exceptions=None,
+) -> list:
     """Occurrences are computed on read for the requested window only -
     nothing is pre-materialized per-occurrence in storage. Applies
     calendar_event_exceptions (skip if cancelled, merge if overridden) so
     'This Event Only' edits/cancellations don't require touching the series.
     Returns a list of dicts merging the event's own fields with any
     exception's override_fields, plus occurrence_date/occurrence_start/
-    occurrence_end/has_exception."""
+    occurrence_end/has_exception.
+
+    `exceptions` lets a caller expanding many events at once (e.g. a
+    dashboard widget over a whole week's candidate events) pass in this
+    event's slice of a single batched query instead of every call issuing
+    its own `list_for_event` round trip. Defaults to the original
+    per-event fetch when not provided, so existing single-event callers are
+    unaffected."""
     base_start = combine_event_datetime(event.start_date, event.start_time, event.all_day, False)
     base_end = combine_event_datetime(event.end_date, event.end_time, event.all_day, True)
     duration = base_end - base_start
 
-    exceptions = await exceptions_repo.list_for_event(db, event.id)
+    if exceptions is None:
+        exceptions = await exceptions_repo.list_for_event(db, event.id)
     exceptions_by_date = {_date_str(e.occurrence_date): e for e in exceptions}
 
     occurrences = []

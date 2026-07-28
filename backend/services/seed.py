@@ -22,7 +22,7 @@ async def seed_identity_data(db: AsyncSession) -> None:
         await users_repo.create(
             db,
             email="admin@jaz.com", phone="0500000000",
-            password=hash_password("admin123"), name="Super Admin",
+            password=await hash_password("admin123"), name="Super Admin",
             role="super_admin", status="active",
         )
         await db.commit()
@@ -46,7 +46,7 @@ async def seed_identity_data(db: AsyncSession) -> None:
             db,
             id=owner_id,
             email="owner@demo.com", phone="0501111111",
-            password=hash_password("owner123"), name="أحمد محمد",
+            password=await hash_password("owner123"), name="أحمد محمد",
             role="company_owner", company_id=company_id, status="active",
         )
         company = Company(
@@ -65,14 +65,14 @@ async def seed_identity_data(db: AsyncSession) -> None:
         await users_repo.create(
             db,
             email="employee1@demo.com", phone="0502222222",
-            password=hash_password("emp123"), name="فاطمة أحمد",
+            password=await hash_password("emp123"), name="فاطمة أحمد",
             role="employee", company_id=company_id,
             department="المبيعات", position="مندوب مبيعات", status="active",
         )
         await users_repo.create(
             db,
             email="employee2@demo.com", phone="0503333333",
-            password=hash_password("emp123"), name="محمد خالد",
+            password=await hash_password("emp123"), name="محمد خالد",
             role="employee", company_id=company_id,
             department="التسويق", position="مسوق رقمي", status="active",
         )

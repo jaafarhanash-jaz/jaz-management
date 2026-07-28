@@ -513,7 +513,7 @@ async def _reconstruct_message_activity(db: AsyncSession, message_ids) -> List[d
     } for r in rows]
 
 
-def _attachment_response(a, *, with_data: bool) -> dict:
+async def _attachment_response(a, *, with_data: bool) -> dict:
     data = {
         "id": str(a.id), "message_id": str(a.message_id), "thread_id": str(a.thread_id),
         "company_id": str(a.company_id), "filename": a.original_filename, "mime_type": a.mime_type,
@@ -525,7 +525,7 @@ def _attachment_response(a, *, with_data: bool) -> dict:
         # proof_files) - reconstructing that exact prefix here is required for
         # the response to stay byte-identical to the old Mongo-era behavior
         # (which stored/returned the client's original string verbatim).
-        data["data"] = f"data:{a.mime_type};base64,{download_base64(a.storage_path)}"
+        data["data"] = f"data:{a.mime_type};base64,{await download_base64(a.storage_path)}"
     return data
 
 
@@ -540,7 +540,7 @@ async def get_message_thread(db: AsyncSession, current_user: dict, message_id: s
     attachments = await attachments_repo.list_by_thread(db, thread_id)
     attachments_by_message = {}
     for a in attachments:
-        attachments_by_message.setdefault(str(a.message_id), []).append(_attachment_response(a, with_data=False))
+        attachments_by_message.setdefault(str(a.message_id), []).append(await _attachment_response(a, with_data=False))
 
     activity = await _reconstruct_message_activity(db, [m.id for m in thread_messages])
 
@@ -692,7 +692,7 @@ async def upload_message_attachment(db: AsyncSession, current_user: dict, messag
         raise HTTPException(status_code=404, detail="Message not found")
 
     decoded = decode_and_validate(data.data, data.filename, data.mime_type)
-    storage_path, checksum = upload(decoded, prefix=f"messages/{message.id}")
+    storage_path, checksum = await upload(decoded, prefix=f"messages/{message.id}")
 
     attachment = await attachments_repo.create(
         db, message_id=message.id, thread_id=message.thread_id, company_id=parse_uuid(current_user["company_id"]),
@@ -714,7 +714,7 @@ async def get_message_attachment(db: AsyncSession, current_user: dict, attachmen
         raise HTTPException(status_code=404, detail="Attachment not found")
     # Lazy-load boundary: the base64 payload is only ever returned here.
     await get_accessible_message(db, str(attachment.message_id), current_user)
-    return _attachment_response(attachment, with_data=True)
+    return await _attachment_response(attachment, with_data=True)
 
 
 # ---- Reminders ----

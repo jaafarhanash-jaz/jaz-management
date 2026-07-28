@@ -27,17 +27,22 @@ async def is_company_holiday(db: AsyncSession, company_id, date_: date_type) -> 
     return None
 
 
-async def is_weekly_holiday(db: AsyncSession, company_id, date_: date_type) -> bool:
-    working_hours = await companies_repo.get_working_hours(db, company_id)
+async def is_weekly_holiday(db: AsyncSession, company_id, date_: date_type, *, working_hours: Optional[dict] = None) -> bool:
+    # working_hours is the same company row for every date in a given batch -
+    # callers looping over many dates (annotate_holiday_dates,
+    # _filter_out_holiday_attendance) fetch it once and pass it through here
+    # instead of this function re-querying the company on every single date.
+    if working_hours is None:
+        working_hours = await companies_repo.get_working_hours(db, company_id)
     weekday = (date_.weekday() + 1) % 7  # 0=Sunday..6=Saturday
     return weekday not in working_hours.get("working_days", [0, 1, 2, 3, 4])
 
 
-async def get_day_off_info(db: AsyncSession, company_id, date_: date_type) -> Optional[dict]:
+async def get_day_off_info(db: AsyncSession, company_id, date_: date_type, *, working_hours: Optional[dict] = None) -> Optional[dict]:
     holiday = await is_company_holiday(db, company_id, date_)
     if holiday:
         return {"type": "company_holiday", "title": holiday["title"]}
-    if await is_weekly_holiday(db, company_id, date_):
+    if await is_weekly_holiday(db, company_id, date_, working_hours=working_hours):
         return {"type": "weekly_holiday", "title": None}
     return None
 
@@ -47,9 +52,10 @@ async def annotate_holiday_dates(db: AsyncSession, company_id, records: List[dic
     holiday_title - never changes the underlying stored status. One lookup
     per distinct date in the batch, not per record."""
     dates = {r["date"] for r in records if r.get("date")}
+    working_hours = await companies_repo.get_working_hours(db, company_id) if dates else None
     off_by_date = {}
     for d in dates:
-        info = await get_day_off_info(db, company_id, date_type.fromisoformat(d))
+        info = await get_day_off_info(db, company_id, date_type.fromisoformat(d), working_hours=working_hours)
         if info:
             off_by_date[d] = info
     for r in records:

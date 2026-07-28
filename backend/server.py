@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 import qrcode
 from io import BytesIO
 import base64
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import engine, get_db, SessionLocal
@@ -887,6 +888,25 @@ async def get_current_user(
 ):
     # Postgres-backed (Auth module, migrated). See services/auth.py.
     return await auth_service.get_current_user(pg, credentials.credentials)
+
+# ============ Health ============
+
+@api_router.get("/health")
+async def health_check(pg: AsyncSession = Depends(get_db)):
+    # Public and unauthenticated on purpose - this is what Docker's
+    # HEALTHCHECK and any external uptime monitor hit. It used to be
+    # `/api/auth/me`, which always returns 401/403 without a token, so the
+    # container health check could only ever prove curl got *some* response,
+    # not that the app or its database connection actually work. A cheap
+    # `SELECT 1` here proves the request pipeline, the DB engine, and the
+    # Supabase/PgBouncer connection are all genuinely alive; a DB outage now
+    # correctly flips this to unhealthy instead of silently staying "healthy".
+    try:
+        await pg.execute(text("SELECT 1"))
+    except Exception:
+        logging.exception("Health check DB probe failed")
+        return JSONResponse(status_code=503, content={"status": "unhealthy"})
+    return {"status": "healthy"}
 
 # ============ Auth Routes ============
 

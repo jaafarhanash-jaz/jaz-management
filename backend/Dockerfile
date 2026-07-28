@@ -37,11 +37,10 @@ ENV PATH=/home/appuser/.local/bin:$PATH \
 
 EXPOSE 8000
 
-# No unauthenticated health-route exists in the app (and adding one is
-# outside "deployment files only" scope) - checking for *any* HTTP
-# response (not `curl -f`, which would treat the real 401 as failure)
-# is enough to prove the process is up and accepting connections.
+# /api/health is public and does a real `SELECT 1` against the database
+# (see server.py) - `-f` makes curl fail the check on the 503 that endpoint
+# returns when the DB probe fails, not just on a dropped connection.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl -s -o /dev/null http://localhost:8000/api/auth/me || exit 1
+    CMD curl -sf http://localhost:8000/api/health || exit 1
 
 ENTRYPOINT ["./docker-entrypoint.sh"]

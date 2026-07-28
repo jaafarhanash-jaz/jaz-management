@@ -83,8 +83,12 @@ async def get_owner_dashboard(db: AsyncSession, current_user: dict) -> dict:
 
     company_id = parse_uuid(current_user["company_id"])
     today = datetime.now(timezone.utc).date()
-    today_holiday = await holidays_service.get_day_off_info(db, company_id, today)
+    # Fetched once and passed through - get_day_off_info would otherwise
+    # re-fetch this exact same company row internally (is_weekly_holiday),
+    # on top of the one the get_current_user auth dependency already fetched
+    # a moment earlier for this same request.
     working_hours = await companies_repo.get_working_hours(db, company_id)
+    today_holiday = await holidays_service.get_day_off_info(db, company_id, today, working_hours=working_hours)
     await tasks_service.activate_due_tasks(db, company_id)
 
     # Scope attendance stats to CURRENT employees only, deduped per employee -
@@ -118,12 +122,15 @@ async def get_owner_dashboard(db: AsyncSession, current_user: dict) -> dict:
     employees_working_today = len(checked_in_ids - checked_out_ids)
     attendance_percentage = min(100.0, round((present_today + late_today) / total_employees * 100, 1)) if total_employees > 0 else 0
 
-    all_tasks = [t for t in await tasks_repo.list_by_company(db, company_id) if t.status not in HIDDEN_TASK_STATUSES]
-    open_tasks = sum(1 for t in all_tasks if t.status in OPEN_STATUSES)
-    completed_tasks = sum(1 for t in all_tasks if t.status == "completed")
-    overdue_tasks = sum(1 for t in all_tasks if t.status == "overdue")
-    pending_urgent_tasks = sum(1 for t in all_tasks if t.task_category == "urgent" and t.status in OPEN_STATUSES)
-    completed_urgent_tasks = sum(1 for t in all_tasks if t.task_category == "urgent" and t.status == "completed")
+    # Grouped in the database (status, task_category, count) instead of
+    # fetching every task row in the company just to count them in Python -
+    # this only needs the five totals below, never the rows themselves.
+    task_counts = await tasks_repo.count_by_status_and_category(db, company_id, exclude_statuses=HIDDEN_TASK_STATUSES)
+    open_tasks = sum(c for status, _cat, c in task_counts if status in OPEN_STATUSES)
+    completed_tasks = sum(c for status, _cat, c in task_counts if status == "completed")
+    overdue_tasks = sum(c for status, _cat, c in task_counts if status == "overdue")
+    pending_urgent_tasks = sum(c for status, cat, c in task_counts if cat == "urgent" and status in OPEN_STATUSES)
+    completed_urgent_tasks = sum(c for status, cat, c in task_counts if cat == "urgent" and status == "completed")
 
     daily_tasks = await daily_tasks_repo.list_by_company(db, company_id)
     active_daily_tasks = sum(1 for t in daily_tasks if t.is_active)
@@ -316,7 +323,13 @@ async def _filter_out_holiday_attendance(db: AsyncSession, company_id, records: 
     dates = {r.date for r in records if r.date}
     if not dates:
         return records
-    off_dates = {d for d in dates if await holidays_service.get_day_off_info(db, company_id, d)}
+    # One company-row fetch reused across every distinct date, instead of
+    # get_day_off_info re-fetching it internally on each iteration.
+    working_hours = await companies_repo.get_working_hours(db, company_id)
+    off_dates = {
+        d for d in dates
+        if await holidays_service.get_day_off_info(db, company_id, d, working_hours=working_hours)
+    }
     if not off_dates:
         return records
     return [r for r in records if r.date not in off_dates]
