@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 import repositories.daily_task_assignees as assignees_repo
 import repositories.daily_tasks as daily_tasks_repo
+import repositories.idempotency as idempotency_repo
 import repositories.task_attachments as attachments_repo
 import repositories.tasks as tasks_repo
 import repositories.users as users_repo
@@ -44,6 +45,51 @@ async def _flush_or_400(db: AsyncSession, default_message: str) -> None:
     except IntegrityError as exc:
         await db.rollback()
         raise HTTPException(status_code=400, detail=_constraint_error_detail(exc, default_message))
+
+
+async def _idempotent(db: AsyncSession, key: Optional[str], company_id, created_by, endpoint: str, create_fn):
+    """Runs create_fn() (which does the actual insert(s) and returns the
+    plain-dict response) at most once per idempotency key, even under
+    truly concurrent duplicate requests - see the incident this fixes:
+    two identical POST /owner/tasks requests reached the backend 0.0
+    seconds apart and both created a task, because nothing tied "this
+    HTTP request" to any prior one.
+
+    `key` is optional and client-supplied per submit attempt (a fresh
+    UUID the frontend generates when a create dialog opens). No key means
+    no protection, same as before this existed - kept optional so any
+    caller that hasn't been updated to send one (e.g. an older mobile
+    client) is completely unaffected.
+
+    Atomicity: the idempotency record is inserted in the *same*
+    transaction as create_fn()'s own insert(s) (one commit at the end of
+    the request - see database.py::get_db). If two requests race on the
+    same new key, both run create_fn(), but only one can win the INSERT
+    into idempotency_keys (key is its primary key); the loser's
+    IntegrityError rolls back its entire transaction - undoing its
+    create_fn() insert(s) too - and it then replays the winner's cached
+    response instead of returning a second, orphaned task.
+    """
+    if not key:
+        return await create_fn()
+
+    existing = await idempotency_repo.get(db, key)
+    if existing:
+        return existing.response_body
+
+    result = await create_fn()
+    try:
+        await idempotency_repo.create(
+            db, key=key, company_id=company_id, created_by=created_by,
+            endpoint=endpoint, response_body=result,
+        )
+    except IntegrityError:
+        await db.rollback()
+        existing = await idempotency_repo.get(db, key)
+        if existing:
+            return existing.response_body
+        raise
+    return result
 
 
 def _iso(value) -> Optional[str]:
@@ -287,58 +333,61 @@ async def create_task_workflow(db: AsyncSession, company_id, created_by, data) -
     if len(data.employee_order) < 2:
         raise HTTPException(status_code=400, detail="Sequential workflow requires at least two employees, in order")
 
-    scheduled_at = _combine_schedule(getattr(data, "scheduled_date", None), getattr(data, "scheduled_time", None))
-    batch_id = uuid.uuid4()
-    created_tasks = []
-    try:
-        for index, employee_id in enumerate(data.employee_order):
-            if index == 0:
-                status = "scheduled" if scheduled_at else "new"
-            else:
-                status = "pending_sequence"
-            task = await tasks_repo.create(
+    async def _create():
+        scheduled_at = _combine_schedule(getattr(data, "scheduled_date", None), getattr(data, "scheduled_time", None))
+        batch_id = uuid.uuid4()
+        created_tasks = []
+        try:
+            for index, employee_id in enumerate(data.employee_order):
+                if index == 0:
+                    status = "scheduled" if scheduled_at else "new"
+                else:
+                    status = "pending_sequence"
+                task = await tasks_repo.create(
+                    db,
+                    company_id=company_id,
+                    assigned_to=employee_id,
+                    title=data.title,
+                    description=data.description,
+                    priority=data.priority,
+                    status=status,
+                    due_date=_parse_date(data.due_date) if data.due_date else None,
+                    due_time=data.due_time,
+                    requires_proof=data.requires_proof,
+                    proof_files=[],
+                    created_by=created_by,
+                    batch_id=batch_id,
+                    sequence_order=index,
+                    scheduled_activation_at=scheduled_at if index == 0 else None,
+                )
+                created_tasks.append(task)
+        except IntegrityError as exc:
+            await db.rollback()
+            raise HTTPException(status_code=400, detail=_constraint_error_detail(exc, "Invalid task data"))
+
+        await db.flush()
+
+        if created_tasks[0].status == "new":
+            await notifications_service.publish(
                 db,
+                user_id=created_tasks[0].assigned_to,
                 company_id=company_id,
-                assigned_to=employee_id,
-                title=data.title,
-                description=data.description,
-                priority=data.priority,
-                status=status,
-                due_date=_parse_date(data.due_date) if data.due_date else None,
-                due_time=data.due_time,
-                requires_proof=data.requires_proof,
-                proof_files=[],
-                created_by=created_by,
-                batch_id=batch_id,
-                sequence_order=index,
-                scheduled_activation_at=scheduled_at if index == 0 else None,
+                category=notifications_service.CATEGORY_TASKS,
+                type="task_assigned",
+                title="مهمة جديدة",
+                message=f"بدأ سير عمل تسلسلي - دورك الآن: {created_tasks[0].title}",
+                entity_type="task",
+                entity_id=created_tasks[0].id,
+                action_url="/employee/tasks",
             )
-            created_tasks.append(task)
-    except IntegrityError as exc:
-        await db.rollback()
-        raise HTTPException(status_code=400, detail=_constraint_error_detail(exc, "Invalid task data"))
 
-    await db.flush()
+        names = await users_repo.get_names_by_ids(db, [t.assigned_to for t in created_tasks])
+        return {
+            "batch_id": str(batch_id),
+            "steps": [task_response(t, assigned_to_name=names.get(str(t.assigned_to))) for t in created_tasks],
+        }
 
-    if created_tasks[0].status == "new":
-        await notifications_service.publish(
-            db,
-            user_id=created_tasks[0].assigned_to,
-            company_id=company_id,
-            category=notifications_service.CATEGORY_TASKS,
-            type="task_assigned",
-            title="مهمة جديدة",
-            message=f"بدأ سير عمل تسلسلي - دورك الآن: {created_tasks[0].title}",
-            entity_type="task",
-            entity_id=created_tasks[0].id,
-            action_url="/employee/tasks",
-        )
-
-    names = await users_repo.get_names_by_ids(db, [t.assigned_to for t in created_tasks])
-    return {
-        "batch_id": str(batch_id),
-        "steps": [task_response(t, assigned_to_name=names.get(str(t.assigned_to))) for t in created_tasks],
-    }
+    return await _idempotent(db, getattr(data, "idempotency_key", None), company_id, created_by, "create_task_workflow", _create)
 
 
 async def list_tasks_for_owner(db: AsyncSession, company_id, limit: int = None, offset: int = None) -> List[dict]:
@@ -433,51 +482,54 @@ async def list_completed_tasks_for_owner(
 
 
 async def create_task(db: AsyncSession, company_id, created_by, data) -> dict:
-    scheduled_at = _combine_schedule(getattr(data, "scheduled_date", None), getattr(data, "scheduled_time", None))
-    initial_status = "scheduled" if scheduled_at else "new"
-    try:
-        task = await tasks_repo.create(
-            db,
-            company_id=company_id,
-            assigned_to=data.assigned_to,
-            title=data.title,
-            description=data.description,
-            priority=data.priority,
-            status=initial_status,
-            due_date=_parse_date(data.due_date),
-            due_time=data.due_time,
-            requires_proof=data.requires_proof,
-            proof_files=[],
-            created_by=created_by,
-            scheduled_activation_at=scheduled_at,
-        )
-    except IntegrityError as exc:
-        await db.rollback()
-        raise HTTPException(status_code=400, detail=_constraint_error_detail(exc, "Invalid task data"))
+    async def _create():
+        scheduled_at = _combine_schedule(getattr(data, "scheduled_date", None), getattr(data, "scheduled_time", None))
+        initial_status = "scheduled" if scheduled_at else "new"
+        try:
+            task = await tasks_repo.create(
+                db,
+                company_id=company_id,
+                assigned_to=data.assigned_to,
+                title=data.title,
+                description=data.description,
+                priority=data.priority,
+                status=initial_status,
+                due_date=_parse_date(data.due_date),
+                due_time=data.due_time,
+                requires_proof=data.requires_proof,
+                proof_files=[],
+                created_by=created_by,
+                scheduled_activation_at=scheduled_at,
+            )
+        except IntegrityError as exc:
+            await db.rollback()
+            raise HTTPException(status_code=400, detail=_constraint_error_detail(exc, "Invalid task data"))
 
-    await _store_attachments(db, task.id, company_id, created_by, data.attachments)
+        await _store_attachments(db, task.id, company_id, created_by, data.attachments)
 
-    # A Scheduled Task (Part 3) must be completely invisible to its
-    # assignee - including the notification - until self-heal activates it
-    # (see activate_due_tasks below).
-    if initial_status == "new":
-        await notifications_service.publish(
-            db,
-            user_id=data.assigned_to,
-            company_id=company_id,
-            category=notifications_service.CATEGORY_TASKS,
-            type="task_assigned",
-            title="مهمة جديدة",
-            message=f"تم تعيين مهمة جديدة لك: {task.title}",
-            entity_type="task",
-            entity_id=task.id,
-            action_url="/employee/tasks",
-        )
+        # A Scheduled Task (Part 3) must be completely invisible to its
+        # assignee - including the notification - until self-heal activates it
+        # (see activate_due_tasks below).
+        if initial_status == "new":
+            await notifications_service.publish(
+                db,
+                user_id=data.assigned_to,
+                company_id=company_id,
+                category=notifications_service.CATEGORY_TASKS,
+                type="task_assigned",
+                title="مهمة جديدة",
+                message=f"تم تعيين مهمة جديدة لك: {task.title}",
+                entity_type="task",
+                entity_id=task.id,
+                action_url="/employee/tasks",
+            )
 
-    await db.refresh(task)
-    names = await users_repo.get_names_by_ids(db, [task.assigned_to])
-    attachments = await _attachments_response(db, task.id)
-    return task_response(task, assigned_to_name=names.get(str(task.assigned_to)), attachments=attachments)
+        await db.refresh(task)
+        names = await users_repo.get_names_by_ids(db, [task.assigned_to])
+        attachments = await _attachments_response(db, task.id)
+        return task_response(task, assigned_to_name=names.get(str(task.assigned_to)), attachments=attachments)
+
+    return await _idempotent(db, getattr(data, "idempotency_key", None), company_id, created_by, "create_task", _create)
 
 
 async def update_task(db: AsyncSession, company_id, task_id: str, updates) -> dict:
@@ -532,45 +584,48 @@ async def create_urgent_task(db: AsyncSession, company_id, created_by, data) -> 
     if not data.assigned_to:
         raise HTTPException(status_code=400, detail="At least one employee must be assigned")
 
-    batch_id = uuid.uuid4()
-    created_ids = []
-    try:
-        for employee_id in data.assigned_to:
-            task = await tasks_repo.create(
-                db,
-                company_id=company_id,
-                assigned_to=employee_id,
-                title=data.title,
-                description=data.description,
-                priority="high",
-                status="new",
-                due_date=_parse_date(data.due_date),
-                requires_proof=data.requires_proof,
-                proof_files=[],
-                created_by=created_by,
-                task_category="urgent",
-                execution_date=_parse_date(data.execution_date),
-                execution_time=data.execution_time,
-                due_time=data.due_time,
-                batch_id=batch_id,
-            )
-            created_ids.append(str(task.id))
-            await notifications_service.publish(
-                db,
-                user_id=employee_id,
-                company_id=company_id,
-                category=notifications_service.CATEGORY_URGENT_TASKS,
-                type="urgent_task",
-                title="مهمة جديدة",
-                message=f"لديك مهمة جديدة: {data.title}",
-                entity_type="task",
-                entity_id=task.id,
-                action_url="/employee/tasks",
-            )
-    except IntegrityError as exc:
-        await db.rollback()
-        raise HTTPException(status_code=400, detail=_constraint_error_detail(exc, "Invalid task data"))
-    return {"message": "Urgent task created successfully", "task_ids": created_ids, "batch_id": str(batch_id)}
+    async def _create():
+        batch_id = uuid.uuid4()
+        created_ids = []
+        try:
+            for employee_id in data.assigned_to:
+                task = await tasks_repo.create(
+                    db,
+                    company_id=company_id,
+                    assigned_to=employee_id,
+                    title=data.title,
+                    description=data.description,
+                    priority="high",
+                    status="new",
+                    due_date=_parse_date(data.due_date),
+                    requires_proof=data.requires_proof,
+                    proof_files=[],
+                    created_by=created_by,
+                    task_category="urgent",
+                    execution_date=_parse_date(data.execution_date),
+                    execution_time=data.execution_time,
+                    due_time=data.due_time,
+                    batch_id=batch_id,
+                )
+                created_ids.append(str(task.id))
+                await notifications_service.publish(
+                    db,
+                    user_id=employee_id,
+                    company_id=company_id,
+                    category=notifications_service.CATEGORY_URGENT_TASKS,
+                    type="urgent_task",
+                    title="مهمة جديدة",
+                    message=f"لديك مهمة جديدة: {data.title}",
+                    entity_type="task",
+                    entity_id=task.id,
+                    action_url="/employee/tasks",
+                )
+        except IntegrityError as exc:
+            await db.rollback()
+            raise HTTPException(status_code=400, detail=_constraint_error_detail(exc, "Invalid task data"))
+        return {"message": "Urgent task created successfully", "task_ids": created_ids, "batch_id": str(batch_id)}
+
+    return await _idempotent(db, getattr(data, "idempotency_key", None), company_id, created_by, "create_urgent_task", _create)
 
 
 # ---- Daily task templates ----

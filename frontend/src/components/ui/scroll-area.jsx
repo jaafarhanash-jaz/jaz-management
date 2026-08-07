@@ -8,7 +8,12 @@ const ScrollArea = React.forwardRef(({ className, children, ...props }, ref) => 
     ref={ref}
     className={cn("relative overflow-hidden", className)}
     {...props}>
-    <ScrollAreaPrimitive.Viewport className="h-full w-full rounded-[inherit]">
+    {/* overscroll-contain stops scroll chaining: without it, once wheel/touch
+        scroll input exhausts this viewport's own scroll range (or on a fast
+        gesture that overshoots it), the leftover delta propagates to the
+        nearest scrollable ancestor - the page behind a Popover/Dialog - and
+        scrolls that instead. This is the fix for that, not a workaround. */}
+    <ScrollAreaPrimitive.Viewport className="h-full w-full rounded-[inherit] overscroll-contain">
       {children}
     </ScrollAreaPrimitive.Viewport>
     <ScrollBar />

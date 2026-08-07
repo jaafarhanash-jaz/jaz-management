@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -28,6 +28,17 @@ const CreateCriticalTaskDialog = ({ open, onOpenChange, employees, onCreated }) 
   const [pendingFiles, setPendingFiles] = useState([]);
   const [step, setStep] = useState('form'); // 'form' | 'confirm'
   const [submitting, setSubmitting] = useState(false);
+  // See CreateTaskDialog.js: submittingRef is a synchronous guard against a
+  // fast double-click on "إرسال المهمة العاجلة الآن" firing
+  // handleConfirmedSend twice before React disables the button; the
+  // idempotency key is one per dialog-open, reused across retries of the
+  // same logical submission.
+  const submittingRef = useRef(false);
+  const idempotencyKeyRef = useRef(null);
+
+  useEffect(() => {
+    if (open) idempotencyKeyRef.current = crypto.randomUUID();
+  }, [open]);
 
   const reset = () => {
     setForm(emptyForm);
@@ -67,6 +78,8 @@ const CreateCriticalTaskDialog = ({ open, onOpenChange, employees, onCreated }) 
   const selectedEmployee = employees.find((e) => e.id === form.assigned_to);
 
   const handleConfirmedSend = async () => {
+    if (submittingRef.current) return;
+    submittingRef.current = true;
     setSubmitting(true);
     try {
       await api.post('/owner/tasks', {
@@ -74,6 +87,7 @@ const CreateCriticalTaskDialog = ({ open, onOpenChange, employees, onCreated }) 
         due_time: form.due_time || null,
         priority: 'critical',
         attachments: pendingFiles,
+        idempotency_key: idempotencyKeyRef.current,
       });
       toast.success('تم إرسال المهمة العاجلة بنجاح');
       close();
@@ -81,6 +95,7 @@ const CreateCriticalTaskDialog = ({ open, onOpenChange, employees, onCreated }) 
     } catch (err) {
       toast.error(err.response?.data?.detail || 'حدث خطأ');
     }
+    submittingRef.current = false;
     setSubmitting(false);
   };
 

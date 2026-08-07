@@ -1,33 +1,58 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, lazy, Suspense } from 'react';
 import LoginPage from './pages/LoginPage';
 import SubscriptionBlocked from './pages/SubscriptionBlocked';
 import api from './utils/api';
-import SuperAdminDashboard from './pages/SuperAdmin/Dashboard';
-import SuperAdminCompanies from './pages/SuperAdmin/Companies';
-import SuperAdminPlans from './pages/SuperAdmin/Plans';
-import OwnerDashboard from './pages/Owner/Dashboard';
-import OwnerEmployees from './pages/Owner/Employees';
-import OwnerTasks from './pages/Owner/Tasks';
-import OwnerAttendance from './pages/Owner/Attendance';
-import OwnerReports from './pages/Owner/Reports';
-import OwnerDepartments from './pages/Owner/Departments';
-import OwnerSubscription from './pages/Owner/Subscription';
-import CommunicationCenter from './pages/Owner/CommunicationCenter';
-import CalendarMonitor from './pages/Owner/CalendarMonitor';
-import CompanyHolidays from './pages/Owner/CompanyHolidays';
-import WorkMessages from './pages/WorkMessages';
-import CalendarPage from './pages/Calendar';
-import Announcements from './pages/Announcements';
-import EmployeeDashboard from './pages/Employee/Dashboard';
-import EmployeeTasks from './pages/Employee/Tasks';
-import EmployeeAttendance from './pages/Employee/Attendance';
-import EmployeePerformance from './pages/Employee/Performance';
-import EmployeeReports from './pages/Employee/Reports';
-import Profile from './pages/Profile';
 import { Toaster } from 'sonner';
 import CriticalTaskAlert from './components/CriticalTaskAlert';
 import '@/App.css';
+
+// Route-based code splitting: previously every one of these ~24 page
+// components (super_admin + company_owner + employee page trees, all of
+// them) was a plain top-level import, so all of it landed in one 732KB
+// gzipped main bundle regardless of which single role/page a given visit
+// actually needs - a company_owner's browser was downloading and parsing
+// the entire employee and super_admin UI (and vice versa) before they
+// could even see the login page. React.lazy + the Suspense boundary below
+// makes each page its own chunk, fetched only when its route is actually
+// visited. Same components, same props, same behavior - just fetched on
+// demand instead of all upfront. LoginPage/SubscriptionBlocked stay eager
+// since one of them is what nearly every fresh visit renders first, and a
+// lazy chunk there would trade a bundle-size win for a loading flash on
+// the single most common page load.
+const SuperAdminDashboard = lazy(() => import('./pages/SuperAdmin/Dashboard'));
+const SuperAdminCompanies = lazy(() => import('./pages/SuperAdmin/Companies'));
+const SuperAdminPlans = lazy(() => import('./pages/SuperAdmin/Plans'));
+const OwnerDashboard = lazy(() => import('./pages/Owner/Dashboard'));
+const OwnerEmployees = lazy(() => import('./pages/Owner/Employees'));
+const OwnerTasks = lazy(() => import('./pages/Owner/Tasks'));
+const OwnerAttendance = lazy(() => import('./pages/Owner/Attendance'));
+const OwnerReports = lazy(() => import('./pages/Owner/Reports'));
+const OwnerDepartments = lazy(() => import('./pages/Owner/Departments'));
+const OwnerSubscription = lazy(() => import('./pages/Owner/Subscription'));
+const CommunicationCenter = lazy(() => import('./pages/Owner/CommunicationCenter'));
+const CalendarMonitor = lazy(() => import('./pages/Owner/CalendarMonitor'));
+const CompanyHolidays = lazy(() => import('./pages/Owner/CompanyHolidays'));
+const WorkMessages = lazy(() => import('./pages/WorkMessages'));
+const CalendarPage = lazy(() => import('./pages/Calendar'));
+const Announcements = lazy(() => import('./pages/Announcements'));
+const EmployeeDashboard = lazy(() => import('./pages/Employee/Dashboard'));
+const EmployeeTasks = lazy(() => import('./pages/Employee/Tasks'));
+const EmployeeAttendance = lazy(() => import('./pages/Employee/Attendance'));
+const EmployeePerformance = lazy(() => import('./pages/Employee/Performance'));
+const EmployeeReports = lazy(() => import('./pages/Employee/Reports'));
+const Profile = lazy(() => import('./pages/Profile'));
+
+// Shown only for the brief moment a lazy page chunk is being fetched
+// (typically a single-digit-ms cache hit after the first visit to that
+// route). Deliberately minimal, not a full skeleton - most page
+// components already render their own loading state for their data fetch
+// once mounted, so this only covers the JS-chunk-fetch gap before that.
+const RouteFallback = () => (
+  <div className="flex items-center justify-center min-h-screen">
+    <div className="animate-spin rounded-full h-8 w-8 border-2 border-gray-300 border-t-[#0033A0]" />
+  </div>
+);
 
 // Module-scope (not defined inside App()) so it keeps the same component
 // identity across every App re-render - e.g. the language toggle in Layout,
@@ -134,6 +159,7 @@ function App() {
   return (
     <div className="App" dir={language === 'ar' ? 'rtl' : 'ltr'}>
       <BrowserRouter>
+        <Suspense fallback={<RouteFallback />}>
         <Routes>
           <Route path="/subscription-blocked" element={<SubscriptionBlocked />} />
           <Route
@@ -369,6 +395,7 @@ function App() {
             }
           />
         </Routes>
+        </Suspense>
       </BrowserRouter>
       {isAuthenticated && userRole === 'employee' && (
         <CriticalTaskAlert tasks={pendingCriticalTasks} onHandled={handleCriticalTaskHandled} />

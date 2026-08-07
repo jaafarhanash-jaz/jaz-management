@@ -886,3 +886,26 @@ class Announcement(Base, TimestampMixin):
     created_by_name: Mapped[str] = mapped_column(String, nullable=False)
     title: Mapped[str] = mapped_column(String, nullable=False)
     message: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+# ============ Idempotency Keys ============
+
+class IdempotencyKey(Base):
+    """Backs the request-level idempotency mechanism used by task creation
+    (see services/tasks.py::_idempotent) to guarantee a duplicate
+    request - concurrent, retried, or a double-click that outraces the
+    frontend's own "saving" guard - can never create a second row. `key`
+    as the primary key is what makes this atomic: two requests racing to
+    insert the same key can't both succeed, so the loser's own would-be
+    task insert rolls back with it instead of leaving an orphaned
+    duplicate. Write-once - no updated_at, nothing ever mutates a row
+    after it's created."""
+
+    __tablename__ = "idempotency_keys"
+
+    key: Mapped[str] = mapped_column(String(100), primary_key=True)
+    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id")
+    created_by: Mapped[uuid.UUID] = fk_uuid("users.id")
+    endpoint: Mapped[str] = mapped_column(String(50), nullable=False)
+    response_body: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)

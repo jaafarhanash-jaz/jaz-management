@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -24,6 +24,18 @@ const CreateUrgentTaskDialog = ({ open, onOpenChange, employees, onCreated }) =>
   const [scheduleExecution, setScheduleExecution] = useState(false);
   const [setDueDateEnabled, setSetDueDateEnabled] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  // See CreateTaskDialog.js for why both of these exist: `submitting`
+  // (React state) disables the button, but only after a re-render, which
+  // is too slow to stop a fast double-click/double-Enter from firing
+  // handleSubmit twice - submittingRef is checked synchronously instead.
+  // idempotencyKeyRef is one key per dialog-open, reused across retries of
+  // the same logical submission so the backend can dedupe them.
+  const submittingRef = useRef(false);
+  const idempotencyKeyRef = useRef(null);
+
+  useEffect(() => {
+    if (open) idempotencyKeyRef.current = crypto.randomUUID();
+  }, [open]);
 
   const toggleEmployee = (id) => {
     setForm((f) => ({
@@ -38,6 +50,8 @@ const CreateUrgentTaskDialog = ({ open, onOpenChange, employees, onCreated }) =>
       toast.error('يرجى اختيار موظف واحد على الأقل');
       return;
     }
+    if (submittingRef.current) return;
+    submittingRef.current = true;
     setSubmitting(true);
     try {
       // Toggles gate whether these fields are sent at all - disabled means
@@ -48,7 +62,8 @@ const CreateUrgentTaskDialog = ({ open, onOpenChange, employees, onCreated }) =>
         execution_date: scheduleExecution ? (form.execution_date || null) : null,
         execution_time: scheduleExecution ? (form.execution_time || null) : null,
         due_date: setDueDateEnabled ? (form.due_date || null) : null,
-        due_time: setDueDateEnabled ? (form.due_time || null) : null
+        due_time: setDueDateEnabled ? (form.due_time || null) : null,
+        idempotency_key: idempotencyKeyRef.current,
       });
       toast.success('تم إرسال المهمة بنجاح');
       setForm(emptyForm);
@@ -59,6 +74,7 @@ const CreateUrgentTaskDialog = ({ open, onOpenChange, employees, onCreated }) =>
     } catch (err) {
       toast.error(err.response?.data?.detail || 'حدث خطأ');
     }
+    submittingRef.current = false;
     setSubmitting(false);
   };
 

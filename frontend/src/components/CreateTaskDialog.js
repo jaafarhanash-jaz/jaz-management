@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -35,9 +35,20 @@ const CreateTaskDialog = ({ open, onOpenChange, employees, onCreated, editingTas
   const [sequentialEnabled, setSequentialEnabled] = useState(false);
   const [employeeOrder, setEmployeeOrder] = useState([]);
   const [saving, setSaving] = useState(false);
+  // Belt-and-suspenders against double submission: `saving` only disables
+  // the submit button after React re-renders, which is asynchronous - a
+  // fast double-click/double-Enter can fire handleSubmit twice before that
+  // happens (confirmed in production: two identical tasks created 0.0s
+  // apart). This ref is checked synchronously, no render in between.
+  const submittingRef = useRef(false);
+  // One idempotency key per "dialog session" (regenerated whenever it's
+  // opened for a fresh task), not per handleSubmit call - a retried/raced
+  // request must resend the *same* key for the backend's dedup to work.
+  const idempotencyKeyRef = useRef(null);
 
   useEffect(() => {
     if (!open) return;
+    idempotencyKeyRef.current = crypto.randomUUID();
     if (editingTask) {
       setForm({
         title: editingTask.title || '', description: editingTask.description || '',
@@ -86,6 +97,8 @@ const CreateTaskDialog = ({ open, onOpenChange, employees, onCreated, editingTas
 
   const handleSubmit = async (e) => {
     e.preventDefault();
+    if (submittingRef.current) return;
+    submittingRef.current = true;
     setSaving(true);
     try {
       if (editingId) {
@@ -97,6 +110,7 @@ const CreateTaskDialog = ({ open, onOpenChange, employees, onCreated, editingTas
       } else if (sequentialEnabled) {
         if (employeeOrder.length < 2) {
           toast.error('سير العمل التسلسلي يتطلب موظفَين على الأقل بالترتيب');
+          submittingRef.current = false;
           setSaving(false);
           return;
         }
@@ -105,6 +119,7 @@ const CreateTaskDialog = ({ open, onOpenChange, employees, onCreated, editingTas
           employee_order: employeeOrder, due_date: form.due_date || null, due_time: form.due_time || null,
           requires_proof: form.requires_proof, attachments: pendingFiles,
           scheduled_date: scheduleEnabled ? scheduleDate : null, scheduled_time: scheduleEnabled ? scheduleTime : null,
+          idempotency_key: idempotencyKeyRef.current,
         });
         toast.success('تم إنشاء سير العمل التسلسلي');
       } else {
@@ -114,6 +129,7 @@ const CreateTaskDialog = ({ open, onOpenChange, employees, onCreated, editingTas
           attachments: pendingFiles,
           scheduled_date: scheduleEnabled ? scheduleDate : null,
           scheduled_time: scheduleEnabled ? scheduleTime : null,
+          idempotency_key: idempotencyKeyRef.current,
         });
         toast.success(scheduleEnabled ? 'تمت جدولة المهمة' : 'تمت الإضافة بنجاح');
       }
@@ -122,6 +138,7 @@ const CreateTaskDialog = ({ open, onOpenChange, employees, onCreated, editingTas
     } catch (err) {
       toast.error(err.response?.data?.detail || 'حدث خطأ');
     }
+    submittingRef.current = false;
     setSaving(false);
   };
 

@@ -361,6 +361,12 @@ class TaskCreate(BaseModel):
     # scheduled_date means "activate immediately", exactly today's behavior.
     scheduled_date: Optional[str] = None
     scheduled_time: Optional[str] = None
+    # Optional, client-generated (fresh per submit attempt - see
+    # CreateTaskDialog.js). Lets tasks_service._idempotent guarantee a
+    # duplicate request (double-click, retry, race) can never create a
+    # second task. Omitted entirely = no protection, same as before this
+    # existed - never required, so older/unmodified clients are unaffected.
+    idempotency_key: Optional[str] = None
 
 class TaskWorkflowCreate(BaseModel):
     """Sequential Workflow (Part 4) - same shape as TaskCreate but
@@ -375,6 +381,7 @@ class TaskWorkflowCreate(BaseModel):
     requires_proof: bool = False
     scheduled_date: Optional[str] = None
     scheduled_time: Optional[str] = None
+    idempotency_key: Optional[str] = None
 
 class TaskUpdate(BaseModel):
     title: Optional[str] = None
@@ -502,6 +509,7 @@ class UrgentTaskCreate(BaseModel):
     due_date: Optional[str] = None
     due_time: Optional[str] = None
     requires_proof: bool = False
+    idempotency_key: Optional[str] = None
 
 class TaskProofUpload(BaseModel):
     """Layer 1 of the proof-upload hardening (defense in depth - see
