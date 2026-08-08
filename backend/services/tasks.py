@@ -910,6 +910,19 @@ async def upload_task_proof(db: AsyncSession, employee_id, task_id: str, proof) 
     if not file_url:
         raise HTTPException(status_code=400, detail="file_url must not be empty or whitespace-only")
 
+    # Enforces the same MAX_ATTACHMENT_BYTES ceiling every other attachment
+    # type in this app is already held to (owner task attachments, calendar,
+    # messages - all via storage.py). This path never used to check size at
+    # all before storing file_url straight into Task.proof_files, which is
+    # why nginx's client_max_body_size was the only thing standing between
+    # an oversized photo and this endpoint (see the nginx config fix). Now
+    # that nginx allows large-enough requests through, this closes the gap:
+    # decode_and_validate's return value is intentionally discarded - this
+    # path still stores the original data-URL string, not the decoded
+    # bytes, matching the existing proof_files contract the frontend
+    # already renders directly as <img src>.
+    decode_and_validate(file_url, filename="proof")
+
     parsed_id = parse_uuid(task_id)
     try:
         appended = parsed_id and await tasks_repo.append_proof_file(db, parsed_id, employee_id, file_url)
