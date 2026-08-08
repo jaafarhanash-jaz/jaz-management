@@ -12,48 +12,17 @@ import api from '@/utils/api';
 import { t } from '@/utils/translations';
 import { validateAndFocus } from '@/utils/formValidation';
 import {
+  PRIORITY_COLORS, STATUS_COLORS, STATUS_LABELS_AR, PRIORITY_LABELS_AR,
+  getCategoryBadge, formatTime, formatDuration,
+} from '@/utils/taskDisplay';
+import {
   Plus, Pencil, Trash2, CheckSquare, Siren, Repeat, PauseCircle, PlayCircle, ChevronDown, ChevronUp,
-  CalendarClock, GitBranch, X as XIcon, Archive, ArrowRight, UserCircle, Timer,
+  CalendarClock, GitBranch, X as XIcon, Archive, ArrowRight, UserCircle, Timer, Eye,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import CreateUrgentTaskDialog from '@/components/CreateUrgentTaskDialog';
 import CreateTaskDialog from '@/components/CreateTaskDialog';
-
-const PRIORITY_COLORS = {
-  critical: 'bg-red-100 text-red-800 border-red-300',
-  high: 'bg-red-50 text-red-700 border-red-200',
-  medium: 'bg-yellow-50 text-yellow-700 border-yellow-200',
-  low: 'bg-blue-50 text-blue-700 border-blue-200',
-};
-
-const STATUS_COLORS = {
-  new: 'bg-blue-50 text-blue-700 border-blue-200',
-  received: 'bg-indigo-50 text-indigo-700 border-indigo-200',
-  seen: 'bg-purple-50 text-purple-700 border-purple-200',
-  in_progress: 'bg-yellow-50 text-yellow-700 border-yellow-200',
-  pending_review: 'bg-purple-50 text-purple-700 border-purple-200',
-  completed: 'bg-green-50 text-green-700 border-green-200',
-  rejected: 'bg-red-50 text-red-700 border-red-200',
-  overdue: 'bg-red-50 text-red-700 border-red-200',
-  cancelled: 'bg-gray-100 text-gray-500 border-gray-300',
-  scheduled: 'bg-indigo-50 text-indigo-700 border-indigo-200',
-  pending_sequence: 'bg-gray-50 text-gray-500 border-gray-200',
-};
-
-const STATUS_LABELS_AR = {
-  new: 'جديدة (معلقة)', received: 'تم الاستلام', seen: 'شوهدت', in_progress: 'قيد التنفيذ', pending_review: 'بانتظار المراجعة',
-  completed: 'مكتملة', rejected: 'مرفوضة', overdue: 'متأخرة', cancelled: 'ملغاة',
-  scheduled: 'مجدولة', pending_sequence: 'بانتظار الدور',
-};
-const PRIORITY_LABELS_AR = { high: 'عالية', medium: 'متوسطة', low: 'منخفضة', critical: 'عاجلة' };
-
-const getCategoryBadge = (task) => {
-  if (task.task_category === 'urgent') return { label: '⚡ فورية', className: 'bg-red-50 text-red-700 border-red-200' };
-  if (task.task_category === 'daily') return { label: '📋 يومية', className: 'bg-indigo-50 text-indigo-700 border-indigo-200' };
-  return null;
-};
-
-const formatTime = (iso) => iso ? new Date(iso).toLocaleString('ar-EG', { dateStyle: 'short', timeStyle: 'short' }) : null;
+import CompletedTaskDetailDialog from '@/components/CompletedTaskDetailDialog';
 
 const TaskTimeline = ({ task }) => {
   const steps = [
@@ -79,7 +48,7 @@ const TaskTimeline = ({ task }) => {
 // same badges/timeline for both, just with history-only fields (creator,
 // completion date, completion duration) and no edit/delete actions when
 // historyView is set - completed tasks are the permanent archive.
-const TaskCard = ({ task, expanded, onToggleExpand, onEdit, onDelete, historyView = false, highlighted = false }) => {
+const TaskCard = ({ task, expanded, onToggleExpand, onEdit, onDelete, onViewDetails, historyView = false, highlighted = false }) => {
   const categoryBadge = getCategoryBadge(task);
   return (
     <Card
@@ -147,6 +116,11 @@ const TaskCard = ({ task, expanded, onToggleExpand, onEdit, onDelete, historyVie
             </Button>
           </div>
         )}
+        {historyView && (
+          <Button variant="outline" size="sm" onClick={() => onViewDetails(task)} data-testid={`view-details-${task.id}`}>
+            <Eye className="w-4 h-4 me-1.5" /> عرض التفاصيل
+          </Button>
+        )}
       </div>
     </Card>
   );
@@ -163,24 +137,6 @@ const HISTORY_SORT_OPTIONS = [
   { value: 'employee_name', label: 'اسم الموظف' },
   { value: 'priority', label: 'الأولوية' },
 ];
-
-// Completion duration (Task History) - derived purely client-side from the
-// same created_at/completed_at fields the task already carries; no new
-// backend field, matches the "reuse existing Task data" rule.
-const formatDuration = (startIso, endIso) => {
-  if (!startIso || !endIso) return '-';
-  const ms = new Date(endIso) - new Date(startIso);
-  if (!Number.isFinite(ms) || ms < 0) return '-';
-  const totalMinutes = Math.floor(ms / 60000);
-  const days = Math.floor(totalMinutes / 1440);
-  const hours = Math.floor((totalMinutes % 1440) / 60);
-  const minutes = totalMinutes % 60;
-  const parts = [];
-  if (days) parts.push(`${days} يوم`);
-  if (hours) parts.push(`${hours} ساعة`);
-  if (minutes || parts.length === 0) parts.push(`${minutes} دقيقة`);
-  return parts.join(' ');
-};
 
 const buildHistoryQuery = (f) => {
   const params = new URLSearchParams();
@@ -202,6 +158,7 @@ const OwnerTasks = ({ onLogout, language, setLanguage }) => {
   const [employees, setEmployees] = useState([]);
   const [loading, setLoading] = useState(true);
   const [expandedId, setExpandedId] = useState(null);
+  const [detailTask, setDetailTask] = useState(null);
 
   // Dashboard widgets deep-link here (Part 1) - e.g. "Urgent Tasks"
   // navigates to ?view=urgent, "Critical Tasks" to ?view=critical. Purely a
@@ -659,6 +616,7 @@ const OwnerTasks = ({ onLogout, language, setLanguage }) => {
                     historyView
                     expanded={historyExpandedId === task.id}
                     onToggleExpand={(id) => setHistoryExpandedId(historyExpandedId === id ? null : id)}
+                    onViewDetails={setDetailTask}
                     highlighted={highlightId === task.id}
                   />
                 ))}
@@ -666,6 +624,12 @@ const OwnerTasks = ({ onLogout, language, setLanguage }) => {
             )}
           </div>
         )}
+
+        <CompletedTaskDetailDialog
+          task={detailTask}
+          open={!!detailTask}
+          onOpenChange={(v) => { if (!v) setDetailTask(null); }}
+        />
 
         <CreateTaskDialog
           open={taskDialogOpen}
