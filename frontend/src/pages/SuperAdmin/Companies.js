@@ -9,6 +9,7 @@ import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover
 import { Command, CommandInput, CommandList, CommandEmpty, CommandGroup, CommandItem } from '@/components/ui/command';
 import api from '@/utils/api';
 import { t } from '@/utils/translations';
+import { validateAndFocus } from '@/utils/formValidation';
 import { Plus, Pencil, Trash2, Building2, PlayCircle, PauseCircle, RotateCcw, RefreshCw, ChevronsUpDown, Check } from 'lucide-react';
 import { toast } from 'sonner';
 
@@ -129,6 +130,7 @@ const SuperAdminCompanies = ({ onLogout, language, setLanguage }) => {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
+    if (!validateAndFocus(e.currentTarget)) return;
     if (!form.subscription_plan_id) {
       toast.error('يرجى اختيار خطة اشتراك');
       return;
@@ -161,6 +163,7 @@ const SuperAdminCompanies = ({ onLogout, language, setLanguage }) => {
 
   const handleEditSubmit = async (e) => {
     e.preventDefault();
+    if (!validateAndFocus(e.currentTarget)) return;
     setEditFieldErrors({});
 
     if (editForm.owner_password || editForm.owner_password_confirm) {
@@ -214,6 +217,7 @@ const SuperAdminCompanies = ({ onLogout, language, setLanguage }) => {
 
   const handleRenewSubmit = async (e) => {
     e.preventDefault();
+    if (!validateAndFocus(e.currentTarget)) return;
     if (!renewForm.subscription_plan_id) {
       toast.error('يرجى اختيار خطة اشتراك');
       return;
@@ -237,6 +241,7 @@ const SuperAdminCompanies = ({ onLogout, language, setLanguage }) => {
 
   const handleActivateSubmit = async (e) => {
     e.preventDefault();
+    if (!validateAndFocus(e.currentTarget)) return;
     if (activateForm.subscription_end_date < activateForm.subscription_start_date) {
       toast.error('تاريخ الانتهاء لا يمكن أن يكون قبل تاريخ البدء');
       return;

@@ -261,7 +261,7 @@ async def activate_due_tasks(db: AsyncSession, company_id) -> None:
             message=f"تم تفعيل مهمة مجدولة: {task.title}",
             entity_type="task",
             entity_id=task.id,
-            action_url="/employee/tasks",
+            action_url=f"/employee/tasks?highlight={task.id}",
         )
 
 
@@ -287,7 +287,7 @@ async def _advance_workflow(db: AsyncSession, task) -> None:
         message=f"دورك الآن في سير العمل: {next_task.title}",
         entity_type="task",
         entity_id=next_task.id,
-        action_url="/employee/tasks",
+        action_url=f"/employee/tasks?highlight={next_task.id}",
     )
 
 
@@ -378,7 +378,7 @@ async def create_task_workflow(db: AsyncSession, company_id, created_by, data) -
                 message=f"بدأ سير عمل تسلسلي - دورك الآن: {created_tasks[0].title}",
                 entity_type="task",
                 entity_id=created_tasks[0].id,
-                action_url="/employee/tasks",
+                action_url=f"/employee/tasks?highlight={created_tasks[0].id}",
             )
 
         names = await users_repo.get_names_by_ids(db, [t.assigned_to for t in created_tasks])
@@ -443,7 +443,16 @@ async def list_completed_tasks_for_owner(
         search=search,
         employee_id=parse_uuid(employee_id) if employee_id else None,
         created_by=parse_uuid(created_by) if created_by else None,
-        priority=priority,
+        # Unguarded before: an empty-string priority (falsy, but not None)
+        # reached the repo's `if priority is not None` check as a real
+        # value, producing `WHERE priority = ''` - a condition no row can
+        # ever match, silently returning zero completed tasks. The
+        # current frontend (buildHistoryQuery) already omits empty
+        # filters, so this specific path isn't reachable today, but nothing
+        # stops a future caller from sending one - guarding here matches
+        # employee_id/created_by immediately above and closes the gap for
+        # any caller, not just this one.
+        priority=priority if priority else None,
         created_from=_day_bounds(created_from),
         created_to=_day_bounds(created_to, end=True),
         completed_from=_day_bounds(completed_from),
@@ -521,7 +530,7 @@ async def create_task(db: AsyncSession, company_id, created_by, data) -> dict:
                 message=f"تم تعيين مهمة جديدة لك: {task.title}",
                 entity_type="task",
                 entity_id=task.id,
-                action_url="/employee/tasks",
+                action_url=f"/employee/tasks?highlight={task.id}",
             )
 
         await db.refresh(task)
@@ -618,7 +627,7 @@ async def create_urgent_task(db: AsyncSession, company_id, created_by, data) -> 
                     message=f"لديك مهمة جديدة: {data.title}",
                     entity_type="task",
                     entity_id=task.id,
-                    action_url="/employee/tasks",
+                    action_url=f"/employee/tasks?highlight={task.id}",
                 )
         except IntegrityError as exc:
             await db.rollback()
@@ -818,6 +827,11 @@ async def update_task_status(db: AsyncSession, employee, company_id, task_id: st
     task.status = new_status
     if new_status == "completed":
         task.completed_at = datetime.now(timezone.utc)
+        # Matches the dedicated complete_task endpoint (this is the
+        # generic status-update path's equivalent "who completed it" -
+        # previously never set here, leaving completed_by NULL for any
+        # task completed through this endpoint instead of /complete).
+        task.completed_by = employee["id"]
 
     critical_task_started = None
     if new_status == "in_progress":
@@ -842,7 +856,7 @@ async def update_task_status(db: AsyncSession, employee, company_id, task_id: st
             message=f"بدأ الموظف {employee['name']} العمل على المهمة العاجلة: {critical_task_started.title}",
             entity_type="task",
             entity_id=critical_task_started.id,
-            action_url="/company-owner/tasks",
+            action_url=f"/company-owner/tasks?highlight={critical_task_started.id}",
             sender_id=employee["id"],
             sender_name=employee["name"],
         )
@@ -858,7 +872,7 @@ async def update_task_status(db: AsyncSession, employee, company_id, task_id: st
             message=f"أكمل الموظف {employee['name']} المهمة: {task.title}",
             entity_type="task",
             entity_id=task.id,
-            action_url="/company-owner/tasks",
+            action_url=f"/company-owner/tasks?highlight={task.id}",
             sender_id=employee["id"],
             sender_name=employee["name"],
         )
@@ -892,7 +906,7 @@ async def receive_critical_task(db: AsyncSession, employee, company_id, task_id:
         message=f"قام الموظف {employee['name']} باستلام المهمة العاجلة: {task.title}",
         entity_type="task",
         entity_id=task.id,
-        action_url="/company-owner/tasks",
+        action_url=f"/company-owner/tasks?highlight={task.id}",
         sender_id=employee["id"],
         sender_name=employee["name"],
     )
@@ -996,7 +1010,7 @@ async def complete_task(db: AsyncSession, employee_id, task_id: str) -> dict:
         message=f"أكمل الموظف {employee_name} المهمة: {task.title}",
         entity_type="task",
         entity_id=task.id,
-        action_url="/company-owner/tasks",
+        action_url=f"/company-owner/tasks?highlight={task.id}",
         sender_id=employee_id,
         sender_name=employee_name,
     )

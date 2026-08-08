@@ -8,6 +8,7 @@ import { Checkbox } from '@/components/ui/checkbox';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import api from '@/utils/api';
 import { toast } from 'sonner';
+import { validateAndFocus } from '@/utils/formValidation';
 import { Siren, Paperclip, X, AlertTriangle } from 'lucide-react';
 
 const emptyForm = {
@@ -64,6 +65,7 @@ const CreateCriticalTaskDialog = ({ open, onOpenChange, employees, onCreated }) 
 
   const goToConfirm = (e) => {
     e.preventDefault();
+    if (!validateAndFocus(e.currentTarget)) return;
     if (!form.assigned_to) {
       toast.error('يرجى اختيار الموظف');
       return;

@@ -7,6 +7,7 @@ import { Card } from '@/components/ui/card';
 import api from '@/utils/api';
 import { toast } from 'sonner';
 import { t } from '@/utils/translations';
+import { validateAndFocus } from '@/utils/formValidation';
 
 const LoginPage = ({ onLogin }) => {
   const navigate = useNavigate();
@@ -22,6 +23,7 @@ const LoginPage = ({ onLogin }) => {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
+    if (!validateAndFocus(e.currentTarget)) return;
     setLoading(true);
     setError('');
 

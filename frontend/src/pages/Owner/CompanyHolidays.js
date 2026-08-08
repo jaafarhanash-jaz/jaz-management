@@ -9,6 +9,7 @@ import { Checkbox } from '@/components/ui/checkbox';
 import { Switch } from '@/components/ui/switch';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
 import api from '@/utils/api';
+import { validateAndFocus } from '@/utils/formValidation';
 import { Plus, CalendarOff, Pencil, Ban, Power, CalendarDays } from 'lucide-react';
 import { toast } from 'sonner';
 
@@ -100,6 +101,7 @@ const OwnerCompanyHolidays = ({ onLogout, language, setLanguage }) => {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
+    if (!validateAndFocus(e.currentTarget)) return;
     if (!form.start_date || !form.end_date) {
       toast.error('يرجى تحديد تاريخ البداية والنهاية');
       return;

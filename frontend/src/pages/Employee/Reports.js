@@ -7,6 +7,7 @@ import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
 import api from '@/utils/api';
 import { t } from '@/utils/translations';
+import { validateAndFocus } from '@/utils/formValidation';
 import { Upload, X, Send, Image as ImageIcon } from 'lucide-react';
 import { toast } from 'sonner';
 
@@ -39,6 +40,7 @@ const EmployeeReports = ({ onLogout, language, setLanguage }) => {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
+    if (!validateAndFocus(e.currentTarget)) return;
     setSubmitting(true);
     try {
       await api.post('/employee/reports', { ...form, images, files });

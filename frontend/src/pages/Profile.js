@@ -6,6 +6,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import api from '@/utils/api';
 import { t } from '@/utils/translations';
+import { validateAndFocus } from '@/utils/formValidation';
 import {
   User, Mail, Briefcase, Camera, Trash2, Upload,
   KeyRound, Globe, ShieldCheck, Loader2,
@@ -100,6 +101,7 @@ const Profile = ({ onLogout, language, setLanguage, userRole }) => {
 
   const handleSaveInfo = async (e) => {
     e.preventDefault();
+    if (!validateAndFocus(e.currentTarget)) return;
     if (!form.name.trim() || !form.phone.trim()) {
       toast.error(isAr ? 'الاسم ورقم الهاتف مطلوبان' : 'Name and phone are required');
       return;
@@ -157,6 +159,7 @@ const Profile = ({ onLogout, language, setLanguage, userRole }) => {
 
   const handleChangePassword = async (e) => {
     e.preventDefault();
+    if (!validateAndFocus(e.currentTarget)) return;
     if (!pwForm.current_password || !pwForm.new_password || !pwForm.confirm_password) {
       toast.error(isAr ? 'يرجى تعبئة جميع الحقول' : 'Please fill in all fields');
       return;

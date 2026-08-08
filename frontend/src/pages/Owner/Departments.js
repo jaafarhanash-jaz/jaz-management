@@ -8,6 +8,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import api from '@/utils/api';
 import { t } from '@/utils/translations';
+import { validateAndFocus } from '@/utils/formValidation';
 import { Plus, Building } from 'lucide-react';
 import { toast } from 'sonner';
 
@@ -35,6 +36,7 @@ const OwnerDepartments = ({ onLogout, language, setLanguage }) => {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
+    if (!validateAndFocus(e.currentTarget)) return;
     try {
       await api.post('/owner/departments', form);
       toast.success('تمت الإضافة بنجاح');

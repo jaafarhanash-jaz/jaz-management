@@ -96,6 +96,10 @@ async def deliver_message(db: AsyncSession, message, employee_ids: List[uuid.UUI
     )
 
     names = await users_repo.get_names_by_ids(db, employee_ids)
+    # Needed only to pick the role-correct action_url prefix below
+    # (/company-owner/messages vs /employee/messages) - WorkMessages.js is
+    # one shared component mounted at both routes.
+    recipients_by_id = await users_repo.get_by_ids(db, employee_ids)
     for employee_id in employee_ids:
         await recipients_repo.create(
             db,
@@ -104,11 +108,14 @@ async def deliver_message(db: AsyncSession, message, employee_ids: List[uuid.UUI
             role="recipient", status="delivered", is_unread=True, is_starred=False,
             delivered_at=now,
         )
+        recipient = recipients_by_id.get(str(employee_id))
+        base_path = "/company-owner/messages" if recipient and recipient.role == "company_owner" else "/employee/messages"
         await notifications_service.publish(
             db, user_id=employee_id, company_id=message.company_id,
             category=notifications_service.CATEGORY_MESSAGES, type="work_message",
             title="رسالة عمل جديدة", message=message.subject,
             entity_type="message", entity_id=message.id,
+            action_url=f"{base_path}?thread={message.thread_id}",
             sender_id=message.sender_id, sender_name=message.sender_name,
         )
 
@@ -122,12 +129,16 @@ async def notify_reply_participants(db: AsyncSession, reply, thread_id, particip
     """A reply does not create new message_recipients rows - it re-opens the
     existing thread-level row for every other participant and notifies them."""
     await recipients_repo.mark_unread_bulk(db, thread_id, participant_ids)
+    participants_by_id = await users_repo.get_by_ids(db, participant_ids)
     for participant_id in participant_ids:
+        participant = participants_by_id.get(str(participant_id))
+        base_path = "/company-owner/messages" if participant and participant.role == "company_owner" else "/employee/messages"
         await notifications_service.publish(
             db, user_id=participant_id, company_id=reply.company_id,
             category=notifications_service.CATEGORY_MESSAGES, type="message_reply",
             title="رد على رسالة", message=reply.subject,
             entity_type="message", entity_id=reply.id,
+            action_url=f"{base_path}?thread={thread_id}",
             sender_id=reply.sender_id, sender_name=reply.sender_name,
         )
     await write_message_activity(

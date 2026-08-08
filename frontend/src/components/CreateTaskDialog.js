@@ -8,6 +8,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Checkbox } from '@/components/ui/checkbox';
 import api from '@/utils/api';
 import { toast } from 'sonner';
+import { validateAndFocus } from '@/utils/formValidation';
 import { CalendarClock, GitBranch, ArrowUp, ArrowDown, X as XIcon, Paperclip } from 'lucide-react';
 
 const emptyForm = () => ({
@@ -97,6 +98,7 @@ const CreateTaskDialog = ({ open, onOpenChange, employees, onCreated, editingTas
 
   const handleSubmit = async (e) => {
     e.preventDefault();
+    if (!validateAndFocus(e.currentTarget)) return;
     if (submittingRef.current) return;
     submittingRef.current = true;
     setSaving(true);

@@ -6,6 +6,7 @@ import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
 import api from '@/utils/api';
 import { toast } from 'sonner';
+import { validateAndFocus } from '@/utils/formValidation';
 import { Megaphone } from 'lucide-react';
 
 const emptyForm = { title: '', message: '' };
@@ -25,6 +26,7 @@ const CreateAnnouncementDialog = ({ open, onOpenChange, onCreated }) => {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
+    if (!validateAndFocus(e.currentTarget)) return;
     setSubmitting(true);
     try {
       await api.post('/owner/announcements', form);

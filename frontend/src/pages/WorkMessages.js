@@ -11,6 +11,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/u
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import api from '@/utils/api';
 import { t } from '@/utils/translations';
+import { validateAndFocus } from '@/utils/formValidation';
 import {
   Mail, Send, Archive as ArchiveIcon, Star, FileEdit, Paperclip, Reply, Forward,
   CheckCircle2, Pin, Bell, Search, Download, X, AlertTriangle, Clock, Siren,
@@ -83,6 +84,10 @@ const WorkMessages = ({ onLogout, language, setLanguage, userRole }) => {
   const [compose, setCompose] = useState(emptyCompose());
   const [pendingFiles, setPendingFiles] = useState([]);
   const [sending, setSending] = useState(false);
+  // Compose isn't a native <form> (Send/Save Draft are separate onClick
+  // buttons, not a submit), so validateAndFocus is called against this
+  // container ref instead of e.currentTarget.
+  const composeFormRef = useRef(null);
 
   const [threadOpen, setThreadOpen] = useState(false);
   const [thread, setThread] = useState(null);
@@ -203,7 +208,7 @@ const WorkMessages = ({ onLogout, language, setLanguage, userRole }) => {
   };
 
   const submitCompose = async (asDraft) => {
-    if (!compose.subject.trim() || !compose.body.trim()) { toast.error('العنوان والنص مطلوبان'); return; }
+    if (!validateAndFocus(composeFormRef.current)) return;
     if (!asDraft && compose.recipientIds.length === 0) { toast.error('يرجى اختيار مستلم واحد على الأقل'); return; }
     setSending(true);
     try {
@@ -463,10 +468,10 @@ const WorkMessages = ({ onLogout, language, setLanguage, userRole }) => {
         <Dialog open={composeOpen} onOpenChange={setComposeOpen}>
           <DialogContent className="max-w-2xl max-h-[85vh] overflow-y-auto" data-testid="compose-dialog">
             <DialogHeader><DialogTitle>{compose.editingId ? 'تعديل المسودة' : 'رسالة عمل جديدة'}</DialogTitle></DialogHeader>
-            <div className="space-y-4">
-              <Input placeholder="العنوان" value={compose.subject} data-testid="compose-subject"
+            <div className="space-y-4" ref={composeFormRef}>
+              <Input id="compose-subject-field" required placeholder="العنوان" value={compose.subject} data-testid="compose-subject"
                 onChange={(e) => setCompose({ ...compose, subject: e.target.value })} />
-              <Textarea placeholder="نص الرسالة" rows={5} value={compose.body} data-testid="compose-body"
+              <Textarea id="compose-body-field" required placeholder="نص الرسالة" rows={5} value={compose.body} data-testid="compose-body"
                 onChange={(e) => setCompose({ ...compose, body: e.target.value })} />
 
               <div className="grid grid-cols-2 gap-4">

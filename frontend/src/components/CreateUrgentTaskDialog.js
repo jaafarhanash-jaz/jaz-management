@@ -7,6 +7,7 @@ import { Textarea } from '@/components/ui/textarea';
 import { Checkbox } from '@/components/ui/checkbox';
 import api from '@/utils/api';
 import { toast } from 'sonner';
+import { validateAndFocus } from '@/utils/formValidation';
 
 const emptyForm = {
   assigned_to: [],
@@ -46,6 +47,7 @@ const CreateUrgentTaskDialog = ({ open, onOpenChange, employees, onCreated }) =>
 
   const handleSubmit = async (e) => {
     e.preventDefault();
+    if (!validateAndFocus(e.currentTarget)) return;
     if (form.assigned_to.length === 0) {
       toast.error('يرجى اختيار موظف واحد على الأقل');
       return;

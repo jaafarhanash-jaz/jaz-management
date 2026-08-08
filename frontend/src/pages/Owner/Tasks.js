@@ -10,6 +10,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '
 import { Checkbox } from '@/components/ui/checkbox';
 import api from '@/utils/api';
 import { t } from '@/utils/translations';
+import { validateAndFocus } from '@/utils/formValidation';
 import {
   Plus, Pencil, Trash2, CheckSquare, Siren, Repeat, PauseCircle, PlayCircle, ChevronDown, ChevronUp,
   CalendarClock, GitBranch, X as XIcon, Archive, ArrowRight, UserCircle, Timer,
@@ -78,10 +79,14 @@ const TaskTimeline = ({ task }) => {
 // same badges/timeline for both, just with history-only fields (creator,
 // completion date, completion duration) and no edit/delete actions when
 // historyView is set - completed tasks are the permanent archive.
-const TaskCard = ({ task, expanded, onToggleExpand, onEdit, onDelete, historyView = false }) => {
+const TaskCard = ({ task, expanded, onToggleExpand, onEdit, onDelete, historyView = false, highlighted = false }) => {
   const categoryBadge = getCategoryBadge(task);
   return (
-    <Card className="p-6 bg-white border border-gray-200 rounded-md task-card" data-testid={`task-card-${task.id}`}>
+    <Card
+      id={`task-${task.id}`}
+      className={`p-6 bg-white border rounded-md task-card transition-shadow ${highlighted ? 'ring-2 ring-[#0033A0] ring-offset-2 border-gray-200' : 'border-gray-200'}`}
+      data-testid={`task-card-${task.id}`}
+    >
       <div className="flex justify-between items-start gap-4">
         <div className="flex-1">
           <div className="flex items-center gap-2 mb-2 flex-wrap">
@@ -206,6 +211,15 @@ const OwnerTasks = ({ onLogout, language, setLanguage }) => {
   const [searchParams, setSearchParams] = useSearchParams();
   const [quickFilter, setQuickFilter] = useState(searchParams.get('view') || 'all');
   useEffect(() => { setQuickFilter(searchParams.get('view') || 'all'); }, [searchParams]);
+
+  // Notifications (task_completed, critical_task_started/received) link
+  // here with ?highlight=<id> - same "scroll to and outline the card"
+  // pattern as Employee/Tasks.js's Dashboard quick-open. A completed
+  // task only ever lives in Task History (see list_tasks_for_owner's own
+  // docstring - the active list deliberately excludes it), so if the id
+  // isn't in the active list, switch into History mode instead of
+  // silently highlighting nothing.
+  const highlightId = searchParams.get('highlight');
   const visibleTasks = tasks.filter((task) => {
     if (quickFilter === 'urgent') return task.task_category === 'urgent';
     if (quickFilter === 'critical') return task.priority === 'critical';
@@ -243,19 +257,48 @@ const OwnerTasks = ({ onLogout, language, setLanguage }) => {
     return () => clearInterval(interval);
   }, []);
 
-  const fetchHistory = async () => {
-    setHistoryLoading(true);
+  const fetchHistory = async (silent = false) => {
+    if (!silent) setHistoryLoading(true);
     try {
       const res = await api.get(`/owner/tasks/history?${buildHistoryQuery(historyFilters)}`);
       setHistoryTasks(res.data);
-    } catch (e) { toast.error('خطأ في جلب سجل المهام'); }
-    setHistoryLoading(false);
+    } catch (e) { if (!silent) toast.error('خطأ في جلب سجل المهام'); }
+    if (!silent) setHistoryLoading(false);
   };
+
+  // The active list above polls every 10s so a newly-created/updated task
+  // shows up without a manual refresh; History never did, so a task an
+  // employee completes while the owner already has this tab open (or
+  // navigates to it from a stale mount) doesn't appear until they touch a
+  // filter or toggle away and back - "not appearing" even though the data
+  // was always there. Same polling pattern as fetchAll, scoped to only
+  // run while History is actually the visible tab.
+  useEffect(() => {
+    if (!historyMode) return undefined;
+    const interval = setInterval(() => fetchHistory(true), 10000);
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [historyMode, historyFilters]);
 
   useEffect(() => {
     if (historyMode) fetchHistory();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [historyMode, historyFilters]);
+
+  // If the highlighted task isn't in the active list (already loaded by
+  // fetchAll above), it's a completed task - only History has it.
+  useEffect(() => {
+    if (!highlightId || historyMode || tasks.length === 0) return;
+    if (!tasks.some((t) => t.id === highlightId)) setHistoryMode(true);
+  }, [highlightId, historyMode, tasks]);
+
+  useEffect(() => {
+    if (!highlightId) return;
+    const list = historyMode ? historyTasks : tasks;
+    if (list.length === 0) return;
+    const el = document.getElementById(`task-${highlightId}`);
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }, [highlightId, historyMode, tasks, historyTasks]);
 
   // Creator filter options: derived from creators actually present in the
   // fetched history results (real users, not a fabricated list) - avoids a
@@ -332,6 +375,7 @@ const OwnerTasks = ({ onLogout, language, setLanguage }) => {
 
   const handleDailySubmit = async (e) => {
     e.preventDefault();
+    if (!validateAndFocus(e.currentTarget)) return;
     if (dailyForm.assigned_to.length === 0) {
       toast.error('يرجى اختيار موظف واحد على الأقل');
       return;
@@ -493,6 +537,7 @@ const OwnerTasks = ({ onLogout, language, setLanguage }) => {
                   onToggleExpand={(id) => setExpandedId(expandedId === id ? null : id)}
                   onEdit={openEdit}
                   onDelete={handleDelete}
+                  highlighted={highlightId === task.id}
                 />
               ))}
             </div>
@@ -614,6 +659,7 @@ const OwnerTasks = ({ onLogout, language, setLanguage }) => {
                     historyView
                     expanded={historyExpandedId === task.id}
                     onToggleExpand={(id) => setHistoryExpandedId(historyExpandedId === id ? null : id)}
+                    highlighted={highlightId === task.id}
                   />
                 ))}
               </div>

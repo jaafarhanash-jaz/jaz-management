@@ -7,6 +7,7 @@ import { Label } from '@/components/ui/label';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
 import api from '@/utils/api';
 import { t } from '@/utils/translations';
+import { validateAndFocus } from '@/utils/formValidation';
 import { Plus, Pencil, Trash2, Users as UsersIcon, FileText, UploadCloud, Download, Eye, X as XIcon } from 'lucide-react';
 import { toast } from 'sonner';
 
@@ -77,6 +78,7 @@ const OwnerEmployees = ({ onLogout, language, setLanguage }) => {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
+    if (!validateAndFocus(e.currentTarget)) return;
     try {
       if (editingId) {
         const updates = { ...form };
