@@ -5,6 +5,7 @@ import SubscriptionBlocked from './pages/SubscriptionBlocked';
 import api from './utils/api';
 import { Toaster } from 'sonner';
 import CriticalTaskAlert from './components/CriticalTaskAlert';
+import { SalesWorkspace } from './components/sales/SalesAccess';
 import '@/App.css';
 
 // Route-based code splitting: previously every one of these ~24 page
@@ -23,6 +24,7 @@ import '@/App.css';
 const SuperAdminDashboard = lazy(() => import('./pages/SuperAdmin/Dashboard'));
 const SuperAdminCompanies = lazy(() => import('./pages/SuperAdmin/Companies'));
 const SuperAdminPlans = lazy(() => import('./pages/SuperAdmin/Plans'));
+const SuperAdminCompanyNotifications = lazy(() => import('./pages/SuperAdmin/CompanyNotifications'));
 const OwnerDashboard = lazy(() => import('./pages/Owner/Dashboard'));
 const OwnerEmployees = lazy(() => import('./pages/Owner/Employees'));
 const OwnerTasks = lazy(() => import('./pages/Owner/Tasks'));
@@ -42,6 +44,8 @@ const EmployeeAttendance = lazy(() => import('./pages/Employee/Attendance'));
 const EmployeePerformance = lazy(() => import('./pages/Employee/Performance'));
 const EmployeeReports = lazy(() => import('./pages/Employee/Reports'));
 const Profile = lazy(() => import('./pages/Profile'));
+const SalesHome = lazy(() => import('./pages/Sales/SalesHome'));
+const SalesTeam = lazy(() => import('./pages/Sales/Team'));
 
 // Shown only for the brief moment a lazy page chunk is being fetched
 // (typically a single-digit-ms cache hit after the first visit to that
@@ -195,6 +199,14 @@ function App() {
             element={
               <ProtectedRoute isAuthenticated={isAuthenticated} userRole={userRole} allowedRoles={['super_admin']}>
                 <SuperAdminPlans onLogout={handleLogout} language={language} setLanguage={setLanguage} />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/super-admin/notifications"
+            element={
+              <ProtectedRoute isAuthenticated={isAuthenticated} userRole={userRole} allowedRoles={['super_admin']}>
+                <SuperAdminCompanyNotifications onLogout={handleLogout} language={language} setLanguage={setLanguage} />
               </ProtectedRoute>
             }
           />
@@ -394,6 +406,22 @@ function App() {
               </ProtectedRoute>
             }
           />
+
+          {/* JAZ Sales (internal staff) - only jaz_staff and super_admin get past the
+              route guard, but that is UX only: every /api/sales endpoint enforces its
+              own permission server-side. One layout route = one /sales/me fetch. */}
+          <Route path="/jaz-staff/dashboard" element={<Navigate to="/sales/dashboard" replace />} />
+          <Route
+            element={
+              <ProtectedRoute isAuthenticated={isAuthenticated} userRole={userRole} allowedRoles={['jaz_staff', 'super_admin']}>
+                <SalesWorkspace />
+              </ProtectedRoute>
+            }
+          >
+            <Route path="/sales/dashboard" element={<SalesHome onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole={userRole} />} />
+            <Route path="/sales/team" element={<SalesTeam onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole={userRole} />} />
+            <Route path="/sales/profile" element={<Profile onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole={userRole} />} />
+          </Route>
         </Routes>
         </Suspense>
       </BrowserRouter>

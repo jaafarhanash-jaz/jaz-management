@@ -22,17 +22,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import engine, get_db, SessionLocal
 import repositories.companies as companies_repo
+import repositories.device_tokens as device_tokens_repo
 import repositories.users as users_repo
 import services.admin as admin_service
 import services.announcements as announcements_service
 import services.attendance as attendance_service
 import services.auth as auth_service
 import services.calendar as calendar_service
+import services.company_notifications as company_notifications_service
 import services.dashboard as dashboard_service
 import services.departments as departments_service
 import services.devices as devices_service
 import services.employees as employees_service
+import services.employee_groups as employee_groups_service
 import services.heartbeat as heartbeat_service
+import services.leaves as leaves_service
 import services.messages as messages_service
 import services.notifications as notifications_service
 import services.realtime as realtime_service
@@ -40,7 +44,10 @@ import services.reports as reports_service
 import services.schedule_resolution as schedule_resolution
 import services.seed as seed_service
 import services.subscriptions as subscriptions_service
+import services.surprise_attendance as surprise_attendance_service
+import services.task_copy as task_copy_service
 import services.tasks as tasks_service
+import services.work_locations as work_locations_service
 import services.work_schedules as work_schedules_service
 from services.admin import parse_uuid
 
@@ -227,6 +234,14 @@ class RefreshTokenRequest(BaseModel):
 
 class LogoutRequest(BaseModel):
     refresh_token: str
+    # Optional: this device's current push token, if the client has one.
+    # Lets logout reliably remove exactly this device's push registration
+    # server-side, in the same request that's already mandatory for
+    # logout - not dependent on the separate, best-effort DELETE /devices
+    # call succeeding. Omitted entirely (not just falsy) by any client
+    # that hasn't been updated to send it, or has no push token yet -
+    # existing logout behavior is unaffected either way.
+    device_token: Optional[str] = None
 
 class CvUploadRequest(BaseModel):
     filename: str
@@ -270,6 +285,7 @@ class UserResponse(BaseModel):
     schedule_name: Optional[str] = None
     cv: Optional[Dict[str, Any]] = None
     photo: Optional[Dict[str, Any]] = None
+    language: str = "ar"
 
 class CompanyCreate(BaseModel):
     name: str
@@ -465,6 +481,54 @@ class AnnouncementResponse(BaseModel):
     message: str
     created_at: str
 
+CompanyNotificationRecipientMode = Literal["all_managers", "all_employees", "everyone", "custom"]
+
+class CompanyNotificationCustomTarget(BaseModel):
+    company_id: str
+    mode: Literal["managers", "employees", "everyone"]
+
+class CompanyNotificationTargetConfig(BaseModel):
+    companies: List[CompanyNotificationCustomTarget]
+
+class CompanyNotificationCreate(BaseModel):
+    recipient_mode: CompanyNotificationRecipientMode
+    target_config: Optional[CompanyNotificationTargetConfig] = None  # required when recipient_mode='custom'
+    title_ar: str
+    title_en: str
+    message_ar: str
+    message_en: str
+    # Client-supplied, one per compose attempt - see CreateCompanyNotificationDialog.js.
+    # Same convention as TaskCreate.idempotency_key (services/tasks.py::_idempotent).
+    idempotency_key: Optional[str] = None
+
+class CompanyNotificationPreviewRequest(BaseModel):
+    recipient_mode: CompanyNotificationRecipientMode
+    target_config: Optional[CompanyNotificationTargetConfig] = None
+
+class CompanyNotificationPreviewResponse(BaseModel):
+    recipient_count: int
+
+class CompanyNotificationResponse(BaseModel):
+    id: str
+    sender_id: str
+    sender_name: str
+    title_ar: str
+    title_en: str
+    message_ar: str
+    message_en: str
+    recipient_mode: str
+    target_config: Optional[dict] = None
+    recipient_count: int
+    notification_created_count: int
+    push_delivered_count: int
+    push_failed_count: int
+    status: str
+    created_at: str
+    sent_at: Optional[str] = None
+
+class LanguageUpdate(BaseModel):
+    language: str  # 'ar' | 'en'
+
 class DailyTaskCreate(BaseModel):
     title: str
     description: str
@@ -529,11 +593,22 @@ class TaskProofUpload(BaseModel):
         return value
 
 class AttendanceCheckIn(BaseModel):
-    qr_code: str
+    # Optional (was required str) - a group with require_qr=False (or the
+    # legacy company-wide qr_enabled=False path) has no QR to scan at all;
+    # the actual requirement is still enforced server-side per the
+    # resolved group policy (see services/attendance.py's
+    # validate_qr_attendance).
+    qr_code: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     accuracy: Optional[float] = None
     device_info: Optional[str] = None
+    # Optional - only needed when the employee belongs to more than one
+    # active Attendance Group AND the presented QR/location doesn't
+    # uniquely identify which one applies (see services/attendance.py's
+    # _resolve_policy_for_check_in). Ignored entirely when the employee
+    # has zero or one active group.
+    group_id: Optional[str] = None
 
 class AttendanceCheckOut(BaseModel):
     # qr_code is Optional so legacy payloads still parse, but the endpoint
@@ -562,6 +637,8 @@ class AttendanceResponse(BaseModel):
     working_duration_minutes: Optional[float] = None
     required_minutes: Optional[float] = None
     scheduled_break_minutes: Optional[float] = None
+    scheduled_start_time: Optional[str] = None
+    scheduled_end_time: Optional[str] = None
     net_minutes: Optional[float] = None
     overtime_minutes: Optional[float] = None
     missing_minutes: Optional[float] = None
@@ -577,6 +654,18 @@ class AttendanceResponse(BaseModel):
     is_holiday: Optional[bool] = None
     holiday_type: Optional[str] = None  # "company_holiday" | "weekly_holiday"
     holiday_title: Optional[str] = None
+    # Display-only annotation (services/leave_attendance.py's
+    # annotate_leave_dates) - same "never changes the underlying stored
+    # status/minutes" rule as the holiday fields above. leave_intervals is
+    # always [] when nothing applies; the effective_* fields are omitted
+    # entirely (None) when there's no approved leave overlapping this shift.
+    leave_intervals: Optional[List[Dict[str, Any]]] = None
+    leave_covered_minutes: Optional[float] = None
+    effective_required_minutes: Optional[float] = None
+    effective_missing_minutes: Optional[float] = None
+    effective_overtime_minutes: Optional[float] = None
+    group_id: Optional[str] = None
+    location_id: Optional[str] = None
 
 class AttendanceSettingsUpdate(BaseModel):
     latitude: Optional[float] = None
@@ -588,6 +677,9 @@ class AttendanceManualEdit(BaseModel):
     check_in_time: Optional[str] = None
     check_out_time: Optional[str] = None
     status: Optional[str] = None
+    # Required (Part 8/Rule 14) - every manual correction must be
+    # justified; stored on the audit_logs row this edit creates.
+    reason: str
 
 # ---- Work Schedules ----
 
@@ -615,6 +707,189 @@ class WorkScheduleResponse(BaseModel):
     working_days: List[int]
     is_default: bool
     is_active: bool
+
+# ---- Work Locations ----
+
+class WorkLocationCreate(BaseModel):
+    name: str
+    latitude: float
+    longitude: float
+    radius_meters: Optional[float] = Field(default=None, gt=0)
+
+class WorkLocationUpdate(WorkLocationCreate):
+    pass
+
+class WorkLocationResponse(BaseModel):
+    id: str
+    name: str
+    latitude: float
+    longitude: float
+    radius_meters: float
+    qr_code: Optional[str] = None
+    qr_token: Optional[str] = None
+    qr_generated_at: Optional[str] = None
+    is_active: bool
+
+# ---- Attendance Groups / Assignments ----
+
+class EmployeeGroupCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    work_schedule_id: Optional[str] = None
+    require_zone: bool = True
+    require_qr: bool = True
+    photo_proof_required: bool = False
+    grace_period_minutes: int = 180
+    location_ids: List[str] = []
+
+class EmployeeGroupUpdate(EmployeeGroupCreate):
+    pass
+
+class EmployeeGroupResponse(BaseModel):
+    id: str
+    name: str
+    description: Optional[str] = None
+    work_schedule_id: Optional[str] = None
+    require_zone: bool
+    require_qr: bool
+    photo_proof_required: bool
+    grace_period_minutes: int
+    is_active: bool
+    member_count: int = 0
+    location_ids: List[str] = []
+    locations: List[Dict[str, Any]] = []
+
+class EmployeeGroupMemberResponse(BaseModel):
+    id: str
+    name: str
+    email: str
+
+class EmployeeGroupMembershipResponse(BaseModel):
+    message: str
+    group_id: str
+
+class EmployeeGroupAssignmentHistoryEntry(BaseModel):
+    id: str
+    group_id: Optional[str] = None
+    effective_from: str
+    effective_to: Optional[str] = None
+
+# ---- Surprise Attendance ----
+
+SurpriseAttendanceTargetMode = Literal["everyone", "selected_employees", "selected_groups"]
+
+class SurpriseAttendanceCreate(BaseModel):
+    target_mode: SurpriseAttendanceTargetMode
+    target_ids: List[str] = []  # employee ids or group ids, per target_mode
+    require_photo: bool = False
+
+class SurpriseAttendanceResponseSummary(BaseModel):
+    id: str
+    employee_id: str
+    employee_name: Optional[str] = None
+    status: str
+    responded_at: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    zone_valid: Optional[bool] = None
+    has_photo: bool = False
+
+class SurpriseAttendanceRequestSummary(BaseModel):
+    id: str
+    requested_by: str
+    target_mode: str
+    target_ids: List[str] = []
+    require_photo: bool
+    status: str
+    created_at: str
+    expires_at: Optional[str] = None
+    requested_count: int = 0
+    responded_count: int = 0
+
+class SurpriseAttendanceRequestDetail(SurpriseAttendanceRequestSummary):
+    responses: List[SurpriseAttendanceResponseSummary] = []
+
+class SurpriseAttendanceRespond(BaseModel):
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    photo_data: Optional[str] = None
+    photo_filename: Optional[str] = None
+    photo_mime_type: Optional[str] = None
+
+# ---- Leave ----
+
+LeaveDurationType = Literal["time_based", "full_day", "remaining_of_day"]
+
+class LeaveCreate(BaseModel):
+    duration_type: LeaveDurationType
+    reason: str
+    # time_based only
+    date: Optional[str] = None  # ISO date - the shift this interval belongs to
+    start_time: Optional[str] = None  # "HH:MM"
+    end_time: Optional[str] = None  # "HH:MM"
+    # full_day only
+    start_date: Optional[str] = None  # ISO date
+    end_date: Optional[str] = None  # ISO date - omitted/equal to start_date for a single day
+    # remaining_of_day only - optional disambiguation when the employee
+    # belongs to several active groups with different schedules (mirrors
+    # the same group_id override available at check-in, Rule 1.2)
+    group_id: Optional[str] = None
+
+class OwnerLeaveCreate(LeaveCreate):
+    employee_id: str
+
+class LeaveRejectRequest(BaseModel):
+    rejection_reason: Optional[str] = None
+
+class LeaveRevokeRequest(BaseModel):
+    cancellation_reason: str
+
+class LeaveResponse(BaseModel):
+    id: str
+    company_id: str
+    employee_id: str
+    employee_name: Optional[str] = None
+    duration_type: str
+    start_date: str
+    end_date: str
+    start_at: str
+    end_at: str
+    reason: str
+    status: str
+    origin: str
+    requested_by: str
+    approved_by: Optional[str] = None
+    approved_at: Optional[str] = None
+    rejected_by: Optional[str] = None
+    rejected_at: Optional[str] = None
+    rejection_reason: Optional[str] = None
+    cancelled_by: Optional[str] = None
+    cancelled_at: Optional[str] = None
+    cancellation_reason: Optional[str] = None
+    created_at: str
+    updated_at: str
+
+# ---- Employee Task Copy ----
+
+class TaskCopyPreviewResponse(BaseModel):
+    old_employee_id: str
+    old_employee_name: str
+    new_employee_id: str
+    new_employee_name: str
+    task_count: int
+    daily_task_count: int
+    critical_task_count_not_copied: int
+
+class TaskCopyConfirmRequest(BaseModel):
+    idempotency_key: Optional[str] = None
+
+class TaskCopyConfirmResponse(BaseModel):
+    message: str
+    old_employee_id: str
+    new_employee_id: str
+    tasks_copied: int
+    daily_tasks_cloned: int
+    critical_tasks_not_copied: int
 
 class ReportCreate(BaseModel):
     title: str
@@ -940,7 +1215,16 @@ async def refresh_access_token(request: Request, body: RefreshTokenRequest, pg: 
 async def logout(body: LogoutRequest, pg: AsyncSession = Depends(get_db)):
     # No auth dependency either - logout must succeed even if the access
     # token already expired; the refresh token being revoked is the point.
-    await auth_service.revoke_refresh_token(pg, body.refresh_token)
+    user_id = await auth_service.revoke_refresh_token(pg, body.refresh_token)
+    # Server-side device-token cleanup, scoped to the token this specific
+    # logout request identified as its own (never a bulk delete for the
+    # user - see delete_by_token_and_user's own (token, user_id) scoping).
+    # Piggybacks on this already-mandatory call rather than depending on
+    # the separate DELETE /devices unregister request succeeding - that
+    # endpoint still exists and still works, this is a second, more
+    # reliable path to the same outcome, not a replacement.
+    if user_id and body.device_token:
+        await device_tokens_repo.delete_by_token_and_user(pg, body.device_token, user_id)
     return {"message": "Logged out"}
 
 @api_router.get("/auth/me", response_model=UserResponse)
@@ -1054,6 +1338,28 @@ async def list_user_devices(user_id: str, current_user: dict = Depends(get_curre
     require_super_admin(current_user)
     return await devices_service.list_devices_for_user(pg, user_id)
 
+# ---- Company Notifications (Super Admin broadcast) ----
+
+@api_router.post("/admin/company-notifications/preview", response_model=CompanyNotificationPreviewResponse)
+async def preview_company_notification(body: CompanyNotificationPreviewRequest, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    """Read-only - resolves the audience for a not-yet-sent broadcast so
+    the admin UI can show a recipient count before the confirm step."""
+    require_super_admin(current_user)
+    target_config = body.target_config.model_dump() if body.target_config else None
+    return await company_notifications_service.preview_recipient_count(pg, body.recipient_mode, target_config)
+
+@api_router.post("/admin/company-notifications", response_model=CompanyNotificationResponse)
+async def create_company_notification(body: CompanyNotificationCreate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    require_super_admin(current_user)
+    return await company_notifications_service.create_and_send(pg, current_user, body)
+
+@api_router.get("/admin/company-notifications", response_model=List[CompanyNotificationResponse])
+async def list_company_notifications(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db), page: Optional[int] = None, page_size: Optional[int] = None):
+    require_super_admin(current_user)
+    limit = page_size if page is not None and page_size is not None else 50
+    offset = (page - 1) * page_size if page is not None and page_size is not None else 0
+    return await company_notifications_service.list_broadcasts(pg, limit=limit, offset=offset)
+
 # ============ Company Owner Routes ============
 
 @api_router.get("/owner/dashboard")
@@ -1123,6 +1429,20 @@ async def delete_employee_cv(employee_id: str, current_user: dict = Depends(get_
     if current_user["role"] != UserRole.COMPANY_OWNER:
         raise HTTPException(status_code=403, detail="Access denied")
     return await employees_service.delete_employee_cv(pg, current_user["company_id"], employee_id)
+
+# ---- Employee Task Copy ----
+
+@api_router.get("/owner/employees/{old_employee_id}/copy-tasks-preview/{new_employee_id}", response_model=TaskCopyPreviewResponse)
+async def preview_copy_employee_tasks(old_employee_id: str, new_employee_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await task_copy_service.preview_copy(pg, current_user, old_employee_id, new_employee_id)
+
+@api_router.post("/owner/employees/{old_employee_id}/copy-tasks-to/{new_employee_id}", response_model=TaskCopyConfirmResponse)
+async def confirm_copy_employee_tasks(old_employee_id: str, new_employee_id: str, data: TaskCopyConfirmRequest, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await task_copy_service.confirm_copy(pg, current_user, old_employee_id, new_employee_id, data.idempotency_key)
 
 @api_router.get("/owner/tasks", response_model=List[TaskResponse])
 async def get_tasks(
@@ -1374,6 +1694,169 @@ async def set_default_work_schedule(schedule_id: str, current_user: dict = Depen
         raise HTTPException(status_code=403, detail="Access denied")
     return await work_schedules_service.set_default_schedule(pg, current_user, schedule_id)
 
+# ---- Work Locations ----
+
+@api_router.get("/owner/work-locations", response_model=List[WorkLocationResponse])
+async def list_work_locations(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await work_locations_service.list_locations(pg, current_user)
+
+@api_router.post("/owner/work-locations", response_model=WorkLocationResponse)
+async def create_work_location(data: WorkLocationCreate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await work_locations_service.create_location(pg, current_user, data)
+
+@api_router.put("/owner/work-locations/{location_id}", response_model=WorkLocationResponse)
+async def update_work_location(location_id: str, data: WorkLocationUpdate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await work_locations_service.update_location(pg, current_user, location_id, data)
+
+@api_router.post("/owner/work-locations/{location_id}/deactivate")
+async def deactivate_work_location(location_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await work_locations_service.deactivate_location(pg, current_user, location_id)
+
+@api_router.post("/owner/work-locations/{location_id}/reactivate")
+async def reactivate_work_location(location_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await work_locations_service.reactivate_location(pg, current_user, location_id)
+
+@api_router.post("/owner/work-locations/{location_id}/qr/regenerate")
+async def regenerate_work_location_qr(location_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await work_locations_service.regenerate_location_qr(pg, current_user, location_id)
+
+# ---- Attendance Groups / Assignments ----
+
+@api_router.get("/owner/attendance-groups", response_model=List[EmployeeGroupResponse])
+async def list_attendance_groups(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await employee_groups_service.list_groups(pg, current_user)
+
+@api_router.post("/owner/attendance-groups", response_model=EmployeeGroupResponse)
+async def create_attendance_group(data: EmployeeGroupCreate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await employee_groups_service.create_group(pg, current_user, data)
+
+@api_router.put("/owner/attendance-groups/{group_id}", response_model=EmployeeGroupResponse)
+async def update_attendance_group(group_id: str, data: EmployeeGroupUpdate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await employee_groups_service.update_group(pg, current_user, group_id, data)
+
+@api_router.post("/owner/attendance-groups/{group_id}/deactivate")
+async def deactivate_attendance_group(group_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await employee_groups_service.deactivate_group(pg, current_user, group_id)
+
+@api_router.post("/owner/attendance-groups/{group_id}/reactivate")
+async def reactivate_attendance_group(group_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await employee_groups_service.reactivate_group(pg, current_user, group_id)
+
+@api_router.get("/owner/attendance-groups/{group_id}/members", response_model=List[EmployeeGroupMemberResponse])
+async def list_attendance_group_members(group_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await employee_groups_service.list_group_members(pg, current_user, group_id)
+
+@api_router.get("/owner/employees/{employee_id}/attendance-groups", response_model=List[EmployeeGroupResponse])
+async def list_employee_attendance_groups(employee_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await employee_groups_service.list_employee_groups(pg, current_user, employee_id)
+
+@api_router.post("/owner/employees/{employee_id}/attendance-groups/{group_id}", response_model=EmployeeGroupMembershipResponse)
+async def add_employee_attendance_group(employee_id: str, group_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await employee_groups_service.add_group_membership(pg, current_user, employee_id, group_id)
+
+@api_router.delete("/owner/employees/{employee_id}/attendance-groups/{group_id}", response_model=EmployeeGroupMembershipResponse)
+async def remove_employee_attendance_group(employee_id: str, group_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await employee_groups_service.remove_group_membership(pg, current_user, employee_id, group_id)
+
+@api_router.get("/owner/employees/{employee_id}/attendance-group/history", response_model=List[EmployeeGroupAssignmentHistoryEntry])
+async def get_employee_attendance_group_history(employee_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await employee_groups_service.get_assignment_history(pg, current_user, employee_id)
+
+# ---- Surprise Attendance ----
+
+@api_router.post("/owner/surprise-attendance", response_model=SurpriseAttendanceRequestSummary)
+async def create_surprise_attendance(data: SurpriseAttendanceCreate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await surprise_attendance_service.create_request(pg, current_user, data)
+
+@api_router.get("/owner/surprise-attendance", response_model=List[SurpriseAttendanceRequestSummary])
+async def list_surprise_attendance(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await surprise_attendance_service.list_requests(pg, current_user)
+
+@api_router.get("/owner/surprise-attendance/{request_id}", response_model=SurpriseAttendanceRequestDetail)
+async def get_surprise_attendance_detail(request_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await surprise_attendance_service.get_request_detail(pg, current_user, request_id)
+
+@api_router.get("/owner/leaves", response_model=List[LeaveResponse])
+async def list_owner_leaves(
+    current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db),
+    status: Optional[str] = None, employee_id: Optional[str] = None, duration_type: Optional[str] = None,
+    date_from: Optional[str] = None, date_to: Optional[str] = None,
+):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await leaves_service.list_for_owner(
+        pg, current_user, status=status, employee_id=employee_id, duration_type=duration_type,
+        date_from=date_from, date_to=date_to,
+    )
+
+@api_router.post("/owner/leaves", response_model=LeaveResponse)
+async def create_owner_leave(data: OwnerLeaveCreate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await leaves_service.create_for_owner(pg, current_user, data)
+
+@api_router.get("/owner/leaves/{leave_id}", response_model=LeaveResponse)
+async def get_owner_leave_detail(leave_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await leaves_service.get_owner_detail(pg, current_user, leave_id)
+
+@api_router.post("/owner/leaves/{leave_id}/approve", response_model=LeaveResponse)
+async def approve_owner_leave(leave_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await leaves_service.approve(pg, current_user, leave_id)
+
+@api_router.post("/owner/leaves/{leave_id}/reject", response_model=LeaveResponse)
+async def reject_owner_leave(leave_id: str, data: LeaveRejectRequest, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await leaves_service.reject(pg, current_user, leave_id, data)
+
+@api_router.post("/owner/leaves/{leave_id}/revoke", response_model=LeaveResponse)
+async def revoke_owner_leave(leave_id: str, data: LeaveRevokeRequest, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await leaves_service.revoke(pg, current_user, leave_id, data)
+
 @api_router.get("/owner/reports", response_model=List[ReportResponse])
 async def get_reports(
     current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db),
@@ -1385,6 +1868,12 @@ async def get_reports(
     limit = page_size if page is not None and page_size is not None else None
     offset = (page - 1) * page_size if limit is not None else None
     return await reports_service.list_reports_for_owner(pg, current_user["company_id"], limit=limit, offset=offset)
+
+@api_router.get("/owner/reports/{report_id}", response_model=ReportResponse)
+async def get_report_detail(report_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await reports_service.get_report_for_owner(pg, current_user, report_id)
 
 @api_router.get("/owner/departments", response_model=List[DepartmentResponse])
 async def get_departments(
@@ -1464,6 +1953,42 @@ async def get_attendance_history(current_user: dict = Depends(get_current_user),
         raise HTTPException(status_code=403, detail="Access denied")
     return await attendance_service.get_attendance_history(pg, current_user)
 
+@api_router.get("/employee/surprise-attendance/pending", response_model=List[SurpriseAttendanceRequestSummary])
+async def list_pending_surprise_attendance(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.EMPLOYEE:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await surprise_attendance_service.list_pending_for_employee(pg, current_user)
+
+@api_router.post("/employee/surprise-attendance/{request_id}/respond", response_model=SurpriseAttendanceResponseSummary)
+async def respond_to_surprise_attendance(request_id: str, data: SurpriseAttendanceRespond, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.EMPLOYEE:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await surprise_attendance_service.respond_to_request(pg, current_user, request_id, data)
+
+@api_router.post("/employee/leaves", response_model=LeaveResponse)
+async def create_employee_leave(data: LeaveCreate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.EMPLOYEE:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await leaves_service.create_for_employee(pg, current_user, data)
+
+@api_router.get("/employee/leaves", response_model=List[LeaveResponse])
+async def list_employee_leaves(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db), status: Optional[str] = None):
+    if current_user["role"] != UserRole.EMPLOYEE:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await leaves_service.list_own(pg, current_user, status=status)
+
+@api_router.get("/employee/leaves/{leave_id}", response_model=LeaveResponse)
+async def get_employee_leave_detail(leave_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.EMPLOYEE:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await leaves_service.get_own_detail(pg, current_user, leave_id)
+
+@api_router.post("/employee/leaves/{leave_id}/cancel", response_model=LeaveResponse)
+async def cancel_employee_leave(leave_id: str, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.EMPLOYEE:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await leaves_service.cancel_own(pg, current_user, leave_id)
+
 @api_router.get("/employee/performance")
 async def get_employee_performance(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
     return await dashboard_service.get_employee_performance(pg, current_user)
@@ -1473,6 +1998,12 @@ async def create_report(report: ReportCreate, current_user: dict = Depends(get_c
     if current_user["role"] != UserRole.EMPLOYEE:
         raise HTTPException(status_code=403, detail="Access denied")
     return await reports_service.create_report(pg, current_user, report)
+
+@api_router.get("/employee/reports", response_model=List[ReportResponse])
+async def list_own_reports(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.EMPLOYEE:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await reports_service.list_reports_for_employee(pg, current_user)
 
 @api_router.put("/employee/profile")
 async def update_profile(updates: dict, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
@@ -1514,6 +2045,10 @@ async def change_own_password(request: Request, body: ChangePasswordRequest, cur
     # 400 "Current password is incorrect" response confirms/denies each
     # guess) for as long as that token stays valid.
     return await auth_service.change_password(pg, current_user["id"], body.current_password, body.new_password)
+
+@api_router.put("/profile/language")
+async def update_own_language(body: LanguageUpdate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    return await auth_service.update_language(pg, current_user["id"], body.language)
 
 # ============ Common Routes ============
 
@@ -2005,6 +2540,13 @@ async def get_owner_subscription(current_user: dict = Depends(get_current_user),
 
 # Include router
 app.include_router(api_router)
+
+# JAZ Sales (internal staff module - see backend/sales/). Self-contained router;
+# every route is permission-gated server-side. SALES_MODULE_ENABLED=false
+# unmounts it entirely (kill switch; requires a restart).
+if os.environ.get('SALES_MODULE_ENABLED', 'true').strip().lower() not in ('0', 'false', 'no', 'off'):
+    from sales.router import sales_router
+    app.include_router(sales_router)
 
 _cors_origins_env = os.environ.get('CORS_ORIGINS')
 if ENVIRONMENT == 'production' and not _cors_origins_env:

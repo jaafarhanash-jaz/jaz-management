@@ -1,5 +1,6 @@
 from typing import List
 
+from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import repositories.companies as companies_repo
@@ -33,6 +34,25 @@ async def list_reports_for_owner(db: AsyncSession, company_id, limit: int = None
     employee_ids = {r.employee_id for r in reports}
     names = await users_repo.get_names_by_ids(db, employee_ids)
     return [report_response(r, employee_name=names.get(str(r.employee_id))) for r in reports]
+
+
+async def get_report_for_owner(db: AsyncSession, current_user: dict, report_id: str) -> dict:
+    """Individual detail pull for the Owner's PDF export flow (Part 10) -
+    the list endpoint above already returns full field content, but a
+    dedicated single-report GET is what an export screen naturally calls
+    for one specific report rather than re-fetching (and re-filtering)
+    the whole company list."""
+    company_id = parse_uuid(current_user["company_id"])
+    report = await reports_repo.get_by_id_and_company(db, parse_uuid(report_id), company_id)
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+    names = await users_repo.get_names_by_ids(db, [report.employee_id])
+    return report_response(report, employee_name=names.get(str(report.employee_id)))
+
+
+async def list_reports_for_employee(db: AsyncSession, current_user: dict) -> List[dict]:
+    reports = await reports_repo.list_by_employee(db, parse_uuid(current_user["id"]))
+    return [report_response(r, employee_name=current_user["name"]) for r in reports]
 
 
 async def create_report(db: AsyncSession, current_user: dict, data) -> dict:

@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import repositories.companies as companies_repo
 import repositories.subscription_plans as plans_repo
 import repositories.users as users_repo
+from services.identifiers import validate_phone
 from services.qr import generate_qr_code
 from services.auth import (
     SUBSCRIPTION_ACTIVE,
@@ -230,6 +231,7 @@ async def list_companies(db: AsyncSession) -> List[dict]:
 
 
 async def create_company(db: AsyncSession, data) -> dict:
+    validate_phone(data.owner_phone, field="owner_phone")
     if await users_repo.email_taken(db, data.owner_email):
         raise HTTPException(status_code=400, detail="Email already registered")
     # The old implementation never checked phone uniqueness (silently allowed
@@ -319,6 +321,7 @@ async def update_company(db: AsyncSession, company_id: str, updates) -> dict:
     if updates.owner_phone is not None:
         if not updates.owner_phone.strip():
             raise HTTPException(status_code=400, detail={"field": "owner_phone", "message": "Phone number is required"})
+        validate_phone(updates.owner_phone, field="owner_phone")
         if await users_repo.phone_taken(db, updates.owner_phone, exclude_id=company.owner_id):
             raise HTTPException(status_code=400, detail={"field": "owner_phone", "message": "Phone number already registered"})
         owner_changes["phone"] = updates.owner_phone

@@ -1,6 +1,8 @@
 import hashlib
+import logging
 import os
 import secrets
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -13,7 +15,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import repositories.companies as companies_repo
 import repositories.refresh_tokens as refresh_tokens_repo
 import repositories.users as users_repo
+from services.identifiers import is_email_identifier
 from services.storage import decode_and_validate, delete as storage_delete, download_base64, upload as storage_upload
+
+logger = logging.getLogger(__name__)
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 SECRET_KEY = os.environ.get("JWT_SECRET_KEY")
@@ -132,12 +137,20 @@ async def rotate_refresh_token(db: AsyncSession, raw_token: str) -> dict:
     return {"token": access_token, "refresh_token": new_raw_token, "user": public_user, "role": user_dict["role"]}
 
 
-async def revoke_refresh_token(db: AsyncSession, raw_token: str) -> None:
+async def revoke_refresh_token(db: AsyncSession, raw_token: str) -> Optional[uuid.UUID]:
     """Logout - idempotent no-op if the token is already gone/unknown, so
-    the client can always call this safely without checking state first."""
+    the client can always call this safely without checking state first.
+    Returns the token's owning user_id (even if it was already revoked -
+    still a reliable, server-verified identity for that logout request),
+    or None if the token is entirely unknown. Used by the /auth/logout
+    route to scope a same-request device-token cleanup to the correct
+    user without trusting anything the client claims about identity."""
     stored = await refresh_tokens_repo.get_by_hash(db, _hash_token(raw_token))
-    if stored and stored.revoked_at is None:
+    if not stored:
+        return None
+    if stored.revoked_at is None:
         await refresh_tokens_repo.revoke(db, stored)
+    return stored.user_id
 
 
 def _photo_response(user) -> Optional[dict]:
@@ -161,8 +174,13 @@ def user_to_dict(user) -> dict:
         "department": user.department,
         "position": user.position,
         "schedule_id": str(user.schedule_id) if user.schedule_id else None,
+        # Deliberately no group_id here - an employee may belong to
+        # multiple Attendance Groups at once, so there is no single
+        # scalar value to expose; see services/group_resolution.py for
+        # how callers resolve the actual set of active memberships.
         "status": user.status,
         "avatar": user.avatar,
+        "language": user.language,
         "photo": _photo_response(user),
         "last_seen_at": user.last_seen_at.isoformat() if user.last_seen_at else None,
         "created_at": user.created_at.isoformat() if user.created_at else None,
@@ -204,8 +222,28 @@ async def enforce_company_access(db: AsyncSession, user_dict: dict, *, company=N
         )
 
 
+async def _resolve_login_identifier(db: AsyncSession, identifier: str):
+    """The ONE live account this identifier names, or None.
+
+    The identifier is classified once (contains '@' -> email, otherwise phone) and looked up in that
+    single column, so the two namespaces can never be confused (see services/identifiers.py). More than
+    one live match is only possible in data that predates the namespace checks (or a missing unique
+    index); it fails closed as "no such account" - never a 500, never an arbitrary pick - and the
+    caller's response is identical to a wrong password, so nothing reveals what collided. The detail
+    goes to the server log only (ids, not the identifier)."""
+    find = users_repo.find_live_by_email if is_email_identifier(identifier) else users_repo.find_live_by_phone
+    matches = await find(db, identifier)
+    if len(matches) > 1:
+        logger.warning(
+            "login refused: identifier matches %d live accounts (user ids: %s)",
+            len(matches), ", ".join(str(u.id) for u in matches),
+        )
+        return None
+    return matches[0] if matches else None
+
+
 async def login(db: AsyncSession, email_or_phone: str, password: str) -> dict:
-    user = await users_repo.get_by_email_or_phone(db, email_or_phone)
+    user = await _resolve_login_identifier(db, email_or_phone)
     if not user or not await verify_password(password, user.password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
@@ -315,3 +353,17 @@ async def change_password(db: AsyncSession, user_id: str, current_password: str,
     user.password = await hash_password(new_password)
     await db.flush()
     return {"message": "Password changed successfully"}
+
+
+async def update_language(db: AsyncSession, user_id: str, language: str) -> dict:
+    """Self-service language preference update - any role. Read by
+    services/company_notifications.py to pick which language variant of a
+    broadcast a given recipient is sent."""
+    if language not in ("ar", "en"):
+        raise HTTPException(status_code=400, detail="language must be 'ar' or 'en'")
+    user = await users_repo.get_by_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    user.language = language
+    await db.flush()
+    return {"message": "Language updated successfully", "language": language}

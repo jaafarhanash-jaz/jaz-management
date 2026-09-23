@@ -10,9 +10,12 @@ import repositories.attendance as attendance_repo
 import repositories.attendance_events as attendance_events_repo
 import repositories.audit_logs as audit_logs_repo
 import repositories.companies as companies_repo
+import repositories.employee_groups as employee_groups_repo
 import repositories.users as users_repo
 import services.attendance_calc_engine as calc_engine
+import services.group_resolution as group_resolution
 import services.holidays as holidays_service
+import services.leave_attendance as leave_attendance_service
 import services.notifications as notifications_service
 import services.schedule_resolution as schedule_resolution
 from services.admin import parse_uuid
@@ -160,12 +163,178 @@ def _normalize_platform(device_info: Optional[str]) -> Optional[str]:
     return "other"
 
 
-async def validate_qr_attendance(db: AsyncSession, current_user: dict, qr_code, latitude, longitude, accuracy):
+def match_group_location(locations, qr_code, latitude, longitude, *, require_qr: bool, require_zone: bool):
+    """Picks which of the employee's group's linked WorkLocations this
+    check-in/out satisfies, per the group's own require_qr/require_zone
+    toggles (Rule 9 - fully independent of each other):
+    - Both required: a single location must satisfy BOTH (QR match AND
+      within that same location's radius) - prevents a QR photographed at
+      one site from being used while physically standing in a different
+      site's zone.
+    - Only QR required: any location whose token matches wins, no radius
+      check at all.
+    - Only zone required: any location whose radius contains the point
+      wins (nearest, if several overlap) - QR is not even inspected.
+    - Neither required: no location gate at all; if a QR was scanned
+      anyway, record which location it belongs to purely for
+      traceability.
+    Returns (location_id_or_None, distance_meters_or_None)."""
+    if not locations:
+        return None, None
+
+    if require_qr and require_zone:
+        for loc in locations:
+            if qr_code and qr_code == loc.qr_token and latitude is not None:
+                distance = round(haversine_meters(latitude, longitude, loc.latitude, loc.longitude), 1)
+                if distance <= loc.radius_meters:
+                    return loc.id, distance
+        return None, None
+
+    if require_qr:
+        for loc in locations:
+            if qr_code and qr_code == loc.qr_token:
+                return loc.id, None
+        return None, None
+
+    if require_zone:
+        best, best_distance = None, None
+        for loc in locations:
+            if latitude is None:
+                continue
+            distance = round(haversine_meters(latitude, longitude, loc.latitude, loc.longitude), 1)
+            if distance <= loc.radius_meters and (best_distance is None or distance < best_distance):
+                best, best_distance = loc.id, distance
+        return best, best_distance
+
+    if qr_code:
+        for loc in locations:
+            if qr_code == loc.qr_token:
+                return loc.id, None
+    return None, None
+
+
+class AmbiguousGroupError(HTTPException):
+    """Raised when an employee belongs to multiple active Attendance
+    Groups and neither an explicit selection nor the presented QR/GPS
+    lets the server determine which one deterministically - the system
+    must NEVER silently guess. Distinct type so callers/tests can assert
+    on it specifically, not just "some 400"."""
+
+    def __init__(self, detail: str):
+        super().__init__(status_code=409, detail=detail)
+
+
+async def _disambiguate_active_groups(db, groups: list, qr_code, latitude, longitude):
+    """Deterministic resolution when an employee has 2+ active group
+    memberships (Rule: never silently choose a random one) and made no
+    explicit selection. Tries each candidate group's OWN policy against
+    the presented QR/GPS; a group is a "match" if it has no location
+    requirement at all (require_qr and require_zone both false - nothing
+    to disambiguate by) or if match_group_location actually finds one of
+    its locations. Exactly one match -> unambiguous, use it. Zero or
+    multiple matches -> genuinely ambiguous, reject and ask the client to
+    resend with an explicit group_id (e.g. after the user picks from a
+    list of their own assignment names)."""
+    candidates = []
+    for group in groups:
+        policy = await group_resolution.to_policy(db, group)
+        if not policy.require_qr and not policy.require_zone:
+            candidates.append((policy, None, None))
+            continue
+        matched_location_id, distance = match_group_location(
+            policy.locations, qr_code, latitude, longitude,
+            require_qr=policy.require_qr, require_zone=policy.require_zone,
+        )
+        if matched_location_id is not None:
+            candidates.append((policy, matched_location_id, distance))
+
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) == 0:
+        raise AmbiguousGroupError(
+            "أنت عضو في أكثر من مجموعة حضور، ولا يتطابق رمز QR أو موقعك الحالي مع أي منها. "
+            "يرجى التأكد من الموقع/الرمز الصحيح أو تحديد المجموعة يدوياً."
+        )
+    raise AmbiguousGroupError(
+        "أنت عضو في أكثر من مجموعة حضور، ويتطابق رمز QR/موقعك الحالي مع أكثر من مجموعة واحدة. "
+        "يرجى تحديد المجموعة المطلوبة يدوياً."
+    )
+
+
+async def _resolve_policy_for_check_in(db, *, employee_id, company_id, qr_code, latitude, longitude, selected_group_id=None):
+    """Returns (policy_or_None, matched_location_id, distance). None
+    policy means "no active group memberships - use the legacy path,"
+    same contract as before this employee ever had any groups."""
+    groups = await group_resolution.list_active_groups_for_employee(db, employee_id=employee_id, company_id=company_id)
+    if not groups:
+        return None, None, None
+
+    if selected_group_id:
+        chosen = next((g for g in groups if str(g.id) == selected_group_id), None)
+        if chosen is None:
+            raise HTTPException(status_code=400, detail="group_id is not one of your current attendance group memberships")
+        policy = await group_resolution.to_policy(db, chosen)
+        matched_location_id, distance = match_group_location(
+            policy.locations, qr_code, latitude, longitude,
+            require_qr=policy.require_qr, require_zone=policy.require_zone,
+        )
+        return policy, matched_location_id, distance
+
+    if len(groups) == 1:
+        policy = await group_resolution.to_policy(db, groups[0])
+        matched_location_id, distance = match_group_location(
+            policy.locations, qr_code, latitude, longitude,
+            require_qr=policy.require_qr, require_zone=policy.require_zone,
+        )
+        return policy, matched_location_id, distance
+
+    return await _disambiguate_active_groups(db, groups, qr_code, latitude, longitude)
+
+
+async def _resolve_policy_for_check_out(db, *, known_group_id, company_id):
+    """Check-out never disambiguates - the session being closed already
+    recorded which group applied at check-in time (Attendance.group_id).
+    QR/zone validation itself stays LIVE here (re-evaluated against that
+    group's CURRENT policy, same as this codebase's pre-existing
+    behavior for the legacy path) - only WHICH group applies is fixed,
+    not whether its rules have since changed. Falls back to the legacy
+    path if the group can no longer be found (e.g. hard-deleted, an
+    edge case normal deactivation doesn't cause)."""
+    if not known_group_id:
+        return None
+    group = await employee_groups_repo.get_by_id_and_company(db, known_group_id, company_id)
+    if group is None:
+        return None
+    return await group_resolution.to_policy(db, group)
+
+
+async def validate_qr_attendance(
+    db: AsyncSession, current_user: dict, qr_code, latitude, longitude, accuracy,
+    *, selected_group_id=None, known_group_id=None,
+):
     """Shared server-side gate for check-in AND check-out. Returns
-    (company, settings, distance_from_company_meters); raises a clear 400
-    on any failure. A valid QR alone is never sufficient - GPS is always
-    required, and the radius is enforced as soon as a company location
-    exists (unless the owner disabled QR attendance entirely)."""
+    (company, settings, distance_from_company_meters, group_policy,
+    location_id); raises a clear 400 (or 409 AmbiguousGroupError) on any
+    failure.
+
+    Resolves the employee's active Attendance Group(s) first (services/
+    group_resolution.py) - an employee may belong to several at once, so
+    which one applies to THIS action is resolved by, in order: an
+    explicit caller-provided group (selected_group_id for check-in,
+    known_group_id for check-out - see the two resolver functions above
+    for how each decides), the single group if there's only one, or
+    deterministic QR/location disambiguation:
+    - No active group memberships -> the EXACT legacy single-location
+      behavior, unchanged byte-for-byte: QR always required, GPS always
+      required, the company's single flattened location/QR.
+      `group_policy` is None in the return.
+    - Resolved to one group -> require_zone/require_qr are enforced
+      INDEPENDENTLY per that group's own toggles (Rule 9's four
+      combinations), matched against its linked WorkLocations via
+      match_group_location. Photo-proof is validated by the caller
+      (check_in/check_out), not here - it's orthogonal to QR/GPS and
+      never gates location resolution (Rule 9: "Photo proof must NOT
+      automatically enable GPS or QR")."""
     if current_user["role"] != "employee":
         raise HTTPException(status_code=403, detail="Access denied")
 
@@ -174,36 +343,89 @@ async def validate_qr_attendance(db: AsyncSession, current_user: dict, qr_code, 
         raise HTTPException(status_code=404, detail="Company not found")
 
     settings = attendance_settings_for(company)
-    if not settings["qr_enabled"]:
-        raise _tag(HTTPException(status_code=400, detail="تسجيل الحضور عبر QR معطل حالياً من قبل إدارة الشركة."), qr_valid=False)
 
-    token = await ensure_qr_token(db, company)
-    if qr_code != token:
-        raise _tag(HTTPException(status_code=400, detail="رمز QR غير صالح. يرجى مسح رمز الشركة الصحيح."), qr_valid=False)
-
-    if latitude is None or longitude is None:
-        raise _tag(
-            HTTPException(status_code=400, detail="خدمة الموقع (GPS) مطلوبة لتسجيل الحضور. يرجى السماح بالوصول إلى موقعك والمحاولة مجدداً."),
-            qr_valid=True, gps_valid=False,
+    if known_group_id:
+        policy = await _resolve_policy_for_check_out(db, known_group_id=known_group_id, company_id=company.id)
+        matched_location_id, distance = None, None
+        if policy is not None:
+            matched_location_id, distance = match_group_location(
+                policy.locations, qr_code, latitude, longitude,
+                require_qr=policy.require_qr, require_zone=policy.require_zone,
+            )
+    else:
+        policy, matched_location_id, distance = await _resolve_policy_for_check_in(
+            db, employee_id=parse_uuid(current_user["id"]), company_id=company.id,
+            qr_code=qr_code, latitude=latitude, longitude=longitude, selected_group_id=selected_group_id,
         )
 
-    rejection = await detect_fake_gps(db, parse_uuid(current_user["id"]), latitude, longitude, accuracy)
-    if rejection:
-        raise _tag(HTTPException(status_code=400, detail=rejection), qr_valid=True, gps_valid=False)
+    if policy is None:
+        # ---- Legacy single-location path, unchanged from before this
+        # feature existed - a company/employee that never adopts the new
+        # group hierarchy keeps behaving exactly as today. ----
+        if not settings["qr_enabled"]:
+            raise _tag(HTTPException(status_code=400, detail="تسجيل الحضور عبر QR معطل حالياً من قبل إدارة الشركة."), qr_valid=False)
 
-    distance = None
-    if settings["latitude"] is not None and settings["longitude"] is not None:
-        distance = round(haversine_meters(latitude, longitude, settings["latitude"], settings["longitude"]), 1)
-        if distance > settings["radius_meters"]:
+        token = await ensure_qr_token(db, company)
+        if qr_code != token:
+            raise _tag(HTTPException(status_code=400, detail="رمز QR غير صالح. يرجى مسح رمز الشركة الصحيح."), qr_valid=False)
+
+        if latitude is None or longitude is None:
             raise _tag(
-                HTTPException(
-                    status_code=400,
-                    detail=f"أنت خارج النطاق المسموح للشركة (المسافة الحالية {int(distance)} متر والمسموح {int(settings['radius_meters'])} متر)."
-                ),
+                HTTPException(status_code=400, detail="خدمة الموقع (GPS) مطلوبة لتسجيل الحضور. يرجى السماح بالوصول إلى موقعك والمحاولة مجدداً."),
                 qr_valid=True, gps_valid=False,
             )
 
-    return company, settings, distance
+        rejection = await detect_fake_gps(db, parse_uuid(current_user["id"]), latitude, longitude, accuracy)
+        if rejection:
+            raise _tag(HTTPException(status_code=400, detail=rejection), qr_valid=True, gps_valid=False)
+
+        distance = None
+        if settings["latitude"] is not None and settings["longitude"] is not None:
+            distance = round(haversine_meters(latitude, longitude, settings["latitude"], settings["longitude"]), 1)
+            if distance > settings["radius_meters"]:
+                raise _tag(
+                    HTTPException(
+                        status_code=400,
+                        detail=f"أنت خارج النطاق المسموح للشركة (المسافة الحالية {int(distance)} متر والمسموح {int(settings['radius_meters'])} متر)."
+                    ),
+                    qr_valid=True, gps_valid=False,
+                )
+
+        return company, settings, distance, None, None
+
+    # ---- Group-based path - `policy` (and matched_location_id/distance)
+    # already resolved above, from exactly one group (see
+    # _resolve_policy_for_check_in/_out) - what follows explains WHY a
+    # resolved-but-unsatisfied match failed, it does not re-resolve
+    # which group applies. ----
+    if policy.require_qr and not policy.locations:
+        raise _tag(
+            HTTPException(status_code=400, detail="لا توجد مواقع مهيأة لمجموعتك. يرجى التواصل مع إدارة الشركة."),
+            qr_valid=False,
+        )
+    if policy.require_zone and (latitude is None or longitude is None):
+        raise _tag(
+            HTTPException(status_code=400, detail="خدمة الموقع (GPS) مطلوبة لتسجيل الحضور. يرجى السماح بالوصول إلى موقعك والمحاولة مجدداً."),
+            gps_valid=False,
+        )
+    if latitude is not None and longitude is not None:
+        rejection = await detect_fake_gps(db, parse_uuid(current_user["id"]), latitude, longitude, accuracy)
+        if rejection:
+            raise _tag(HTTPException(status_code=400, detail=rejection), gps_valid=False)
+
+    if (policy.require_qr or policy.require_zone) and matched_location_id is None:
+        if policy.require_qr and policy.require_zone:
+            detail = "رمز QR غير صحيح، أو أنك خارج النطاق المسموح لجميع المواقع المخصصة لك."
+        elif policy.require_qr:
+            detail = "رمز QR غير صحيح لأي من المواقع المخصصة لك."
+        else:
+            detail = "أنت خارج النطاق المسموح لجميع المواقع المخصصة لك."
+        raise _tag(
+            HTTPException(status_code=400, detail=detail),
+            qr_valid=(False if policy.require_qr else None), gps_valid=(False if policy.require_zone else None),
+        )
+
+    return company, settings, distance, policy, matched_location_id
 
 
 def _duration_minutes(start, end) -> Optional[float]:
@@ -247,6 +469,12 @@ def attendance_response(record, *, employee_name=None) -> dict:
         # check-in, overtime/missing/early_leave/net only once checked out.
         "required_minutes": record.required_minutes,
         "scheduled_break_minutes": record.scheduled_break_minutes,
+        # Exposed alongside the other schedule-snapshot fields above so
+        # services/leave_attendance.py's annotate_leave_dates can recompute
+        # the shift's scheduled window (never the actual check-in/check-out
+        # clock times) without a second, separate lookup.
+        "scheduled_start_time": record.scheduled_start_time,
+        "scheduled_end_time": record.scheduled_end_time,
         "net_minutes": record.net_minutes,
         "overtime_minutes": record.overtime_minutes,
         "missing_minutes": record.missing_minutes,
@@ -256,7 +484,52 @@ def attendance_response(record, *, employee_name=None) -> dict:
         "device_info": record.device_info,
         "created_at": _iso(record.created_at),
         "status": record.status,
+        # Group/location traceability (Part 4-9) - null on every record
+        # from before this feature, or when the legacy single-location
+        # company-wide path resolved the check-in (no group assigned).
+        "group_id": str(record.group_id) if record.group_id else None,
+        "location_id": str(record.location_id) if record.location_id else None,
     }
+
+
+def _forgotten_checkout_deadline(record) -> datetime:
+    """The deadline THIS record's own snapshotted schedule/grace values
+    resolve to - never a fresh group/schedule lookup (see the model
+    comment on Attendance.grace_period_minutes). Falls back to a 24h
+    safety cap plus grace when no schedule was resolvable at check-in at
+    all (a company that hasn't configured any WorkSchedule yet) - a
+    session still must not stay open forever even then. See
+    calc_engine.compute_forgotten_checkout_deadline for the check-in-time
+    floor guarantee."""
+    grace = record.grace_period_minutes if record.grace_period_minutes is not None else group_resolution.DEFAULT_GRACE_PERIOD_MINUTES
+    if record.scheduled_start_time and record.scheduled_end_time:
+        return calc_engine.compute_forgotten_checkout_deadline(
+            record.date, record.scheduled_start_time, record.scheduled_end_time, grace,
+            check_in_time=record.check_in_time,
+        )
+    return record.check_in_time + timedelta(hours=24, minutes=grace)
+
+
+def _is_past_forgotten_checkout_deadline(record) -> bool:
+    return datetime.now(timezone.utc) >= _forgotten_checkout_deadline(record)
+
+
+def self_heal_open_record(record) -> bool:
+    """If this open record's forgotten-checkout deadline has passed,
+    resolves it as 'did_not_check_out' in place (caller is responsible for
+    flushing). Returns True if it was (or already had been) closed this
+    way. Shared by check_in (before allowing a new session), check_out
+    (when the found session turns out to already be past deadline), and
+    read paths (history/list) so the Owner-facing view reflects the
+    correct status without requiring a write to trigger it. Never fires
+    merely because the calendar date changed (Part 7/Rule 12) - only
+    wall-clock time past shift-end-plus-grace."""
+    if record.check_out_time is not None or record.status == "did_not_check_out":
+        return False
+    if _is_past_forgotten_checkout_deadline(record):
+        record.status = "did_not_check_out"
+        return True
+    return False
 
 
 async def _log_attendance_event(
@@ -291,14 +564,43 @@ async def check_in(db: AsyncSession, current_user: dict, data) -> dict:
     known_record_id = None
 
     try:
-        company, settings, distance = await validate_qr_attendance(
-            db, current_user, data.qr_code, data.latitude, data.longitude, data.accuracy
+        company, settings, distance, policy, location_id = await validate_qr_attendance(
+            db, current_user, data.qr_code, data.latitude, data.longitude, data.accuracy,
+            selected_group_id=getattr(data, "group_id", None),
         )
 
         now = datetime.now(timezone.utc)
         today = now.date()
 
+        # Self-heal any stale OPEN session before allowing a new check-in -
+        # THE fix for Part 7/Rule 13: this looks for "my current open
+        # session" (any date), never "today's row," so a night shift that
+        # started yesterday is found here exactly like one that started an
+        # hour ago. If it's still within its own grace period, a second,
+        # overlapping session must not begin - the employee has to check
+        # out of the first one. If its grace period has already elapsed,
+        # it's resolved as 'did_not_check_out' in place and this new
+        # check-in is then free to proceed, per Rule 13's explicit "allow
+        # the next legitimate shift to begin independently."
+        open_record = await attendance_repo.get_latest_open_for_employee(db, employee_id)
+        if open_record:
+            known_record_id = open_record.id
+            if self_heal_open_record(open_record):
+                await db.flush()
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail="لديك جلسة حضور سابقة لم يتم تسجيل الخروج منها بعد. يرجى تسجيل الخروج أولاً قبل بدء جلسة جديدة.",
+                )
+
         existing = await attendance_repo.get_for_employee_on_date(db, employee_id, today)
+        if existing and existing.status == "did_not_check_out":
+            # Already resolved/closed (Part 8: "preserve it") - never
+            # reused as a same-day placeholder and never mistaken for
+            # "already checked in today." A new check-in on the same
+            # calendar date creates its own independent row below,
+            # leaving this one exactly as self-healed.
+            existing = None
         if existing:
             known_record_id = existing.id
         if existing and existing.check_in_time:
@@ -308,15 +610,27 @@ async def check_in(db: AsyncSession, current_user: dict, data) -> dict:
         # denormalization comment on the Attendance model. Every later read
         # (history, reports, analytics) uses these stored columns, never a
         # fresh lookup, so editing or deleting a schedule afterwards can never
-        # rewrite this record's calculated history.
-        schedule = await schedule_resolution.get_effective_schedule_for_employee(
-            db,
-            schedule_id=parse_uuid(current_user.get("schedule_id")),
-            company_id=company_id,
-        )
-        snapshot = schedule_resolution.to_snapshot(schedule)
+        # rewrite this record's calculated history. When a group is
+        # assigned, its already-resolved schedule snapshot (from
+        # group_resolution.to_policy, which follows the group's own
+        # work_schedule_id -> company-default fall-through) is reused
+        # directly rather than re-resolving.
+        if policy:
+            snapshot = policy.schedule
+        else:
+            schedule = await schedule_resolution.get_effective_schedule_for_employee(
+                db, schedule_id=parse_uuid(current_user.get("schedule_id")), company_id=company_id,
+            )
+            snapshot = schedule_resolution.to_snapshot(schedule)
         calc = calc_engine.calculate_check_in(snapshot, now)
         attendance_status = calc["status"]
+        # Group policy's grace period when assigned; the global default
+        # (services/group_resolution.py's DEFAULT_GRACE_PERIOD_MINUTES,
+        # currently 180) for every ungrouped/legacy employee - the
+        # forgotten-checkout FIX itself applies universally (it's a
+        # correctness fix, not an opt-in feature), only the multi-
+        # location/QR-independence pieces are opt-in via group setup.
+        grace_period_minutes = policy.grace_period_minutes if policy else group_resolution.DEFAULT_GRACE_PERIOD_MINUTES
 
         fields = dict(
             employee_department=current_user.get("department"),
@@ -330,13 +644,16 @@ async def check_in(db: AsyncSession, current_user: dict, data) -> dict:
             distance_from_company_meters=distance,
             device_info=data.device_info,
             status=attendance_status,
-            schedule_id=schedule.id if schedule else None,
+            schedule_id=parse_uuid(snapshot.schedule_id) if snapshot else None,
             scheduled_start_time=snapshot.start_time if snapshot else None,
             scheduled_end_time=snapshot.end_time if snapshot else None,
             scheduled_break_minutes=snapshot.break_minutes if snapshot else None,
             required_minutes=snapshot.required_minutes if snapshot else None,
             late_minutes=calc["late_minutes"],
             early_arrival_minutes=calc["early_arrival_minutes"],
+            group_id=parse_uuid(policy.group_id) if policy else None,
+            location_id=parse_uuid(location_id) if location_id else None,
+            grace_period_minutes=grace_period_minutes,
         )
 
         if existing:
@@ -351,9 +668,12 @@ async def check_in(db: AsyncSession, current_user: dict, data) -> dict:
         # leaving the route handler, which would silently discard this
         # event along with everything else - commit it here, before
         # re-raising, so the audit trail survives the failure it's
-        # recording. Safe: nothing above this point mutates a row, only
-        # reads (validate_qr_attendance, get_for_employee_on_date), so
-        # there's nothing else in the transaction to accidentally persist.
+        # recording. If a stale open session was self-healed to
+        # 'did_not_check_out' above before some LATER, unrelated failure
+        # occurred, that resolution is committed too - it's an
+        # independently-correct fix that must not be rolled back just
+        # because this particular check-in attempt failed for some other
+        # reason.
         await _log_attendance_event(
             db, employee_id=employee_id, company_id=company_id, action_type="check_in",
             attendance_record_id=known_record_id,
@@ -397,20 +717,55 @@ async def check_out(db: AsyncSession, current_user: dict, data) -> dict:
     known_record_id = None
 
     try:
-        company, settings, distance = await validate_qr_attendance(
-            db, current_user, data.qr_code, data.latitude, data.longitude, data.accuracy
-        )
-
         now = datetime.now(timezone.utc)
-        today = now.date()
 
-        record = await attendance_repo.get_for_employee_on_date(db, employee_id, today)
+        # THE fix for midnight-crossing shifts (Part 7): resolve "my
+        # current open session" (any date), never "today's row." A shift
+        # that started yesterday at 5PM and is being checked out of at
+        # 1:30AM today is found here exactly the same as a same-day shift.
+        # Resolved BEFORE group/QR/zone validation below - closing a
+        # specific session needs to validate against THAT session's own
+        # already-snapshotted group (Attendance.group_id), never a fresh
+        # multi-group disambiguation (the employee isn't starting a new
+        # session, there's nothing to disambiguate).
+        record = await attendance_repo.get_latest_open_for_employee(db, employee_id)
         if record:
             known_record_id = record.id
-        if not record or not record.check_in_time:
-            raise HTTPException(status_code=400, detail="No check-in record found for today.")
-        if record.check_out_time:
-            raise HTTPException(status_code=400, detail="Already checked out")
+        if not record:
+            # No open session anywhere - distinguish "already checked out
+            # today" (a clearer, more actionable message) from "never
+            # checked in at all today" by falling back to today's row,
+            # which get_latest_open_for_employee deliberately excludes
+            # once it's closed.
+            todays_record = await attendance_repo.get_for_employee_on_date(db, employee_id, now.date())
+            if todays_record:
+                known_record_id = todays_record.id
+            if todays_record and todays_record.check_out_time:
+                raise HTTPException(status_code=400, detail="Already checked out")
+            raise HTTPException(status_code=400, detail="No check-in record found.")
+
+        # If this session's forgotten-checkout deadline already passed
+        # (shift end + grace, per Rule 12 - never merely "the calendar
+        # date changed"), it gets resolved as 'did_not_check_out' right
+        # here rather than accepting a very-late checkout for it. A
+        # legitimate late arrival still needs an Owner's manual
+        # correction (Part 8), not a silent late accept.
+        if self_heal_open_record(record):
+            await db.flush()
+            raise HTTPException(
+                status_code=400,
+                detail="انتهت مهلة السماح لتسجيل الخروج من هذه الجلسة، وتم اعتبارها (لم يسجل خروج). "
+                       "يرجى التواصل مع إدارة الشركة لتصحيح السجل.",
+            )
+
+        # Note: group/QR/zone validation still runs (an employee must
+        # still be somewhere valid to check out, per that group's current
+        # policy) - known_group_id pins it to the session's own group,
+        # skipping disambiguation entirely.
+        company, settings, distance, policy, location_id = await validate_qr_attendance(
+            db, current_user, data.qr_code, data.latitude, data.longitude, data.accuracy,
+            known_group_id=record.group_id,
+        )
 
         record.check_out_time = now
         record.check_out_latitude = data.latitude
@@ -463,9 +818,24 @@ async def check_out(db: AsyncSession, current_user: dict, data) -> dict:
     return {"message": "Checked out successfully"}
 
 
+async def _self_heal_and_flush(db: AsyncSession, records) -> None:
+    """Applies self_heal_open_record to every record with an open session
+    (check_out_time NULL) and flushes if anything actually changed - the
+    read-path half of Part 7/Rule 13's "read/history/dashboard paths
+    should also safely resolve stale sessions." No-op for the common case
+    (no open records in the page being read), so this is cheap on every
+    call that isn't actively touching a stale session."""
+    healed = any([self_heal_open_record(r) for r in records if r.check_out_time is None])
+    if healed:
+        await db.flush()
+
+
 async def get_attendance_history(db: AsyncSession, current_user: dict) -> List[dict]:
     records = await attendance_repo.list_history_for_employee(db, parse_uuid(current_user["id"]))
-    return [attendance_response(r, employee_name=current_user["name"]) for r in records]
+    await _self_heal_and_flush(db, records)
+    results = [attendance_response(r, employee_name=current_user["name"]) for r in records]
+    await leave_attendance_service.annotate_leave_dates(db, results)
+    return results
 
 
 async def list_attendance_for_owner(db: AsyncSession, company_id, *, date=None, date_from=None, date_to=None,
@@ -498,6 +868,8 @@ async def list_attendance_for_owner(db: AsyncSession, company_id, *, date=None, 
         late=late, overtime=overtime, missing_hours=missing_hours,
     )
 
+    await _self_heal_and_flush(db, records)
+
     employees = await users_repo.list_employees_by_company(db, company_id)
     employee_map = {str(e.id): e for e in employees}
 
@@ -520,6 +892,7 @@ async def list_attendance_for_owner(db: AsyncSession, company_id, *, date=None, 
         results.append(response)
 
     await holidays_service.annotate_holiday_dates(db, company_id, results)
+    await leave_attendance_service.annotate_leave_dates(db, results)
     return results
 
 
@@ -677,7 +1050,17 @@ async def get_attendance_analytics(db: AsyncSession, company_id, date_from: Opti
 
     attended_records = [r for r in records if r.check_in_time]
     late_count = sum(1 for r in records if r.status == "late")
-    expected_attendance = total_employees * day_count
+    # Unified expected-attendance exclusion (approved decision): this
+    # denominator previously counted every calendar day for every employee
+    # with no holiday/weekly-off or Leave adjustment at all - a pre-existing
+    # gap for holidays, now fixed here at the same time Leave is wired in,
+    # rather than leaving Leave correct and Holiday still blind in this one
+    # function. compute_non_working_employee_days accounts for both without
+    # double-counting a given employee-day.
+    non_working_employee_days = await leave_attendance_service.compute_non_working_employee_days(
+        db, company_id, [e.id for e in employees], start_date, end_date,
+    )
+    expected_attendance = max(0, total_employees * day_count - non_working_employee_days)
     absence_count = max(0, expected_attendance - len(attended_records))
     attendance_percentage = round(len(attended_records) / expected_attendance * 100, 1) if expected_attendance > 0 else 0
     late_percentage = round(late_count / expected_attendance * 100, 1) if expected_attendance > 0 else 0
@@ -856,13 +1239,17 @@ async def edit_attendance(db: AsyncSession, current_user: dict, attendance_id: s
     if not record:
         raise HTTPException(status_code=404, detail="Attendance record not found")
 
+    reason = (updates.reason or "").strip()
+    if not reason:
+        raise HTTPException(status_code=400, detail="A reason is required for every manual attendance correction")
+
     provided = updates.model_dump(exclude_none=True)
     current_values = {"check_in_time": _iso(record.check_in_time), "check_out_time": _iso(record.check_out_time), "status": record.status}
     changes = {k: v for k, v in provided.items() if k in ATTENDANCE_EDITABLE_FIELDS and current_values.get(k) != v}
     if not changes:
         raise HTTPException(status_code=400, detail="No valid fields to update")
 
-    if "status" in changes and changes["status"] not in ("present", "late", "absent"):
+    if "status" in changes and changes["status"] not in ("present", "late", "absent", "did_not_check_out"):
         raise HTTPException(status_code=400, detail="Invalid status value")
 
     old_values = {k: current_values.get(k) for k in changes}
@@ -888,6 +1275,7 @@ async def edit_attendance(db: AsyncSession, current_user: dict, attendance_id: s
         action="manual_edit",
         old_values=old_values,
         new_values=changes,
+        reason=reason,
     )
 
     return {"message": "Attendance record updated", "audit_entries": len(changes)}
@@ -919,6 +1307,7 @@ async def get_attendance_audit_log(db: AsyncSession, company_id) -> List[dict]:
                 "field": field,
                 "old_value": (row.old_values or {}).get(field),
                 "new_value": new_value,
+                "reason": row.reason,
                 "employee_name": names.get(str(record.employee_id)) if record else None,
                 "attendance_date": _iso(record.date) if record else None,
             })

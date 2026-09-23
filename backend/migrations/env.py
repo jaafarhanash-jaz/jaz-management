@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 import models  # noqa: E402
+import sales.models  # noqa: E402,F401  - registers the JAZ Sales tables on Base.metadata
 from database import Base  # noqa: E402
 
 config = context.config

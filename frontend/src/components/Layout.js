@@ -16,16 +16,20 @@ import {
   CalendarDays,
   CalendarOff,
   Megaphone,
+  Bell,
   UserCircle,
 } from 'lucide-react';import { useState, useEffect } from 'react';
 import { t } from '@/utils/translations';
 import api from '@/utils/api';
 import { NotificationBell } from '@/components/NotificationBell';
+import { useSalesMenu, superAdminSalesMenuItem } from '@/components/sales/SalesAccess';
 
 export const Layout = ({ children, userRole, onLogout, language, setLanguage }) => {
   const location = useLocation();
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [unreadMessages, setUnreadMessages] = useState(0);
+  // Non-null only inside the JAZ Sales workspace (see components/sales/SalesAccess.js).
+  const salesMenu = useSalesMenu(language);
 
   // Sidebar-wide unread badge - reuses the existing inbox endpoint
   // (unread_only=true, page_size=1) rather than a dedicated count endpoint.
@@ -44,11 +48,14 @@ export const Layout = ({ children, userRole, onLogout, language, setLanguage }) 
   }, [userRole]);
 
   const getMenuItems = () => {
+    if (salesMenu) return salesMenu;
     if (userRole === 'super_admin') {
       return [
         { icon: LayoutDashboard, label: t('dashboard', language), path: '/super-admin/dashboard' },
         { icon: Building2, label: t('companies', language), path: '/super-admin/companies' },
         { icon: CreditCard, label: t('plans', language), path: '/super-admin/plans' },
+        { icon: Bell, label: t('companyNotifications', language), path: '/super-admin/notifications' },
+        superAdminSalesMenuItem(language),
         { icon: UserCircle, label: t('profile', language), path: '/super-admin/profile' },
       ];
     } else if (userRole === 'company_owner') {

@@ -16,10 +16,11 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    column,
     func,
 )
 from sqlalchemy import text
-from sqlalchemy.dialects.postgresql import ARRAY as PG_ARRAY, JSONB, UUID as PG_UUID
+from sqlalchemy.dialects.postgresql import ARRAY as PG_ARRAY, ExcludeConstraint, JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from database import Base
@@ -69,9 +70,23 @@ class User(Base, TimestampMixin, SoftDeleteMixin):
     # for whoever it's assigned to even if it's later hidden from
     # assignment pickers - see WorkSchedule.is_active's own comment.
     schedule_id: Mapped[Optional[uuid.UUID]] = fk_uuid("work_schedules.id", nullable=True)
+    # Deliberately NO group_id column here (removed 2026-08-31, see
+    # architecture correction note on EmployeeGroupAssignment): an
+    # employee may belong to MULTIPLE Attendance Groups at once (e.g.
+    # "Sales Representatives" AND "Al-Bayaa Branch" simultaneously, per
+    # the approved spec), which a single scalar FK on User cannot
+    # represent. EmployeeGroupAssignment (a real many-to-many table with
+    # history) is the sole, authoritative source of an employee's current
+    # and past group memberships - never a column on this row.
     status: Mapped[str] = mapped_column(String, nullable=False, server_default="active")
     avatar: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     last_seen_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Per-account UI/notification language preference. Mirrors the mobile
+    # app's own Arabic-first default (see jaz_mobile's locale_provider.dart)
+    # so a user who never opens Settings still resolves to a sane value -
+    # used to pick which language variant of a broadcast (see
+    # CompanyNotification) a given recipient receives.
+    language: Mapped[str] = mapped_column(String, nullable=False, server_default="ar")
     # Employee CV (Part 1): a single optional attachment per employee - flat
     # columns rather than a child table, since it's strictly 1:1 (unlike
     # task/message/calendar attachments, which are 1:many). Same object
@@ -91,7 +106,14 @@ class User(Base, TimestampMixin, SoftDeleteMixin):
     avatar_mime_type: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
     __table_args__ = (
-        CheckConstraint("role IN ('super_admin','company_owner','employee')", name="ck_users_role"),
+        CheckConstraint("role IN ('super_admin','company_owner','employee','jaz_staff')", name="ck_users_role"),
+        CheckConstraint("language IN ('ar','en')", name="ck_users_language"),
+        # Login takes ONE free-text identifier (email OR phone), so the two value spaces must never
+        # overlap: every email has an '@', no phone does (services/identifiers.py). Created NOT VALID by
+        # the migration that adds them - enforced for new writes at once, existing rows checked only when
+        # someone runs VALIDATE CONSTRAINT after auditing production data.
+        CheckConstraint("position('@' in email) > 0", name="ck_users_email_has_at"),
+        CheckConstraint("position('@' in phone) = 0", name="ck_users_phone_no_at"),
         # Partial unique: only LIVE rows contend. A soft-deleted user frees
         # their email/phone for reuse, exactly matching the old hard-delete
         # behavior (delete employee -> recreate with the same email works).
@@ -343,6 +365,152 @@ class WorkSchedule(Base, TimestampMixin):
     )
 
 
+# ============ Work Locations & Attendance Groups ============
+
+class WorkLocation(Base, TimestampMixin, SoftDeleteMixin):
+    """A single named check-in location (branch, office, warehouse, sales
+    zone, ...) owned by a company. Distinct from the legacy
+    Company.attendance_* fields, which remain the implicit single location
+    for a company that never creates any WorkLocation - see
+    services/attendance.py for how the two coexist. Whether QR/GPS are
+    actually *required* to use this location is an EmployeeGroup-level
+    decision (require_qr/require_zone), not a property of the location
+    itself - the same location can be QR-optional for one group and
+    QR-required for another."""
+    __tablename__ = "work_locations"
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    # Not `index=True` here - explicit named index below avoids a
+    # duplicate, differently-named index (same rationale as
+    # WorkSchedule.company_id's comment).
+    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id")
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    latitude: Mapped[float] = mapped_column(Float, nullable=False)
+    longitude: Mapped[float] = mapped_column(Float, nullable=False)
+    radius_meters: Mapped[float] = mapped_column(Float, nullable=False, server_default="50.0")
+    # Always provisioned on creation (mirrors Company.qr_token) - whether a
+    # scan against it is ever actually required is decided per-group.
+    qr_token: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    qr_code: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    qr_generated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Gates only future assignment pickers, same split as WorkSchedule/
+    # EmployeeGroup.is_active - services/work_locations.py additionally
+    # blocks deactivating a location still linked to an active group.
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
+
+    __table_args__ = (
+        Index("ix_work_locations_company", "company_id"),
+    )
+
+
+class EmployeeGroup(Base, TimestampMixin, SoftDeleteMixin):
+    """The Owner-facing "Attendance Group / Assignment" - deliberately
+    independent of Department (see the architecture decision recorded in
+    PROJECT_HANDOVER-adjacent session notes, 2026-08-31): an employee's org
+    department and their attendance group are different concepts and are
+    never conflated. Each employee has at most one active group at a time
+    (User.group_id); EmployeeGroupAssignment keeps the historical record
+    of past assignments for reporting. Bundles everything Part 25's
+    conceptual flow describes: a work schedule (hours), one or more
+    WorkLocations (via EmployeeGroupLocation), and the QR/zone/photo/grace
+    policy - all independently configurable per Rule 9's 2x2 QR/GPS
+    matrix. A company that never creates a group keeps every employee on
+    the legacy single-location/QR/both-required behavior untouched."""
+    __tablename__ = "employee_groups"
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    # Not `index=True` here - same duplicate-index rationale as
+    # WorkLocation.company_id above.
+    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id")
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Null means "use the company's default schedule", identical
+    # fall-through convention to User.schedule_id.
+    work_schedule_id: Mapped[Optional[uuid.UUID]] = fk_uuid("work_schedules.id", nullable=True)
+    # Independently configurable per Rule 9 - all four (require_zone,
+    # require_qr) combinations are valid. Both default true to reproduce
+    # today's implicit legacy behavior (QR+GPS both always required) for
+    # any group an Owner creates without touching these toggles.
+    require_zone: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
+    require_qr: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
+    # A third, fully independent option - never implied by require_zone or
+    # require_qr (see services/attendance.py's validation gate).
+    photo_proof_required: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    # Minutes after shift END before an unresolved open session is
+    # resolved as 'did_not_check_out' - see services/attendance.py's
+    # self-heal-on-read closeout. NOT used for late-arrival classification
+    # (that stays exactly as today: any positive delta is late) - grace
+    # here is specifically the forgotten-checkout threshold from Part 7.
+    grace_period_minutes: Mapped[int] = mapped_column(Integer, nullable=False, server_default="180")
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
+    created_by: Mapped[Optional[uuid.UUID]] = fk_uuid("users.id", nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("grace_period_minutes >= 0", name="ck_employee_groups_grace_period_nonneg"),
+        Index("ix_employee_groups_company", "company_id"),
+    )
+
+
+class EmployeeGroupLocation(Base):
+    """Join table: which WorkLocation(s) a group allows check-in from - a
+    group may span multiple zones (Part 6/8), an employee is accepted at
+    ANY one of them."""
+    __tablename__ = "employee_group_locations"
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    group_id: Mapped[uuid.UUID] = fk_uuid("employee_groups.id", index=True, ondelete="CASCADE")
+    location_id: Mapped[uuid.UUID] = fk_uuid("work_locations.id", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("group_id", "location_id", name="uq_employee_group_locations_pair"),
+    )
+
+
+class EmployeeGroupAssignment(Base):
+    """THE authoritative employee<->group membership relationship
+    (2026-08-31 architecture correction) - an employee may belong to
+    MULTIPLE Attendance Groups at once (e.g. "Sales Representatives" AND
+    "Al-Bayaa Branch" simultaneously, per the approved spec's own
+    example), so this is a genuine many-to-many table with history, not
+    a log trailing a single-valued pointer elsewhere. A row with
+    effective_to NULL is a CURRENTLY ACTIVE membership; "employee has no
+    groups" is simply zero open rows, not a NULL-group placeholder row.
+    Live resolution (services/group_resolution.py) always reads this
+    table directly - there is no User.group_id shortcut, precisely
+    because a single scalar column cannot represent multi-membership.
+    Closing one membership (effective_to set) never touches any other
+    open row for the same employee, and never rewrites past attendance,
+    which already snapshots whichever group actually applied at
+    check-in time (Attendance.group_id)."""
+    __tablename__ = "employee_group_assignments"
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    # Not `index=True` on employee_id/company_id here - explicit named
+    # indexes below avoid duplicate, differently-named indexes (same
+    # rationale as WorkLocation.company_id's comment).
+    employee_id: Mapped[uuid.UUID] = fk_uuid("users.id")
+    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id")
+    group_id: Mapped[uuid.UUID] = fk_uuid("employee_groups.id")
+    effective_from: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    effective_to: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    assigned_by: Mapped[uuid.UUID] = fk_uuid("users.id")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_employee_group_assignments_company", "company_id"),
+        Index("ix_employee_group_assignments_employee", "employee_id", "effective_from"),
+        # At most one OPEN (effective_to IS NULL) row per (employee, group)
+        # pair - prevents a duplicate concurrent membership to the SAME
+        # group, while placing no limit at all on how many DIFFERENT
+        # groups an employee can simultaneously have an open row for.
+        Index(
+            "uq_employee_group_assignments_open_pair", "employee_id", "group_id",
+            unique=True, postgresql_where=text("effective_to IS NULL"),
+        ),
+    )
+
+
 # ============ Attendance ============
 
 class Attendance(Base, TimestampMixin):
@@ -396,8 +564,29 @@ class Attendance(Base, TimestampMixin):
     early_leave_minutes: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     net_minutes: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
+    # Group/location traceability - same "never live-joined for
+    # calculation, snapshot only" rule as schedule_id above. Null on every
+    # record from before this feature, or when the legacy single-location
+    # company-wide path resolved the check-in (no group assigned).
+    group_id: Mapped[Optional[uuid.UUID]] = fk_uuid("employee_groups.id", nullable=True)
+    location_id: Mapped[Optional[uuid.UUID]] = fk_uuid("work_locations.id", nullable=True)
+    # Grace-period snapshot (Part 7) - the value actually used to compute
+    # THIS record's forgotten-checkout deadline, resolved once at check-in
+    # from the employee's group (or the global default when ungrouped) and
+    # never re-read afterward, same snapshot rule as schedule_id/
+    # scheduled_end_time above: an Owner editing a group's grace period
+    # later must never change what already-open or already-resolved past
+    # sessions were held to.
+    grace_period_minutes: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
     __table_args__ = (
-        CheckConstraint("status IN ('present','late','absent')", name="ck_attendance_status"),
+        # 'did_not_check_out': resolved by the self-heal-on-read closeout
+        # once now() passes (shift end + the resolved group's
+        # grace_period_minutes) with check_out_time still NULL - see
+        # services/attendance.py. Never set merely because the calendar
+        # date changed (Part 7/Rule 12) - a night shift crossing midnight
+        # is one session regardless of date rollover.
+        CheckConstraint("status IN ('present','late','absent','did_not_check_out')", name="ck_attendance_status"),
     )
 
 
@@ -438,6 +627,177 @@ class AttendanceEvent(Base):
         # to drop them just because the model didn't know about them.
         Index("ix_attendance_events_company_date", "company_id", "event_date"),
         Index("ix_attendance_events_record", "attendance_record_id"),
+    )
+
+
+# ============ Surprise Attendance ============
+
+class SurpriseAttendanceRequest(Base, TimestampMixin):
+    """An Owner-initiated "prove you're here right now" ping (Part 9) -
+    deliberately its own table rather than an Attendance/AttendanceEvent
+    row: it's not a scheduled check-in, has its own targeting/lifecycle,
+    and must never affect normal attendance calculation. Fan-out mirrors
+    CompanyNotification's own pattern (resolve recipients once at
+    creation, loop services.notifications.publish() per resolved
+    employee) - scoped to a single company, never cross-company."""
+    __tablename__ = "surprise_attendance_requests"
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    # Not `index=True` here - same duplicate-index rationale as
+    # WorkLocation.company_id above.
+    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id")
+    requested_by: Mapped[uuid.UUID] = fk_uuid("users.id")
+    target_mode: Mapped[str] = mapped_column(String, nullable=False)
+    # Employee ids (target_mode='selected_employees') or group ids
+    # (target_mode='selected_groups') - unused/empty for 'everyone'.
+    target_ids: Mapped[Optional[List[uuid.UUID]]] = mapped_column(PG_ARRAY(PG_UUID(as_uuid=True)), nullable=True)
+    # Independent of require_zone (Rule 10) - applies regardless of
+    # whether the responding employee's group requires a zone.
+    require_photo: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    status: Mapped[str] = mapped_column(String, nullable=False, server_default="pending")
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "target_mode IN ('everyone','selected_employees','selected_groups')",
+            name="ck_surprise_attendance_requests_target_mode",
+        ),
+        CheckConstraint(
+            "status IN ('pending','completed','expired')", name="ck_surprise_attendance_requests_status",
+        ),
+        Index("ix_surprise_attendance_requests_company", "company_id"),
+    )
+
+
+class SurpriseAttendanceResponse(Base):
+    """One row per employee actually targeted by a request, pre-created at
+    request-creation time in status='pending' (same "resolve recipients
+    once, track per-recipient outcome" shape as CompanyNotification's
+    push-count columns) so the Owner can see requested-vs-responded
+    without re-deriving the target list later."""
+    __tablename__ = "surprise_attendance_responses"
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    request_id: Mapped[uuid.UUID] = fk_uuid("surprise_attendance_requests.id", index=True, ondelete="CASCADE")
+    employee_id: Mapped[uuid.UUID] = fk_uuid("users.id", index=True)
+    status: Mapped[str] = mapped_column(String, nullable=False, server_default="pending")
+    responded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    latitude: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    longitude: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    zone_valid: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    photo_storage_path: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending','completed','expired')", name="ck_surprise_attendance_responses_status",
+        ),
+        UniqueConstraint("request_id", "employee_id", name="uq_surprise_attendance_responses_pair"),
+    )
+
+
+# ============ Leave ============
+
+class Leave(Base, TimestampMixin):
+    """Employee leave request/grant - a fully independent domain entity,
+    never represented as an Attendance row or an Attendance.status value
+    (see services/leave_attendance.py for how an APPROVED leave's effect
+    on attendance obligations is computed at read time instead, exactly
+    mirroring services/holidays.py's annotate-on-read pattern rather than
+    mutating any stored Attendance field). Three duration shapes share
+    one table rather than three: time_based (a clock interval within a
+    single shift), full_day (one or more whole calendar dates), and
+    remaining_of_day (system-resolved end - see services/leaves.py).
+
+    start_date/end_date are shift-OWNING dates - the same concept as
+    Attendance.date (the check-in calendar date for a shift, not
+    wherever its clock time happens to fall). This is what lets a
+    full_day leave correctly exempt an overnight shift whose checkout
+    timestamp lands on the next calendar day, and what lets a
+    time_based/remaining_of_day leave stay associated with the single
+    shift it was requested against even when its own clock instants
+    straddle midnight - both always equal for time_based/remaining_of_day
+    (a leave interval belongs to exactly one shift), and a real range for
+    full_day.
+
+    start_at/end_at are the leave's absolute instants, used only for
+    overlap detection: for full_day this is a conservative
+    midnight-to-midnight covering window (services/leaves.py), never
+    compared against a shift's actual clock times - the attendance-
+    exemption check for full_day is a start_date<=Attendance.date<=
+    end_date membership test, not an instant-overlap test. For
+    time_based/remaining_of_day, start_at/end_at ARE the real exempted
+    sub-shift interval.
+
+    remaining_of_day's start_at/end_at are resolved once, authoritatively,
+    by the backend at creation time from the employee's effective
+    schedule/group (never client-supplied) and never recomputed later
+    even if the employee's schedule subsequently changes (historical
+    determinism, Rule 2.10)."""
+    __tablename__ = "leaves"
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    # Not `index=True` here - same duplicate-index rationale as
+    # WorkLocation.company_id/SurpriseAttendanceRequest.company_id above;
+    # covered by the composite ix_leaves_company_status below instead.
+    company_id: Mapped[uuid.UUID] = fk_uuid("companies.id")
+    employee_id: Mapped[uuid.UUID] = fk_uuid("users.id")
+    duration_type: Mapped[str] = mapped_column(String, nullable=False)
+
+    # Shift-owning dates (see class docstring) - always both set, equal
+    # to each other for time_based/remaining_of_day. Mapped[str] to match
+    # the existing Attendance.date/AttendanceEvent.event_date convention
+    # (ISO date strings at the service layer) rather than a python date.
+    start_date: Mapped[str] = mapped_column(Date, nullable=False)
+    end_date: Mapped[str] = mapped_column(Date, nullable=False)
+    # Absolute instants - see class docstring for what these mean per
+    # duration_type.
+    start_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False, server_default="pending")
+    # 'employee' (self-requested, always starts pending) or 'owner'
+    # (direct grant, always starts approved) - drives the approval
+    # shortcut without inferring it from requested_by's current role,
+    # which could change later.
+    origin: Mapped[str] = mapped_column(String, nullable=False)
+    requested_by: Mapped[uuid.UUID] = fk_uuid("users.id")
+
+    approved_by: Mapped[Optional[uuid.UUID]] = fk_uuid("users.id", nullable=True)
+    approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    rejected_by: Mapped[Optional[uuid.UUID]] = fk_uuid("users.id", nullable=True)
+    rejected_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    rejection_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    cancelled_by: Mapped[Optional[uuid.UUID]] = fk_uuid("users.id", nullable=True)
+    cancelled_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancellation_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "duration_type IN ('time_based','full_day','remaining_of_day')", name="ck_leaves_duration_type",
+        ),
+        CheckConstraint("status IN ('pending','approved','rejected','cancelled')", name="ck_leaves_status"),
+        CheckConstraint("origin IN ('employee','owner')", name="ck_leaves_origin"),
+        CheckConstraint("end_date >= start_date", name="ck_leaves_date_order"),
+        CheckConstraint("end_at > start_at", name="ck_leaves_instant_order"),
+        Index("ix_leaves_company_status", "company_id", "status"),
+        Index("ix_leaves_employee_status", "employee_id", "status"),
+        Index("ix_leaves_employee_dates", "employee_id", "start_date", "end_date"),
+        # Requires btree_gist (enabled in the migration) - GIST has no
+        # native support for '=' on a UUID column without it. This is
+        # the DB-level backstop against a true concurrent-approval race;
+        # the primary UX path is the transactional row-locked re-check
+        # services/leaves.py does at approval time, which produces a
+        # friendly 409 instead of a raw constraint-violation error in the
+        # common (non-racing) case.
+        ExcludeConstraint(
+            (column("employee_id"), "="),
+            (func.tstzrange(column("start_at"), column("end_at")), "&&"),
+            where=text("status = 'approved'"),
+            using="gist",
+            name="ex_leaves_no_overlap_when_approved",
+        ),
     )
 
 
@@ -785,6 +1145,11 @@ class AuditLog(Base):
     action: Mapped[str] = mapped_column(String, nullable=False)
     old_values: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     new_values: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    # Free-text justification, kept separate from old_values/new_values
+    # (which stay purely field diffs) - required by services/attendance.py
+    # for manual attendance corrections (Part 8/Rule 14); optional and
+    # unused by every other existing caller.
+    reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     ip_address: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     user_agent: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -886,6 +1251,67 @@ class Announcement(Base, TimestampMixin):
     created_by_name: Mapped[str] = mapped_column(String, nullable=False)
     title: Mapped[str] = mapped_column(String, nullable=False)
     message: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+# ============ Company Notifications (Super Admin broadcast) ============
+
+class CompanyNotification(Base, TimestampMixin):
+    """A Super Admin's platform-wide broadcast, targeting a resolved
+    audience across companies (unlike Announcement, which is one
+    company_owner's broadcast to their own employees only - that feature
+    is untouched by this one). One row here is the durable audit record;
+    sending it fans out one real notification per resolved recipient via
+    the existing services.notifications.publish() framework, same
+    delivery mechanism Announcement already uses - see
+    services/company_notifications.py. Stores both language variants so
+    each recipient can be sent the one matching their User.language."""
+
+    __tablename__ = "company_notifications"
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    sender_id: Mapped[uuid.UUID] = fk_uuid("users.id", index=True)
+    sender_name: Mapped[str] = mapped_column(String, nullable=False)
+    title_ar: Mapped[str] = mapped_column(String, nullable=False)
+    title_en: Mapped[str] = mapped_column(String, nullable=False)
+    message_ar: Mapped[str] = mapped_column(Text, nullable=False)
+    message_en: Mapped[str] = mapped_column(Text, nullable=False)
+    recipient_mode: Mapped[str] = mapped_column(String, nullable=False)
+    # Only populated for recipient_mode='custom':
+    # {"companies": [{"company_id": "...", "mode": "managers"|"employees"|"everyone"}]}
+    target_config: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    recipient_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    # Renamed from delivered_count/failed_count (audit finding: those names
+    # implied real push delivery when they only ever measured whether the
+    # per-recipient Notification DB row was created). notification_created_
+    # count is exactly that pre-existing meaning, honestly named.
+    # push_delivered_count/push_failed_count are new - real per-recipient
+    # FCM outcomes, sourced from services/push.py's now-returned
+    # BatchResponse data (see services/company_notifications.py). All three
+    # count unique recipients, never devices - a user with 3 devices
+    # contributes at most 1 to any of these.
+    notification_created_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    push_delivered_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    push_failed_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Client-supplied, one per compose attempt (see CreateCompanyNotificationDialog.js) -
+    # same idempotency pattern as services/tasks.py::_idempotent, scoped to
+    # this table rather than the shared idempotency_keys table because that
+    # table's company_id is NOT NULL and doesn't fit a cross-company
+    # broadcast. No key means no protection, same convention as tasks.py.
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "recipient_mode IN ('all_managers','all_employees','everyone','custom')",
+            name="ck_company_notifications_recipient_mode",
+        ),
+        CheckConstraint(
+            "status IN ('sent','partial_failure','failed')", name="ck_company_notifications_status"
+        ),
+        Index("ix_company_notifications_created_at", "created_at"),
+        UniqueConstraint("idempotency_key", name="uq_company_notifications_idempotency_key"),
+    )
 
 
 # ============ Idempotency Keys ============

@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from typing import List, Optional
 
 from fastapi import HTTPException
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import repositories.companies as companies_repo
@@ -10,6 +11,7 @@ import repositories.work_schedules as work_schedules_repo
 import services.notifications as notifications_service
 from services.admin import parse_uuid
 from services.auth import hash_password, validate_password_strength
+from services.identifiers import PHONE_TAKEN, translate_phone_integrity_error, validate_phone
 from services.storage import decode_and_validate, delete as storage_delete, download_base64, upload as storage_upload
 
 UPDATE_ALLOWED_FIELDS = ["name", "phone", "department", "position", "status", "avatar", "schedule_id"]
@@ -100,6 +102,7 @@ async def _store_cv(db: AsyncSession, employee, uploaded_by, cv_data) -> None:
 
 
 async def create_employee(db: AsyncSession, company_id, created_by, data) -> dict:
+    validate_phone(data.phone)
     if await users_repo.email_taken(db, data.email):
         raise HTTPException(status_code=400, detail="Email already registered")
     # The old Mongo implementation never checked phone uniqueness (there was
@@ -165,6 +168,8 @@ async def update_employee(db: AsyncSession, company_id, employee_id: str, update
     # updates arrives as a raw dict (unvalidated), same contract as the old
     # implementation - whitelist filtering is the only guard.
     safe_updates = {k: v for k, v in updates.items() if k in UPDATE_ALLOWED_FIELDS}
+    if "phone" in safe_updates:
+        validate_phone(safe_updates["phone"])
     if updates.get("password"):
         validate_password_strength(updates["password"])
         safe_updates["password"] = await hash_password(updates["password"])
@@ -175,6 +180,12 @@ async def update_employee(db: AsyncSession, company_id, employee_id: str, update
     employee = await users_repo.get_employee_in_company(db, parsed_id, company_id) if parsed_id else None
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
+
+    # Same-column uniqueness, like create_employee's: this path used to rely on the unique index
+    # alone, so a duplicate phone surfaced as an unhandled IntegrityError (a 500).
+    if "phone" in safe_updates and safe_updates["phone"] != employee.phone:
+        if await users_repo.phone_taken(db, safe_updates["phone"], exclude_id=employee.id):
+            raise HTTPException(status_code=400, detail=PHONE_TAKEN)
 
     # schedule_id is a cross-table FK, unlike every other field in
     # UPDATE_ALLOWED_FIELDS (plain scalars with no referential integrity to
@@ -193,7 +204,11 @@ async def update_employee(db: AsyncSession, company_id, employee_id: str, update
 
     for field, value in safe_updates.items():
         setattr(employee, field, value)
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        # A concurrent write can win the race the pre-check above loses; the DB has the last word.
+        raise translate_phone_integrity_error(exc) or exc
     return {"message": "Employee updated successfully"}
 
 
@@ -273,12 +288,23 @@ async def update_own_profile(db: AsyncSession, user_id: str, updates: dict) -> d
     filtered = {k: v for k, v in updates.items() if k in PROFILE_ALLOWED_FIELDS}
     if not filtered:
         raise HTTPException(status_code=400, detail="No valid fields to update")
+    if "phone" in filtered:
+        validate_phone(filtered["phone"])
 
     user = await users_repo.get_by_id(db, parse_uuid(user_id))
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
+    # Reachable by EVERY authenticated role (see the route's note), so this is the path that used to
+    # let anyone set their phone to another user's email, or to a phone already in use.
+    if "phone" in filtered and filtered["phone"] != user.phone:
+        if await users_repo.phone_taken(db, filtered["phone"], exclude_id=user.id):
+            raise HTTPException(status_code=400, detail=PHONE_TAKEN)
+
     for field, value in filtered.items():
         setattr(user, field, value)
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        raise translate_phone_integrity_error(exc) or exc
     return {"message": "Profile updated successfully"}

@@ -33,14 +33,18 @@ async def get_by_id_with_company(db: AsyncSession, user_id) -> Tuple[Optional[Us
     return row[0], row[1]
 
 
-async def get_by_email_or_phone(db: AsyncSession, identifier: str) -> Optional[User]:
-    result = await db.execute(
-        select(User).where(
-            (User.email == identifier) | (User.phone == identifier),
-            User.deleted_at.is_(None),
-        )
-    )
-    return result.scalar_one_or_none()
+# Login lookups. Each is a plain single-column equality on LIVE rows (it matches the partial unique
+# index of that column), and returns up to `limit` rows instead of asserting there is one, so the
+# caller can tell "no such account" from "more than one" without an exception. Which column to
+# search is the caller's decision - see services/identifiers.py.
+async def find_live_by_email(db: AsyncSession, email: str, limit: int = 2) -> List[User]:
+    result = await db.execute(select(User).where(User.email == email, User.deleted_at.is_(None)).limit(limit))
+    return list(result.scalars().all())
+
+
+async def find_live_by_phone(db: AsyncSession, phone: str, limit: int = 2) -> List[User]:
+    result = await db.execute(select(User).where(User.phone == phone, User.deleted_at.is_(None)).limit(limit))
+    return list(result.scalars().all())
 
 
 async def get_by_email(db: AsyncSession, email: str) -> Optional[User]:
@@ -201,4 +205,40 @@ async def count_matching_ids_in_company(db: AsyncSession, ids, company_id) -> in
 
 async def list_by_role(db: AsyncSession, role: str) -> List[User]:
     result = await db.execute(select(User).where(User.role == role, User.deleted_at.is_(None)))
+    return list(result.scalars().all())
+
+
+async def list_by_roles(db: AsyncSession, roles: List[str], company_ids: Optional[List[uuid.UUID]] = None) -> List[User]:
+    """Generalizes list_by_role (any-of-roles) with an optional company
+    scope - the one primitive services/company_notifications.py needs to
+    resolve all of its recipient modes (platform-wide when company_ids is
+    omitted, or scoped to specific companies for custom targeting).
+
+    Only used by company_notifications.py (verified: no other caller) -
+    joins Company and requires it to be in good standing, using exactly
+    the predicate services/auth.py::enforce_company_access already treats
+    as "active" elsewhere in the app (subscription_status == 'active',
+    not the self-healing date check that function also does - a plain
+    read here shouldn't have the side effect of mutating a company row).
+    Both 'expired' and 'suspended' are excluded by that one equality
+    check, since the CHECK constraint only allows one of the three values
+    at a time. A soft-deleted company (deleted_at set) is excluded too.
+    roles is always ['company_owner'] and/or ['employee'] here, and every
+    row with either role always has a non-null company_id by construction
+    (see Company.owner_id / employees_service.create_employee), so this
+    is a plain inner join, not a left join - it can't accidentally drop a
+    legitimately-matching row for either role."""
+    query = (
+        select(User)
+        .join(Company, User.company_id == Company.id)
+        .where(
+            User.role.in_(roles),
+            User.deleted_at.is_(None),
+            Company.deleted_at.is_(None),
+            Company.subscription_status == "active",
+        )
+    )
+    if company_ids is not None:
+        query = query.where(User.company_id.in_(company_ids))
+    result = await db.execute(query)
     return list(result.scalars().all())

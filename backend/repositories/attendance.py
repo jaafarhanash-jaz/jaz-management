@@ -8,8 +8,42 @@ from models import Attendance, User
 
 
 async def get_for_employee_on_date(db: AsyncSession, employee_id, date_) -> Optional[Attendance]:
+    """The most recent row for this employee/date. No unique constraint on
+    (employee_id, date) prevents more than one (a stray duplicate
+    check-in, or - since Part 7 - a same-day 'did_not_check_out' row
+    coexisting with a fresh same-day check-in, by design: see
+    services/attendance.py's check_in, which never reuses a resolved
+    row). `.first()` on an explicit ordering rather than
+    `scalar_one_or_none()`, which would raise on more than one row."""
     result = await db.execute(
-        select(Attendance).where(Attendance.employee_id == employee_id, Attendance.date == date_)
+        select(Attendance)
+        .where(Attendance.employee_id == employee_id, Attendance.date == date_)
+        .order_by(Attendance.check_in_time.desc().nullslast(), Attendance.created_at.desc())
+    )
+    return result.scalars().first()
+
+
+async def get_latest_open_for_employee(db: AsyncSession, employee_id) -> Optional[Attendance]:
+    """The employee's most recent still-open session (checked in, not yet
+    checked out, and not already resolved as 'did_not_check_out'),
+    regardless of calendar date - THE fix for midnight-crossing shifts
+    (Part 7): check_out() must resolve "my current open session," not
+    "today's row." A shift that started yesterday and is still within its
+    grace period is exactly as findable here as one that started an hour
+    ago. Excluding 'did_not_check_out' rows is what lets a legitimate next
+    shift begin independently once a stale session has been self-healed
+    (Part 7/Rule 13) - otherwise the same resolved row would keep matching
+    forever, since check_out_time is deliberately left NULL on it."""
+    result = await db.execute(
+        select(Attendance)
+        .where(
+            Attendance.employee_id == employee_id,
+            Attendance.check_in_time.is_not(None),
+            Attendance.check_out_time.is_(None),
+            Attendance.status != "did_not_check_out",
+        )
+        .order_by(Attendance.check_in_time.desc())
+        .limit(1)
     )
     return result.scalar_one_or_none()
 

@@ -662,7 +662,11 @@ class TestSmartQRAttendance:
                             json={"qr_code": TestSmartQRAttendance._token, "latitude": 24.7, "longitude": 46.6},
                             headers=TestSmartQRAttendance._emp_headers)
         assert r.status_code == 400
-        assert "already checked in" in r.json()["detail"].lower()
+        # Part 7's open-session guard now catches this first, with a more
+        # specific bilingual message ("you have an unfinished session -
+        # check out first") than the old same-day-only "already checked
+        # in" - still a 400, still correctly rejected either way.
+        assert "لديك جلسة حضور سابقة" in r.json()["detail"]
 
     def test_fake_gps_impossible_velocity_rejected(self, api_client):
         # Seconds after checking in at 24.7, a checkout from ~111km away is
@@ -718,10 +722,17 @@ class TestSmartQRAttendance:
         current_status = r.json()[0]["status"]
         new_status = "late" if current_status != "late" else "present"
         TestSmartQRAttendance._new_status = new_status
+        # reason is required (Part 8/Rule 14) - every manual correction
+        # must be justified.
         r = api_client.patch(f"{BASE_URL}/api/owner/attendance/{TestSmartQRAttendance._record_id}",
-                             json={"status": new_status}, headers=owner_headers)
+                             json={"status": new_status, "reason": "TEST_ pytest correction"}, headers=owner_headers)
         assert r.status_code == 200, r.text
         assert r.json()["audit_entries"] == 1
+
+    def test_manual_edit_without_reason_rejected(self, api_client, owner_headers):
+        r = api_client.patch(f"{BASE_URL}/api/owner/attendance/{TestSmartQRAttendance._record_id}",
+                             json={"status": "present"}, headers=owner_headers)
+        assert r.status_code == 422, r.text
 
     def test_audit_log_read_only_viewer(self, api_client, owner_headers, employee_headers):
         r = api_client.get(f"{BASE_URL}/api/owner/attendance/audit-log", headers=owner_headers)
@@ -733,6 +744,7 @@ class TestSmartQRAttendance:
         assert entry["new_value"] == TestSmartQRAttendance._new_status
         assert entry["edited_by_name"] == "أحمد محمد"
         assert entry["employee_name"] == "TEST_QR_Employee"
+        assert entry["reason"] == "TEST_ pytest correction"
         assert entry["edited_at"]
         # Newest first
         timestamps = [e["edited_at"] for e in entries]

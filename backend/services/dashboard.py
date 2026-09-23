@@ -15,6 +15,7 @@ import repositories.users as users_repo
 import services.attendance as attendance_service
 import services.calendar as calendar_service
 import services.holidays as holidays_service
+import services.leave_attendance as leave_attendance_service
 import services.messages as messages_service
 import services.notifications as notifications_service
 import services.schedule_resolution as schedule_resolution
@@ -118,7 +119,16 @@ async def get_owner_dashboard(db: AsyncSession, current_user: dict) -> dict:
 
     present_today = sum(1 for s in status_by_employee.values() if s == "present")
     late_today = 0 if today_holiday else sum(1 for s in status_by_employee.values() if s == "late")
-    absent_today = 0 if today_holiday else max(0, total_employees - present_today - late_today)
+    # Unified expected-attendance exclusion (approved decision): today_holiday
+    # is company-wide (kept as its own explicit gate above, unchanged), while
+    # approved full_day leave is per-employee - non_working_today counts
+    # BOTH without double-counting a given employee-day, and reduces to
+    # exactly total_employees on a holiday (identical result to the old
+    # `0 if today_holiday else ...` shortcut) when no leave applies.
+    non_working_today = await leave_attendance_service.compute_non_working_employee_days(
+        db, company_id, employee_ids, today, today, working_hours=working_hours,
+    )
+    absent_today = max(0, (total_employees - non_working_today) - present_today - late_today)
     checked_out_today = len(checked_out_ids)
     # "Working" = checked in but not yet checked out today (distinct from
     # "Finished" = checked_out_today above) - Phase 4's daily summary.
@@ -216,7 +226,7 @@ async def get_owner_analytics(db: AsyncSession, current_user: dict) -> dict:
     # check-in on a company holiday must not count as a "late" violation or
     # skew anyone's attendance rate.
     all_attendance = await attendance_repo.list_by_company(db, company_id)
-    all_attendance = await _filter_out_holiday_attendance(db, company_id, all_attendance)
+    all_attendance = await _filter_out_exempt_attendance(db, company_id, all_attendance)
 
     total_attendance_all = len(all_attendance)
     present_attendance_all = sum(1 for a in all_attendance if a.status == "present")
@@ -318,11 +328,18 @@ async def get_owner_analytics(db: AsyncSession, current_user: dict) -> dict:
     }
 
 
-async def _filter_out_holiday_attendance(db: AsyncSession, company_id, records: list) -> list:
+async def _filter_out_exempt_attendance(db: AsyncSession, company_id, records: list) -> list:
     """Drops attendance rows whose date falls on a non-working day (named
-    company holiday or configured weekly holiday) - a stray check-in on a
-    day off must never count as a late/absent violation or skew the
-    attendance-rate denominator. One holiday lookup per distinct date."""
+    company holiday or configured weekly holiday - applies to every
+    employee equally) OR whose specific employee has an APPROVED full_day
+    leave covering that date (per-employee, unlike a holiday) - a stray
+    check-in on an exempt day must never count as a late/absent violation
+    or skew the attendance-rate denominator. One holiday lookup per
+    distinct date, one leave lookup batched across every distinct employee
+    in the record set. Formerly _filter_out_holiday_attendance - renamed
+    and extended rather than duplicated, since both call sites want the
+    same combined exclusion (approved decision: unify Leave and Holiday
+    exclusion at this one calculation layer)."""
     dates = {r.date for r in records if r.date}
     if not dates:
         return records
@@ -333,9 +350,17 @@ async def _filter_out_holiday_attendance(db: AsyncSession, company_id, records: 
         d for d in dates
         if await holidays_service.get_day_off_info(db, company_id, d, working_hours=working_hours)
     }
-    if not off_dates:
-        return records
-    return [r for r in records if r.date not in off_dates]
+    remaining = [r for r in records if r.date not in off_dates] if off_dates else records
+
+    employee_ids = {r.employee_id for r in remaining}
+    if not employee_ids:
+        return remaining
+    leave_pairs = await leave_attendance_service.get_full_day_leave_employee_date_pairs(
+        db, company_id, employee_ids, min(dates), max(dates),
+    )
+    if not leave_pairs:
+        return remaining
+    return [r for r in remaining if (str(r.employee_id), r.date.isoformat()) not in leave_pairs]
 
 
 async def get_employee_dashboard(db: AsyncSession, current_user: dict) -> dict:
@@ -433,7 +458,7 @@ async def get_employee_performance(db: AsyncSession, current_user: dict) -> dict
     overdue_tasks = sum(1 for t in tasks if t.status == "overdue")
 
     employee_attendance = await attendance_repo.list_by_company(db, company_id, employee_id=employee_id)
-    employee_attendance = await _filter_out_holiday_attendance(db, company_id, employee_attendance)
+    employee_attendance = await _filter_out_exempt_attendance(db, company_id, employee_attendance)
     total_days = len(employee_attendance)
     present_days = sum(1 for a in employee_attendance if a.status == "present")
     late_days = sum(1 for a in employee_attendance if a.status == "late")

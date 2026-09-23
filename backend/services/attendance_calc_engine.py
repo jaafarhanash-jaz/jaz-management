@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date as date_type, datetime, timedelta, timezone
 from typing import Iterable, Optional
 
 # ---------------------------------------------------------------------------
@@ -68,6 +68,53 @@ def calculate_check_in(schedule: Optional[ScheduleSnapshot], check_in_time: date
     if delta < 0:
         return {"status": "present", "late_minutes": None, "early_arrival_minutes": round(-delta, 2)}
     return {"status": "present", "late_minutes": None, "early_arrival_minutes": None}
+
+
+def compute_shift_end_datetime(shift_date: date_type, start_time: str, end_time: str) -> datetime:
+    """Combines a shift's calendar date (its check-in date) with its
+    scheduled end time, rolling to the next day when the shift crosses
+    midnight - e.g. a 17:00-02:00 shift dated 2026-08-31 ends at
+    2026-09-01 02:00, not 2026-08-31 02:00. This is THE fix for Part 7's
+    "midnight must not automatically close a night shift": end-of-shift is
+    always derived from start/end-time-of-day, never from the calendar
+    date changing.
+
+    A shift is treated as overnight whenever end_time <= start_time
+    (equal only for a degenerate 24-hour shift, also rolled forward).
+    Returns a UTC-aware datetime, matching this module's existing
+    timezone convention (see the module docstring)."""
+    end_minutes = _parse_hhmm_to_minutes(end_time)
+    start_minutes = _parse_hhmm_to_minutes(start_time)
+    end_hour, end_minute = divmod(int(end_minutes), 60)
+    end_dt = datetime(shift_date.year, shift_date.month, shift_date.day, end_hour, end_minute, tzinfo=timezone.utc)
+    if end_minutes <= start_minutes:
+        end_dt += timedelta(days=1)
+    return end_dt
+
+
+def compute_forgotten_checkout_deadline(
+    shift_date: date_type, start_time: str, end_time: str, grace_period_minutes: int,
+    check_in_time: Optional[datetime] = None,
+) -> datetime:
+    """Shift end + grace period - the exact threshold after which an open
+    session with no check-out is resolved as 'did_not_check_out' (Rule 12).
+    Never derived from the calendar date changing - see
+    compute_shift_end_datetime above.
+
+    When `check_in_time` is given, the result is never earlier than
+    check_in_time + grace_period_minutes - an employee who checks in well
+    after the schedule's own nominal end-of-day (e.g. a very late arrival
+    against a 9-5 schedule, checking in at 8PM) must still get their full
+    configured grace period from the moment they actually checked in; a
+    session must never become eligible for 'did_not_check_out'
+    functionally the instant it was created. For a check-in that happens
+    reasonably close to the shift's own start time (the normal case,
+    including every worked example in the spec), this is a no-op - the
+    schedule-derived deadline is always the later of the two then."""
+    deadline = compute_shift_end_datetime(shift_date, start_time, end_time) + timedelta(minutes=grace_period_minutes)
+    if check_in_time is not None:
+        deadline = max(deadline, check_in_time + timedelta(minutes=grace_period_minutes))
+    return deadline
 
 
 def get_live_worked_minutes(check_in_time: datetime, now: datetime) -> float:

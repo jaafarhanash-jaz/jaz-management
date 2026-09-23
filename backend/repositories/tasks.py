@@ -7,6 +7,44 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from models import Task
 
 
+async def list_copyable_for_employee(db: AsyncSession, employee_id, company_id) -> List[Task]:
+    """Configuration tasks eligible for Part 21's employee-replacement
+    copy flow: standalone, still-active, non-critical, non-daily-derived
+    tasks. Deliberately excludes: critical tasks (historical incidents,
+    never copied - see count_critical_for_employee for the info-only
+    count), daily-task occurrences (handled by cloning the DailyTask
+    template instead - see services/task_copy.py), completed/rejected/
+    overdue/cancelled/scheduled tasks (historical or not-yet-configuration
+    state, not portable configuration), and sequential-workflow/batch
+    tasks (their ordering is tied to the old employee's specific workflow
+    instance - a documented limitation, not silently approximated)."""
+    result = await db.execute(
+        select(Task).where(
+            Task.assigned_to == employee_id, Task.company_id == company_id, Task.deleted_at.is_(None),
+            Task.priority != "critical",
+            Task.task_category.is_distinct_from("daily"),
+            Task.status.in_(["new", "received", "seen", "in_progress"]),
+            Task.batch_id.is_(None),
+            Task.daily_task_id.is_(None),
+            Task.scheduled_activation_at.is_(None),
+        )
+    )
+    return list(result.scalars().all())
+
+
+async def count_critical_for_employee(db: AsyncSession, employee_id, company_id) -> int:
+    """Info-only count for the copy-preview summary (Part 21: "explain
+    what will and will not be copied") - critical tasks are never copied,
+    regardless of status."""
+    result = await db.execute(
+        select(func.count()).select_from(Task).where(
+            Task.assigned_to == employee_id, Task.company_id == company_id, Task.deleted_at.is_(None),
+            Task.priority == "critical",
+        )
+    )
+    return result.scalar_one()
+
+
 async def get_pending_critical_for_employee(db: AsyncSession, employee_id, limit: int = 50) -> List[Task]:
     result = await db.execute(
         select(Task)

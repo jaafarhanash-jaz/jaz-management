@@ -41,6 +41,7 @@ CATEGORY_REPORTS = "reports"
 CATEGORY_SUBSCRIPTIONS = "subscriptions"
 CATEGORY_PAYMENTS = "payments"
 CATEGORY_ANNOUNCEMENTS = "announcements"
+CATEGORY_COMPANY_NOTIFICATIONS = "company_notifications"
 
 SUBSCRIPTION_EXPIRING_SOON_DAYS = 7
 
@@ -110,7 +111,14 @@ async def publish(
     )
     response = notification_response(notification)
     realtime_service.publish_to_user(str(user_id), response)
-    await push_service.send_push_to_user(
+    # push_result is additive - every existing caller of publish() ignores
+    # it, same as they already ignored send_push_to_user's own return
+    # value, so nothing changes for tasks/messages/attendance/
+    # announcements/system notifications. Currently only read by
+    # services/company_notifications.py, which needs to know real push
+    # outcome (not just "a Notification row was created") for its
+    # audit-record counts.
+    push_result = await push_service.send_push_to_user(
         db,
         user_id,
         title=title,
@@ -121,6 +129,7 @@ async def publish(
         entity_id=entity_id,
         action_url=action_url,
     )
+    response["push_result"] = push_result
     return response
 
 
