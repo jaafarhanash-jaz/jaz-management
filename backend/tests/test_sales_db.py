@@ -8,7 +8,7 @@ resolution (union, revoked grants, retired roles, inactive accounts).
 Same pattern as test_leave_db_constraints.py (asyncio.run + engine.dispose()).
 Refuses to run unless DATABASE_URL is the scratch database.
 """
-from sales_test_utils import assert_scratch_target
+from sales_test_utils import ALL_PERMISSION_KEYS, SYSTEM_ROLE_PERMISSIONS, assert_scratch_target
 
 assert_scratch_target(need_http=False)  # must run BEFORE importing database (which loads .env)
 
@@ -72,15 +72,12 @@ class TestSeedAndCheckConstraint:
                 assert set(roles) == {"sales_manager", "sales_employee", "lead_data_entry", "onboarding_employee"}
                 assert all(r.is_system and r.is_active and r.module == "sales" for r in roles.values())
                 perms = {p.key for p in (await db.execute(select(StaffPermission))).scalars()}
-                assert perms == {"sales.access", "sales.team.view", "sales.staff.create", "sales.staff.update", "sales.staff.assign_roles"}
+                assert perms == ALL_PERMISSION_KEYS  # Phase 1 + Phase 2 + Phase 3 catalog
                 grants = {(roles_by_id, k) for roles_by_id, k in (await db.execute(
                     select(StaffRole.key, StaffRolePermission.permission_key).join(StaffRolePermission, StaffRolePermission.role_id == StaffRole.id)
                     .where(StaffRole.is_system.is_(True))
                 )).all()}
-                assert grants == {
-                    ("sales_manager", "sales.access"), ("sales_manager", "sales.team.view"),
-                    ("sales_employee", "sales.access"), ("lead_data_entry", "sales.access"), ("onboarding_employee", "sales.access"),
-                }
+                assert grants == {(role, key) for role, keys in SYSTEM_ROLE_PERMISSIONS.items() for key in keys}
         run(_run())
 
     def test_ck_users_role_accepts_jaz_staff_and_rejects_anything_else(self):
@@ -300,7 +297,7 @@ class TestPermissionResolution:
                     assert exc.value.status_code == 403
 
                     sa = await resolve_staff_context(db, {"id": str(uuid.uuid4()), "role": "super_admin", "status": "active"})
-                    assert sa.is_super_admin and len(sa.permissions) == 5
+                    assert sa.is_super_admin and sa.permissions == frozenset(ALL_PERMISSION_KEYS)
 
                     with pytest.raises(HTTPException) as exc:
                         await resolve_staff_context(db, _user_dict(staff_inactive))          # deactivated -> denied outright
@@ -322,17 +319,19 @@ class TestPermissionResolution:
                 async with SessionLocal() as db:
                     user = await _new_user(db); uid = user.id
                     mgr, emp = await _role(db, "sales_manager"), await _role(db, "sales_employee")
+                    emp_perms = frozenset(SYSTEM_ROLE_PERMISSIONS["sales_employee"])
                     await staff_repo.grant_role(db, user.id, emp.id, user.id)
                     ctx = await resolve_staff_context(db, _user_dict(user))
-                    assert ctx.permissions == frozenset({"sales.access"})
+                    assert ctx.permissions == emp_perms
 
                     await staff_repo.grant_role(db, user.id, mgr.id, user.id)                     # union grows
                     ctx = await resolve_staff_context(db, _user_dict(user))
-                    assert ctx.permissions == frozenset({"sales.access", "sales.team.view"})
+                    assert ctx.permissions == emp_perms | SYSTEM_ROLE_PERMISSIONS["sales_manager"]
+                    assert "sales.team.view" in ctx.permissions
 
                     await staff_repo.revoke_role(db, user.id, mgr.id, user.id)                    # revoked grant contributes nothing
                     ctx = await resolve_staff_context(db, _user_dict(user))
-                    assert ctx.permissions == frozenset({"sales.access"})
+                    assert ctx.permissions == emp_perms
 
                     # a RETIRED role (is_active=False) contributes nothing even while still granted
                     temp = StaffRole(id=uuid.uuid4(), module="sales", key=f"temp_{uuid.uuid4().hex[:8]}", name_en="t", name_ar="t"); temp_id = temp.id
@@ -343,7 +342,7 @@ class TestPermissionResolution:
                     assert "sales.team.view" in ctx.permissions
                     temp.is_active = False; await db.flush()
                     ctx = await resolve_staff_context(db, _user_dict(user))
-                    assert ctx.permissions == frozenset({"sales.access"})
+                    assert ctx.permissions == emp_perms
                     await db.commit()
             finally:
                 if uid:

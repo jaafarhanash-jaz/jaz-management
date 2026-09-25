@@ -1,7 +1,16 @@
 // JAZ Sales strings. Kept in their own file (not utils/translations.js) so the
 // Sales module stays self-contained and reviewable on its own. Arabic is the
-// primary language, matching the rest of the platform.
-export const salesTranslations = {
+// primary language, matching the rest of the platform. Phase 1 (workspace, team)
+// lives below; Phase 2 (leads, campaigns, pipeline) is in salesLeadsTranslations.js
+// Phase 3 (calls, follow-ups, demos, trials) in salesActivitiesTranslations.js, Phase 4 (conversion, customers,
+// onboarding) in salesCustomersTranslations.js and Phase 5 (dashboard, reports) in salesReportsTranslations.js; all are
+// merged in at the bottom of this file.
+import { leadsTranslations } from '@/utils/salesLeadsTranslations';
+import { activitiesTranslations } from '@/utils/salesActivitiesTranslations';
+import { customersTranslations } from '@/utils/salesCustomersTranslations';
+import { reportsTranslations } from '@/utils/salesReportsTranslations';
+
+const baseTranslations = {
   ar: {
     brand: 'مبيعات JAZ',
     nav_home: 'لوحة المبيعات',
@@ -144,6 +153,11 @@ export const salesTranslations = {
     toast_error: 'Something went wrong',
     loading: 'Loading...',
   },
+};
+
+export const salesTranslations = {
+  ar: { ...baseTranslations.ar, ...leadsTranslations.ar, ...activitiesTranslations.ar, ...customersTranslations.ar, ...reportsTranslations.ar },
+  en: { ...baseTranslations.en, ...leadsTranslations.en, ...activitiesTranslations.en, ...customersTranslations.en, ...reportsTranslations.en },
 };
 
 export const ts = (key, language = 'ar') =>

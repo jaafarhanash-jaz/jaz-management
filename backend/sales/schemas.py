@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, SecretStr, field_validator
 
 
 class _Strict(BaseModel):
@@ -25,7 +25,7 @@ class StaffCreate(_Strict):
     name: str = Field(max_length=200)
     email: EmailStr
     phone: str = Field(max_length=50)
-    password: str = Field(min_length=1, max_length=200)  # strength enforced by core validate_password_strength
+    password: SecretStr = Field(min_length=1, max_length=200)  # strength enforced by core validate_password_strength; a SecretStr prints as ********** if the model is ever logged
     # Initial roles, by key. Validated server-side against staff_roles (never trusted).
     role_keys: List[str] = Field(default_factory=list, max_length=20)
 
@@ -47,7 +47,7 @@ class StaffUpdate(_Strict):
 
 
 class PasswordReset(_Strict):
-    new_password: str = Field(min_length=1, max_length=200)
+    new_password: SecretStr = Field(min_length=1, max_length=200)
 
 
 class RoleAssignment(_Strict):

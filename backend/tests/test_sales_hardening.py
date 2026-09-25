@@ -25,6 +25,7 @@ import uuid
 from types import SimpleNamespace
 
 import pytest
+from pydantic import SecretStr
 from sqlalchemy import delete, select, text, update
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
@@ -599,7 +600,7 @@ class TestAuditIsAtomicWithTheChange:
             ops = {
                 "create": lambda db: team_service.create_staff(db, ctx, StaffCreate(name="In Proc", email=new_email, phone=unique_phone(), password=STAFF_PASSWORD, role_keys=["sales_employee"]), audit),
                 "update": lambda db: team_service.update_staff(db, ctx, sid, StaffUpdate(name="Should Not Stick", status="inactive"), audit),
-                "reset": lambda db: team_service.reset_password(db, ctx, sid, "Reset#98765Xy", audit),
+                "reset": lambda db: team_service.reset_password(db, ctx, sid, SecretStr("Reset#98765Xy"), audit),
                 "grant": lambda db: team_service.assign_role(db, ctx, sid, "sales_manager", audit),
                 "revoke": lambda db: team_service.revoke_role(db, ctx, sid, "sales_employee", audit),
             }

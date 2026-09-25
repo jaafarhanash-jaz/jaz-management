@@ -19,6 +19,64 @@ import requests
 SCRATCH_DB_NAME = "jaz_sales_scratch"
 STAFF_PASSWORD = "Staff#12345"
 
+# The approved permission catalog and system-role grants: Phase 1 (bb595f6d8dae) + Phase 2 (d764d5f44e91) + Phase 3
+# (e3a9c5b07d12) + Phase 4 (f4c8a1d92b63) + Phase 5 (b6d1f3a8c294). The tests that pin "exactly the approved grants" import these, so a new phase
+# updates ONE place - and any drift between the code catalog (sales/permissions.py), the migrations and this list is caught.
+_PHASE1_PERMISSIONS = {"sales.access", "sales.team.view", "sales.staff.create", "sales.staff.update", "sales.staff.assign_roles"}
+_PHASE2_PERMISSIONS = {
+    "sales.leads.view", "sales.leads.create", "sales.leads.update", "sales.leads.delete", "sales.leads.change_stage",
+    "sales.leads.assign", "sales.leads.override_duplicates", "sales.leads.scope_all", "sales.leads.scope_assigned",
+    "sales.leads.scope_intake", "sales.campaigns.view", "sales.campaigns.manage",
+}
+# Phase 3: calls, follow-ups, demos, trials. Held by Sales Manager and Sales Employee ONLY - Lead Data Entry and
+# Onboarding Employee get none of them.
+_PHASE3_PERMISSIONS = {
+    "sales.calls.view", "sales.calls.manage", "sales.followups.view", "sales.followups.manage",
+    "sales.demos.view", "sales.demos.manage", "sales.trials.view", "sales.trials.manage",
+}
+# Phase 4: customers and onboarding. Sales Manager: convert + view customers, run onboarding everywhere. Sales Employee: view
+# the customers of their own leads, nothing else. Onboarding Employee: work the onboarding records assigned to them.
+# Lead Data Entry gets none of them.
+_PHASE4_PERMISSIONS = {
+    "sales.customers.view", "sales.customers.convert", "sales.onboarding.view", "sales.onboarding.manage",
+    "sales.onboarding.assign", "sales.onboarding.scope_all", "sales.onboarding.scope_assigned",
+}
+_PHASE4_MANAGER = {
+    "sales.customers.view", "sales.customers.convert", "sales.onboarding.view", "sales.onboarding.manage",
+    "sales.onboarding.assign", "sales.onboarding.scope_all",
+}
+_PHASE4_EMPLOYEE = {"sales.customers.view"}
+_PHASE4_ONBOARDING = {"sales.onboarding.view", "sales.onboarding.manage", "sales.onboarding.scope_assigned"}
+# Phase 5: dashboard and reports. Sales Manager, Sales Employee and Onboarding Employee hold both; Lead Data Entry holds neither
+# (metrics are opt-in). What a section shows is still limited by the permissions of the records it counts.
+_PHASE5_PERMISSIONS = {"sales.dashboard.view", "sales.reports.view"}
+ALL_PERMISSION_KEYS = _PHASE1_PERMISSIONS | _PHASE2_PERMISSIONS | _PHASE3_PERMISSIONS | _PHASE4_PERMISSIONS | _PHASE5_PERMISSIONS
+SYSTEM_ROLE_PERMISSIONS = {
+    "sales_manager": {
+        "sales.access", "sales.team.view",
+        "sales.leads.view", "sales.leads.create", "sales.leads.update", "sales.leads.delete", "sales.leads.change_stage",
+        "sales.leads.assign", "sales.leads.override_duplicates", "sales.leads.scope_all",
+        "sales.campaigns.view", "sales.campaigns.manage",
+    } | _PHASE3_PERMISSIONS | _PHASE4_MANAGER | _PHASE5_PERMISSIONS,
+    "sales_employee": {
+        "sales.access", "sales.leads.view", "sales.leads.update", "sales.leads.change_stage",
+        "sales.leads.scope_assigned", "sales.campaigns.view",
+    } | _PHASE3_PERMISSIONS | _PHASE4_EMPLOYEE | _PHASE5_PERMISSIONS,
+    "lead_data_entry": {
+        "sales.access", "sales.leads.view", "sales.leads.create", "sales.leads.update",
+        "sales.leads.scope_intake", "sales.campaigns.view",
+    },
+    "onboarding_employee": {"sales.access"} | _PHASE4_ONBOARDING | _PHASE5_PERMISSIONS,
+}
+# what GET /sales/me lists as `modules` for each system role (server order: sales/permissions.py::MODULES)
+SYSTEM_ROLE_MODULES = {
+    "sales_manager": ["home", "team", "leads", "pipeline", "campaigns", "followups", "calls", "demos", "trials", "reports", "customers", "onboarding"],
+    "sales_employee": ["home", "leads", "pipeline", "campaigns", "followups", "calls", "demos", "trials", "reports", "customers"],
+    "lead_data_entry": ["home", "leads", "pipeline", "campaigns"],
+    "onboarding_employee": ["home", "reports", "onboarding"],
+}
+ALL_MODULES = ["home", "team", "leads", "pipeline", "campaigns", "followups", "calls", "demos", "trials", "reports", "customers", "onboarding"]
+
 BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "").rstrip("/")
 
 
@@ -46,7 +104,9 @@ def unique_email(label: str) -> str:
 
 
 def unique_phone() -> str:
-    return f"+1555{random.randint(1000000, 9999999)}"
+    # 9 random digits (10^8 - 10^9 possibilities): the scratch DB accumulates thousands of staff across runs, and a 7-digit
+    # draw collided with an existing account often enough to fail a test now and then ("Phone number already registered").
+    return f"+1555{random.randint(100000000, 999999999)}"
 
 
 def auth(token: str) -> dict:
@@ -124,6 +184,19 @@ def create_staff(admin_headers: dict, role_keys, label: str = "staff", do_login:
 
 def api(method: str, path: str, headers=None, json=None, **kw):
     return requests.request(method, f"{BASE_URL}{path}", headers=headers, json=json, timeout=30, **kw)
+
+
+def team_items(admin_headers) -> list:
+    """Every row of the Super Admin team listing, paged (500 per page, oldest first). The scratch DB accumulates staff
+    across runs, so an account created moments ago is not on page one - and "this account does not exist" is only a
+    meaningful assertion when the whole listing has been read."""
+    items, offset = [], 0
+    while True:
+        page = api("GET", f"/api/sales/team?limit=500&offset={offset}", admin_headers).json()
+        items += page["items"]
+        offset += 500
+        if not page["items"] or offset >= page["total"]:
+            return items
 
 
 # ---------------------------------------------------------------------------

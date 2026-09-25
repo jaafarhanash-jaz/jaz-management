@@ -46,6 +46,20 @@ const EmployeeReports = lazy(() => import('./pages/Employee/Reports'));
 const Profile = lazy(() => import('./pages/Profile'));
 const SalesHome = lazy(() => import('./pages/Sales/SalesHome'));
 const SalesTeam = lazy(() => import('./pages/Sales/Team'));
+const SalesLeads = lazy(() => import('./pages/Sales/Leads'));
+const SalesLeadEditor = lazy(() => import('./pages/Sales/LeadEditor'));
+const SalesLeadDetail = lazy(() => import('./pages/Sales/LeadDetail'));
+const SalesPipeline = lazy(() => import('./pages/Sales/Pipeline'));
+const SalesCampaigns = lazy(() => import('./pages/Sales/Campaigns'));
+const SalesCustomers = lazy(() => import('./pages/Sales/Customers'));
+const SalesCustomerDetail = lazy(() => import('./pages/Sales/CustomerDetail'));
+const SalesOnboarding = lazy(() => import('./pages/Sales/Onboarding'));
+const SalesOnboardingDetail = lazy(() => import('./pages/Sales/OnboardingDetail'));
+const SalesFollowups = lazy(() => import('./pages/Sales/Followups'));
+const SalesCalls = lazy(() => import('./pages/Sales/Calls'));
+const SalesDemos = lazy(() => import('./pages/Sales/Demos'));
+const SalesTrials = lazy(() => import('./pages/Sales/Trials'));
+const SalesReports = lazy(() => import('./pages/Sales/Reports'));
 
 // Shown only for the brief moment a lazy page chunk is being fetched
 // (typically a single-digit-ms cache hit after the first visit to that
@@ -77,22 +91,23 @@ const ProtectedRoute = ({ children, allowedRoles, isAuthenticated, userRole }) =
   return children;
 };
 
+// The signed-in role, read from localStorage - or null when there is no session. Read SYNCHRONOUSLY, in the state
+// initializers below: setting it from an effect (as this used to) left the very first render "unauthenticated", so on a hard
+// refresh every protected route redirected to "/" - which then forwarded to the role's home page, dropping the deep link
+// (/sales/leads, /company-owner/tasks ... all landed on their dashboard).
+const storedRole = () => {
+  const token = localStorage.getItem('token');
+  const role = localStorage.getItem('role');
+  return token && role ? role : null;
+};
+
 function App() {
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
-  const [userRole, setUserRole] = useState(null);
+  const [userRole, setUserRole] = useState(storedRole);
+  const [isAuthenticated, setIsAuthenticated] = useState(() => storedRole() !== null);
   // Preferred Language (Profile/Account Settings) - persisted so the choice
   // survives a reload instead of resetting to Arabic every time.
   const [language, setLanguage] = useState(() => localStorage.getItem('language') || 'ar');
   const [pendingCriticalTasks, setPendingCriticalTasks] = useState([]);
-
-  useEffect(() => {
-    const token = localStorage.getItem('token');
-    const role = localStorage.getItem('role');
-    if (token && role) {
-      setIsAuthenticated(true);
-      setUserRole(role);
-    }
-  }, []);
 
   // Update HTML dir attribute when language changes
   useEffect(() => {
@@ -419,6 +434,21 @@ function App() {
             }
           >
             <Route path="/sales/dashboard" element={<SalesHome onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole={userRole} />} />
+            <Route path="/sales/leads" element={<SalesLeads onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole={userRole} />} />
+            <Route path="/sales/leads/new" element={<SalesLeadEditor onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole={userRole} />} />
+            <Route path="/sales/leads/:leadId" element={<SalesLeadDetail onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole={userRole} />} />
+            <Route path="/sales/leads/:leadId/edit" element={<SalesLeadEditor onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole={userRole} />} />
+            <Route path="/sales/pipeline" element={<SalesPipeline onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole={userRole} />} />
+            <Route path="/sales/campaigns" element={<SalesCampaigns onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole={userRole} />} />
+            <Route path="/sales/followups" element={<SalesFollowups onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole={userRole} />} />
+            <Route path="/sales/calls" element={<SalesCalls onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole={userRole} />} />
+            <Route path="/sales/demos" element={<SalesDemos onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole={userRole} />} />
+            <Route path="/sales/trials" element={<SalesTrials onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole={userRole} />} />
+            <Route path="/sales/customers" element={<SalesCustomers onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole={userRole} />} />
+            <Route path="/sales/customers/:customerId" element={<SalesCustomerDetail onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole={userRole} />} />
+            <Route path="/sales/onboarding" element={<SalesOnboarding onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole={userRole} />} />
+            <Route path="/sales/onboarding/:onboardingId" element={<SalesOnboardingDetail onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole={userRole} />} />
+            <Route path="/sales/reports" element={<SalesReports onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole={userRole} />} />
             <Route path="/sales/team" element={<SalesTeam onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole={userRole} />} />
             <Route path="/sales/profile" element={<Profile onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole={userRole} />} />
           </Route>

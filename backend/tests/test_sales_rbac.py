@@ -11,19 +11,24 @@ import uuid
 import pytest
 
 from sales_test_utils import (
+    ALL_MODULES,
+    ALL_PERMISSION_KEYS,
     STAFF_PASSWORD,
+    SYSTEM_ROLE_MODULES,
+    SYSTEM_ROLE_PERMISSIONS,
     api,
     assert_scratch_target,
     auth,
     create_staff,
     login,
+    team_items,
     unique_email,
     unique_phone,
 )
 # token fixtures that mint instead of logging in (see sales_test_utils) - override conftest's for this module
 from sales_test_utils import admin_token, employee_token, employee_user, owner_token, owner_user  # noqa: F401,E402
 
-ALL_PERMS = {"sales.access", "sales.team.view", "sales.staff.create", "sales.staff.update", "sales.staff.assign_roles"}
+ALL_PERMS = ALL_PERMISSION_KEYS  # Phase 1-3 catalog (sales_test_utils)
 PHANTOM_ID = "00000000-0000-4000-8000-000000000000"
 
 
@@ -51,8 +56,7 @@ def personas(admin_h):
 def _account_exists(admin_h, email) -> bool:
     """True if a staff account with this email exists - via the Super Admin team listing, so it costs
     no login request (the shared login rate limit is precious)."""
-    items = api("GET", "/api/sales/team?limit=500", admin_h).json()["items"]
-    return any(i["email"] == email for i in items)
+    return any(i["email"] == email for i in team_items(admin_h))
 
 
 def _has_password_key(obj) -> bool:
@@ -93,13 +97,12 @@ class TestSuperAdmin:
         assert body["is_super_admin"] is True
         assert body["user"]["role"] == "super_admin"
         assert set(body["permissions"]) == ALL_PERMS
-        assert body["modules"] == ["home", "team"]
+        assert body["modules"] == ALL_MODULES
 
     def test_can_read_team_and_roles(self, admin_h, personas):
-        team = api("GET", "/api/sales/team", admin_h)
-        assert team.status_code == 200
-        ids = {i["id"] for i in team.json()["items"]}
-        assert {p["id"] for p in personas.values()} <= ids
+        assert api("GET", "/api/sales/team", admin_h).status_code == 200
+        # every persona is in the listing (paged: the scratch DB accumulates staff, oldest first)
+        assert {p["id"] for p in personas.values()} <= {i["id"] for i in team_items(admin_h)}
         roles = api("GET", "/api/sales/roles", admin_h)
         assert roles.status_code == 200
         assert {r["key"] for r in roles.json() if r["is_system"]} == {"sales_manager", "sales_employee", "lead_data_entry", "onboarding_employee"}
@@ -107,9 +110,7 @@ class TestSuperAdmin:
     def test_system_roles_carry_only_the_approved_grants(self, admin_h):
         by_key = {r["key"]: set(r["permissions"]) for r in api("GET", "/api/sales/roles", admin_h).json() if r["is_system"]}
         assert set(by_key) == {"sales_manager", "sales_employee", "lead_data_entry", "onboarding_employee"}
-        assert by_key["sales_manager"] == {"sales.access", "sales.team.view"}
-        for key in ("sales_employee", "lead_data_entry", "onboarding_employee"):
-            assert by_key[key] == {"sales.access"}
+        assert by_key == SYSTEM_ROLE_PERMISSIONS  # exactly the approved grants (Phase 1 + 2 + 3), nothing extra
         # staff-account management is granted to NO role - Super Admin only
         assert not any(p.startswith("sales.staff.") for perms in by_key.values() for p in perms)
 
@@ -119,10 +120,10 @@ class TestSuperAdmin:
 # =============================================================================
 ROLE_MATRIX = {
     #  persona      -> (role key,             permissions,                       modules,            /team, /roles)
-    "manager":      ("sales_manager",       {"sales.access", "sales.team.view"}, ["home", "team"],   200,   200),
-    "employee":     ("sales_employee",      {"sales.access"},                    ["home"],           403,   403),
-    "data_entry":   ("lead_data_entry",     {"sales.access"},                    ["home"],           403,   403),
-    "onboarding":   ("onboarding_employee", {"sales.access"},                    ["home"],           403,   403),
+    "manager":      ("sales_manager",       SYSTEM_ROLE_PERMISSIONS["sales_manager"],       SYSTEM_ROLE_MODULES["sales_manager"],       200, 200),
+    "employee":     ("sales_employee",      SYSTEM_ROLE_PERMISSIONS["sales_employee"],      SYSTEM_ROLE_MODULES["sales_employee"],      403, 403),
+    "data_entry":   ("lead_data_entry",     SYSTEM_ROLE_PERMISSIONS["lead_data_entry"],     SYSTEM_ROLE_MODULES["lead_data_entry"],     403, 403),
+    "onboarding":   ("onboarding_employee", SYSTEM_ROLE_PERMISSIONS["onboarding_employee"], SYSTEM_ROLE_MODULES["onboarding_employee"], 403, 403),
 }
 
 
@@ -157,7 +158,7 @@ class TestStaffRoles:
             r = api(method, path, personas[persona]["headers"], body)
             assert r.status_code == 403, f"{persona} {method} {path} -> {r.status_code} {r.text}"
         # ...and nothing happened to the target
-        team = {i["id"]: i for i in api("GET", "/api/sales/team?limit=500", admin_h).json()["items"]}
+        team = {i["id"]: i for i in team_items(admin_h)}
         assert team[target]["name"] == "Test noroles"
         assert team[target]["roles"] == []
 
@@ -188,20 +189,21 @@ class TestMultiRoleUnion:
         u = create_staff(admin_h, ["sales_employee", "onboarding_employee"], "multi")
         me = api("GET", "/api/sales/me", u["headers"]).json()
         assert {r["key"] for r in me["roles"]} == {"sales_employee", "onboarding_employee"}
-        assert set(me["permissions"]) == {"sales.access"}
+        employee_perms = SYSTEM_ROLE_PERMISSIONS["sales_employee"] | SYSTEM_ROLE_PERMISSIONS["onboarding_employee"]
+        assert set(me["permissions"]) == employee_perms
         assert api("GET", "/api/sales/team", u["headers"]).status_code == 403
 
-        # add the manager role -> team.view joins the union, effective on the very next request
+        # add the manager role -> team.view (and the manager's lead permissions) join the union, effective on the very next request
         assert api("POST", f"/api/sales/team/{u['id']}/roles", admin_h, {"role_key": "sales_manager"}).status_code == 200
         me = api("GET", "/api/sales/me", u["headers"]).json()
-        assert set(me["permissions"]) == {"sales.access", "sales.team.view"}
+        assert set(me["permissions"]) == employee_perms | SYSTEM_ROLE_PERMISSIONS["sales_manager"]
         assert len(me["roles"]) == 3
         assert api("GET", "/api/sales/team", u["headers"]).status_code == 200
 
         # revoke it -> privilege disappears, the other two roles are untouched
         assert api("DELETE", f"/api/sales/team/{u['id']}/roles/sales_manager", admin_h).status_code == 200
         me = api("GET", "/api/sales/me", u["headers"]).json()
-        assert set(me["permissions"]) == {"sales.access"}
+        assert set(me["permissions"]) == employee_perms
         assert {r["key"] for r in me["roles"]} == {"sales_employee", "onboarding_employee"}
         assert api("GET", "/api/sales/team", u["headers"]).status_code == 403
 
@@ -319,9 +321,12 @@ class TestStaffCreation:
         assert r.status_code == 400 and r.json()["detail"]["field"] == "phone"
 
     def test_collision_creates_nothing(self, admin_h, personas):
-        before = api("GET", "/api/sales/team?limit=500", admin_h).json()["total"]
-        api("POST", "/api/sales/team", admin_h, {**_valid_create_body(), "email": personas["manager"]["email"]})
-        assert api("GET", "/api/sales/team?limit=500", admin_h).json()["total"] == before
+        # Not "the global team total is unchanged": the suite runs in parallel workers, so another module may create staff
+        # between two reads of a global count. This request's own artifact - the unique phone it carried - is what must not exist.
+        body = {**_valid_create_body(), "email": personas["manager"]["email"]}
+        r = api("POST", "/api/sales/team", admin_h, body)
+        assert r.status_code == 400 and r.json()["detail"]["field"] == "email"
+        assert not any(i["phone"] == body["phone"] for i in team_items(admin_h))
 
     def test_weak_password(self, admin_h):
         r = api("POST", "/api/sales/team", admin_h, {**_valid_create_body(), "password": "abc"})
@@ -413,7 +418,7 @@ class TestTeamApiIsPinnedToStaffAccounts:
             assert r.status_code == 404, f"{kind} {method} {path} -> {r.status_code} {r.text}"
 
     def test_customers_are_never_listed_as_staff(self, admin_h, foreign_ids):
-        ids = {i["id"] for i in api("GET", "/api/sales/team?limit=500", admin_h).json()["items"]}
+        ids = {i["id"] for i in team_items(admin_h)}
         assert not (set(foreign_ids.values()) & ids)
 
     def test_owner_credentials_untouched_by_failed_reset(self, admin_h, foreign_ids, owner_user):

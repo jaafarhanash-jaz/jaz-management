@@ -3,13 +3,15 @@ import { Layout } from '@/components/Layout';
 import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { SALES_SECTIONS, useSalesAccess } from '@/components/sales/SalesAccess';
+import WorkOverview from '@/components/sales/WorkOverview';
+import SalesDashboard from '@/components/sales/SalesDashboard';
 import { ts, roleName } from '@/utils/salesTranslations';
 import { Briefcase, ShieldCheck, UserX } from 'lucide-react';
 
-// Phase 1 landing page: a clean foundation / empty state. There is no Sales
-// business data yet, so nothing here pretends to be a metric.
+// The Sales landing page. Someone who may open the dashboard (sales.dashboard.view) gets it - the server decides which
+// sections they see; anybody else keeps the Phase 1-4 page (the work overview and their sections).
 const SalesHome = ({ onLogout, language, setLanguage, userRole }) => {
-  const { loading, error, me, hasModule, reload } = useSalesAccess();
+  const { loading, error, me, hasModule, reload, can } = useSalesAccess();
 
   const noRole = me && !me.is_super_admin && me.roles.length === 0;
   const otherSections = SALES_SECTIONS.filter((s) => s.key !== 'home' && hasModule(s.key));
@@ -58,8 +60,12 @@ const SalesHome = ({ onLogout, language, setLanguage, userRole }) => {
                 <h2 className="text-lg font-semibold text-[#0A0A0A]">{ts('home_no_role_title', language)}</h2>
                 <p className="text-gray-500 mt-2 max-w-xl mx-auto">{ts('home_no_role_body', language)}</p>
               </Card>
+            ) : can('sales.dashboard.view') ? (
+              <SalesDashboard language={language} />
             ) : (
               <>
+                <WorkOverview language={language} />
+
                 <Card className="p-12 text-center bg-white border border-gray-200" data-testid="sales-home-foundation">
                   <Briefcase className="w-12 h-12 mx-auto text-gray-300 mb-4" />
                   <h2 className="text-lg font-semibold text-[#0A0A0A]">{ts('home_foundation_title', language)}</h2>

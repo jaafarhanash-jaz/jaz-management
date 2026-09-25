@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import { Outlet } from 'react-router-dom';
-import { Briefcase, LayoutDashboard, UserCircle, Users } from 'lucide-react';
+import { BarChart3, Briefcase, Building2, ClipboardCheck, Columns3, FlaskConical, LayoutDashboard, ListChecks, Megaphone, PhoneCall, Presentation, Target, UserCircle, Users } from 'lucide-react';
 import api from '@/utils/api';
 import { ts } from '@/utils/salesTranslations';
 
@@ -17,6 +17,16 @@ const SalesAccessContext = createContext(null);
 // permissions); later phases append their sections here.
 export const SALES_SECTIONS = [
   { key: 'home', path: '/sales/dashboard', icon: LayoutDashboard, labelKey: 'nav_home' },
+  { key: 'leads', path: '/sales/leads', icon: Target, labelKey: 'nav_leads' },
+  { key: 'pipeline', path: '/sales/pipeline', icon: Columns3, labelKey: 'nav_pipeline' },
+  { key: 'followups', path: '/sales/followups', icon: ListChecks, labelKey: 'nav_followups' },
+  { key: 'calls', path: '/sales/calls', icon: PhoneCall, labelKey: 'nav_calls' },
+  { key: 'demos', path: '/sales/demos', icon: Presentation, labelKey: 'nav_demos' },
+  { key: 'trials', path: '/sales/trials', icon: FlaskConical, labelKey: 'nav_trials' },
+  { key: 'customers', path: '/sales/customers', icon: Building2, labelKey: 'nav_customers' },
+  { key: 'onboarding', path: '/sales/onboarding', icon: ClipboardCheck, labelKey: 'nav_onboarding' },
+  { key: 'campaigns', path: '/sales/campaigns', icon: Megaphone, labelKey: 'nav_campaigns' },
+  { key: 'reports', path: '/sales/reports', icon: BarChart3, labelKey: 'nav_reports' },
   { key: 'team', path: '/sales/team', icon: Users, labelKey: 'nav_team' },
 ];
 

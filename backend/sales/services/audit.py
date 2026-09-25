@@ -39,9 +39,12 @@ ACTION_STAFF_DEACTIVATED = "staff_deactivated"
 ACTION_STAFF_REACTIVATED = "staff_reactivated"
 ACTION_STAFF_ROLE_GRANTED = "staff_role_granted"
 ACTION_STAFF_ROLE_REVOKED = "staff_role_revoked"
+# Phase 4: converting a lead creates a real JAZ company and its owner ACCOUNT, which is security-relevant on its own.
+ACTION_CUSTOMER_CONVERTED = "customer_converted"
 
 TARGET_STAFF_USER = "staff_user"
 TARGET_STAFF_ROLE_GRANT = "staff_role_grant"
+TARGET_SALES_CUSTOMER = "sales_customer"
 
 # ---- what may appear in before/after: the account fields an investigator needs, nothing else ----
 STAFF_USER_FIELDS = ("name", "email", "phone", "status")
@@ -50,7 +53,7 @@ STAFF_PROFILE_FIELDS = ("name", "email", "phone")  # status changes are their ow
 # Keys that must never appear, at any depth, in before_data / after_data / metadata (compared
 # case-insensitively, exactly - `refresh_tokens_revoked` is fine, `refresh_token` is not).
 _SECRET_KEYS = frozenset({
-    "password", "new_password", "current_password", "old_password", "password_hash", "hashed_password", "hash",
+    "password", "new_password", "current_password", "old_password", "owner_password", "password_hash", "hashed_password", "hash",
     "token", "access_token", "refresh_token", "id_token", "secret", "client_secret", "api_key", "authorization",
 })
 _MAX_USER_AGENT = 512

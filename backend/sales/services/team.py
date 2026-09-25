@@ -14,6 +14,7 @@ import uuid
 from typing import List
 
 from fastapi import HTTPException
+from pydantic import SecretStr
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -148,8 +149,9 @@ async def create_staff(db: AsyncSession, actor: StaffContext, data, audit: Audit
     if await users_repo.phone_taken(db, data.phone):
         raise _field_error("phone", "Phone number already registered")
 
-    _validated_password(data.password, "password")
-    hashed = await hash_password(data.password)  # off the event loop (bcrypt is slow)
+    password = data.password.get_secret_value()      # unwrapped here, once, to be hashed - never stored, logged or returned
+    _validated_password(password, "password")
+    hashed = await hash_password(password)  # off the event loop (bcrypt is slow)
 
     try:
         async with db.begin_nested():  # savepoint: a lost race must not poison the outer transaction
@@ -258,10 +260,11 @@ async def update_staff(db: AsyncSession, actor: StaffContext, user_id: str, data
     return await _staff_out_fresh(db, user)
 
 
-async def reset_password(db: AsyncSession, actor: StaffContext, user_id: str, new_password: str, audit: AuditContext) -> dict:
+async def reset_password(db: AsyncSession, actor: StaffContext, user_id: str, new_password: SecretStr, audit: AuditContext) -> dict:
     user = await _get_staff_or_404(db, user_id)
-    _validated_password(new_password, "new_password")
-    user.password = await hash_password(new_password)
+    plain = new_password.get_secret_value()      # unwrapped here, once, to be hashed - never stored, logged or returned
+    _validated_password(plain, "new_password")
+    user.password = await hash_password(plain)
     await db.flush()
     await refresh_tokens_repo.revoke_all_for_user(db, user.id)  # signs the person out everywhere
     # Audit: the fact of the reset, never the password or its hash (no before/after at all).

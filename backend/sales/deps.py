@@ -7,6 +7,8 @@ that forgets its permission guard is still closed to Company Owners, Employees
 and every other non-staff caller. tests/test_sales_route_sweep.py asserts both.
 """
 from fastapi import Depends, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.routing import APIRoute
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -63,3 +65,31 @@ def require_permission(*keys: str):
     _guard.__sales_guard__ = "permission"
     _guard.__sales_permissions__ = tuple(keys)
     return _guard
+
+
+# ---- validation errors that never echo what was sent -------------------------------------------------------------
+# Pydantic puts the offending INPUT into every validation error, and for a missing field that input is the WHOLE object it was
+# missing from - so a request that forgets one field would come back carrying the rest of its body, passwords included (the
+# staff account's password, the Owner password of a conversion). The caller sent it, but a password has no business in a
+# response body: browser tooling, error trackers and response-logging middleware all keep those. Every Sales route therefore
+# answers with the error's type, location and message only.
+_SAFE_ERROR_KEYS = ("type", "loc", "msg")
+
+
+def scrub_validation_errors(errors) -> list:
+    return [{key: error[key] for key in _SAFE_ERROR_KEYS if key in error} for error in errors]
+
+
+class SalesRoute(APIRoute):
+    """Route class of the Sales router: FastAPI's own request handling, with the validation error scrubbed."""
+
+    def get_route_handler(self):
+        handler = super().get_route_handler()
+
+        async def scrubbed(request: Request):
+            try:
+                return await handler(request)
+            except RequestValidationError as exc:
+                raise RequestValidationError(scrub_validation_errors(exc.errors())) from None
+
+        return scrubbed
