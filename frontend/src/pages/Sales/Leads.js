@@ -15,8 +15,10 @@ import { useSalesAccess } from '@/components/sales/SalesAccess';
 import { useSalesReference } from '@/components/sales/useSalesReference';
 import SalesNoAccess from '@/components/sales/SalesNoAccess';
 import AssignDialog from '@/components/sales/AssignDialog';
+import DistributionDialog, { useDistributionStatus } from '@/components/sales/DistributionDialog';
+import LeadExportButtons from '@/components/sales/LeadExportButtons';
 import { PriorityBadge, StageBadge } from '@/components/sales/LeadBadges';
-import { ArrowDownUp, ChevronLeft, ChevronRight, Columns3, Plus, Search, Target, UserPlus, X } from 'lucide-react';
+import { ArrowDownUp, ChevronLeft, ChevronRight, Columns3, Plus, Search, Shuffle, Target, UserPlus, X } from 'lucide-react';
 
 const PAGE_SIZE = 25;
 const ALL = '__all__';
@@ -48,6 +50,10 @@ const SalesLeads = ({ onLogout, language, setLanguage, userRole }) => {
 
   const canCreate = can('sales.leads.create');
   const canAssign = can('sales.leads.assign');
+  const canExport = can('sales.leads.export');
+  const canDistribute = can('sales.settings.manage');
+  const [distributionOpen, setDistributionOpen] = useState(false);
+  const [distribution, reloadDistribution] = useDistributionStatus(!accessLoading && canDistribute);
 
   const setFilter = useCallback((key, value) => {
     const next = new URLSearchParams(params);
@@ -103,6 +109,9 @@ const SalesLeads = ({ onLogout, language, setLanguage, userRole }) => {
   const pageCount = Math.max(1, Math.ceil(data.total / PAGE_SIZE));
   const filtersApplied = FILTER_KEYS.some((key) => filters[key] && filters[key] !== DEFAULTS[key]);
   const allOnPage = items.length > 0 && items.every((lead) => selected.has(lead.id));
+  // the export takes the SAME filters, search and sort as this list (every matching lead, not this page)
+  const exportQuery = { sort: filters.sort, order: filters.order };
+  FILTER_KEYS.forEach((key) => { if (!['sort', 'order'].includes(key) && filters[key] && filters[key] !== DEFAULTS[key]) exportQuery[key] = filters[key]; });
 
   const toggleAll = (checked) => setSelected(checked ? new Set(items.map((lead) => lead.id)) : new Set());
   const toggleOne = (id, checked) => setSelected((prev) => { const next = new Set(prev); if (checked) next.add(id); else next.delete(id); return next; });
@@ -136,6 +145,13 @@ const SalesLeads = ({ onLogout, language, setLanguage, userRole }) => {
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
+          {canDistribute && (
+            <Button type="button" variant="outline" className="rounded-sm" onClick={() => setDistributionOpen(true)} data-testid="distribution-btn">
+              <Shuffle className="w-4 h-4 me-2" aria-hidden="true" />
+              {distribution ? ts(distribution.auto_distribution_enabled ? 'dist_button_on' : 'dist_button_off', language) : ts('dist_title', language)}
+            </Button>
+          )}
+          {canExport && <LeadExportButtons query={exportQuery} language={language} />}
           {hasModule('pipeline') && (
             <Button asChild variant="outline" className="rounded-sm">
               <Link to="/sales/pipeline"><Columns3 className="w-4 h-4 me-2" aria-hidden="true" />{ts('nav_pipeline', language)}</Link>
@@ -351,6 +367,7 @@ const SalesLeads = ({ onLogout, language, setLanguage, userRole }) => {
       )}
 
       <AssignDialog open={assignOpen} onOpenChange={setAssignOpen} leadIds={[...selected]} language={language} onDone={fetchLeads} />
+      {canDistribute && <DistributionDialog open={distributionOpen} onOpenChange={setDistributionOpen} language={language} onSaved={reloadDistribution} />}
     </div>
   );
 };

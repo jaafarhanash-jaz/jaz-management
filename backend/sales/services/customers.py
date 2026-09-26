@@ -12,6 +12,7 @@ A customer's `status` is never edited here: it follows the onboarding stage and 
 service, in the same transaction as the stage change.
 """
 import uuid
+from types import SimpleNamespace
 from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,6 +25,21 @@ from sales.services.access import StaffContext
 from sales.services.lead_access import lead_visibility
 from sales.services.onboarding_access import can_see_onboarding
 from services.admin import parse_uuid
+from services.auth import SUBSCRIPTION_ACTIVE, SUBSCRIPTION_EXPIRED, subscription_has_ended
+
+
+def effective_subscription_status(row: CustomerRow) -> Optional[str]:
+    """The company's subscription status as the platform would enforce it NOW: a stored 'active' whose period is over
+    (services/auth.subscription_has_ended - an exact trial at its instant, anything else after its last day) reads
+    'expired' here too, even before the platform's own self-heal has written it."""
+    status = row.company_subscription_status
+    period = SimpleNamespace(
+        subscription_end_date=row.company_subscription_end_date,
+        subscription_ends_exactly=row.company_subscription_ends_exactly,
+    )
+    if status == SUBSCRIPTION_ACTIVE and subscription_has_ended(period):
+        return SUBSCRIPTION_EXPIRED
+    return status
 
 
 def customer_out(row: CustomerRow, ctx: StaffContext, *, employee_count: Optional[int] = None) -> dict:
@@ -38,6 +54,7 @@ def customer_out(row: CustomerRow, ctx: StaffContext, *, employee_count: Optiona
     return {
         "id": str(c.id),
         "status": c.status,
+        "subscription_type": c.subscription_type,         # trial | paid (customer setup); None for a Phase-4 conversion
         "converted_at": c.converted_at,
         "converted_by": work.user_ref(c.converted_by, row.converter_name),
         "created_at": c.created_at,
@@ -47,7 +64,7 @@ def customer_out(row: CustomerRow, ctx: StaffContext, *, employee_count: Optiona
             "contact_name": row.contact_name, "phone": row.phone, "email": row.email, "city": row.city,
         },
         "company": {
-            "id": str(c.company_id), "name": row.company_name, "subscription_status": row.company_subscription_status,
+            "id": str(c.company_id), "name": row.company_name, "subscription_status": effective_subscription_status(row),
             "deleted": row.company_deleted, "owner_name": row.owner_name, "owner_email": row.owner_email,
             "owner_phone": row.owner_phone, "employee_count": employee_count,
         },

@@ -80,6 +80,30 @@ PERM_ONBOARDING_SCOPE_ASSIGNED = "sales.onboarding.scope_assigned"
 PERM_DASHBOARD_VIEW = "sales.dashboard.view"
 PERM_REPORTS_VIEW = "sales.reports.view"
 
+# ---- Simplified workflow (a3f8c2d7e915) ----
+# The Sales Manager's workspace settings (automatic lead distribution) and the lead export. Both Sales Manager only. The
+# same migration grants sales.leads.delete to Lead Data Entry (archive / restore, limited in code to their latest
+# RECENT_EDIT_WINDOW leads). (It also granted sales.customers.convert to the Sales Employee; e7a2d4c9b1f3 replaced that
+# with PERM_CUSTOMERS_SETUP below.)
+PERM_SETTINGS_MANAGE = "sales.settings.manage"
+PERM_LEADS_EXPORT = "sales.leads.export"
+# The Customer Setup (Trial exactly 7 x 24 h / Paid for the plan's period) has its own key (migration e7a2d4c9b1f3): Sales
+# Manager and Sales Employee. The Phase-4 conversion (a company with NO subscription dates) is RETIRED: POST
+# /leads/{id}/convert and /convert/preflight answer 410 `conversion_retired` to everybody, so no path creates a company outside the
+# Trial / Paid rules. Its key, sales.customers.convert, stays in the catalog and in the Sales Manager's grants (history) and now
+# guards nothing but those two retired endpoints (a holder gets the 410, anybody else the 403). It does NOT allow winning a lead: NO
+# role or permission may move a lead to `won` by hand - a lead is won only through the Customer Setup (services/leads.change_stage).
+PERM_CUSTOMERS_SETUP = "sales.customers.setup"
+
+# ---- Batches and performance (f2b6d8a1c4e9) - SALES MANAGER ONLY ----
+# The Data Batch / Master Batch / Sales Work Batch layer, the cross-batch lead search and the per-employee performance numbers are
+# management views: neither Lead Data Entry nor the Sales Employee may see or touch any of it (no role but the manager gets these
+# keys, and every route ALSO demands sales.leads.scope_all - an aggregate obeys the scope of the records it counts, see
+# sales/services/report_scope.py). `reassign` hands a completed Work Batch to another Sales Employee.
+PERM_BATCHES_VIEW = "sales.batches.view"
+PERM_BATCHES_REASSIGN = "sales.batches.reassign"
+PERM_PERFORMANCE_VIEW = "sales.performance.view"
+
 # key -> human description. Super Admin's implicit permission set.
 ALL_PERMISSIONS: Dict[str, str] = {
     PERM_ACCESS: "Open the JAZ Sales workspace",
@@ -116,15 +140,30 @@ ALL_PERMISSIONS: Dict[str, str] = {
     PERM_ONBOARDING_SCOPE_ASSIGNED: "Onboarding scope: onboarding records assigned to the caller (also makes the caller assignable)",
     PERM_DASHBOARD_VIEW: "Open the Sales dashboard (each section shows only what the caller's other permissions allow)",
     PERM_REPORTS_VIEW: "Open the Sales reports (each report also needs the permissions of the records it counts)",
+    PERM_SETTINGS_MANAGE: "Change the Sales workspace settings (automatic lead distribution)",
+    PERM_LEADS_EXPORT: "Export the leads within the caller's lead scope to Excel or PDF",
+    PERM_CUSTOMERS_SETUP: (
+        "Complete the Customer Setup (company, owner, trial / paid subscription, optional employees and tasks) of a lead "
+        "within the caller's lead scope"
+    ),
+    PERM_BATCHES_VIEW: "View the Data Batches, Master Batches and Sales Work Batches, search every lead across them and trace a lead through them",
+    PERM_BATCHES_REASSIGN: "Hand a completed Sales Work Batch to another Sales Employee for another attempt at the same leads",
+    PERM_PERFORMANCE_VIEW: "View the work statistics and work history of Data Entry and Sales employees",
 }
 
 # The four seeded system roles (keys only; definitions/grants live in the DB).
+# onboarding_employee is RETIRED (staff_roles.is_active = false, migration c5e1b9a4d2f7): it is not part of the simplified
+# workflow, so it grants nothing, is not listed and cannot be granted - enforced server-side by the active-role checks in
+# repositories/staff.py. Its grants, the onboarding tables and the onboarding API are kept; re-enabling it is one flag.
 SYSTEM_ROLE_KEYS = ("sales_manager", "sales_employee", "lead_data_entry", "onboarding_employee")
+RETIRED_SYSTEM_ROLE_KEYS = ("onboarding_employee",)
 
 # Server-side source of truth for which workspace sections a user may see.
 # GET /api/sales/me returns only the modules whose permission the user holds;
 # the frontend maps `key` -> route/label. (UI filtering is convenience only -
 # every endpoint enforces its own permission regardless.)
+# Onboarding is NOT a section any more (simplified workflow): the Sales Employee completes the customer setup, so there is no
+# onboarding work to show. Its tables, endpoints, permissions and role stay in place, dormant, for a later expansion.
 MODULES: List[Dict[str, str]] = [
     {"key": "home", "permission": PERM_ACCESS},
     {"key": "team", "permission": PERM_TEAM_VIEW},
@@ -137,5 +176,6 @@ MODULES: List[Dict[str, str]] = [
     {"key": "trials", "permission": PERM_TRIALS_VIEW},
     {"key": "reports", "permission": PERM_REPORTS_VIEW},
     {"key": "customers", "permission": PERM_CUSTOMERS_VIEW},
-    {"key": "onboarding", "permission": PERM_ONBOARDING_VIEW},
+    {"key": "batches", "permission": PERM_BATCHES_VIEW},
+    {"key": "performance", "permission": PERM_PERFORMANCE_VIEW},
 ]

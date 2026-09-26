@@ -132,14 +132,18 @@ SECRET = "Sup3r#Secret-Pass-9"
 
 class TestValidationErrorsDoNotEchoTheRequest:
     def test_a_missing_field_does_not_bring_the_password_back(self, admin_h):
-        # a conversion that forgets the plan, an account that forgets its name: the two requests that carry a password
-        convert = api("POST", f"/api/sales/leads/{PHANTOM_ID}/convert", admin_h, {
+        # a Customer Setup that forgets the plan, an account that forgets its name: the requests that carry a password
+        setup = api("POST", f"/api/sales/leads/{PHANTOM_ID}/setup", admin_h, {
             "business_name": "X", "owner_name": "Y", "owner_email": "a@b.co", "owner_phone": "+9647701234567", "owner_password": SECRET})
         create = api("POST", "/api/sales/team", admin_h, {"email": "z@z.co", "phone": "+15551234567", "password": SECRET, "role_keys": []})
         reset = api("POST", f"/api/sales/team/{PHANTOM_ID}/reset-password", admin_h, {"new_password": SECRET, "surprise": 1})
-        for name, r in (("convert", convert), ("create", create), ("reset", reset)):
+        for name, r in (("setup", setup), ("create", create), ("reset", reset)):
             assert r.status_code == 422, name
             assert SECRET not in r.text, f"{name}: the password came back in the error"
+        # the RETIRED conversion (which used to be one of them) reads no body at all: a 410 that says nothing about what was sent
+        retired = api("POST", f"/api/sales/leads/{PHANTOM_ID}/convert", admin_h, {
+            "business_name": "X", "owner_name": "Y", "owner_email": "a@b.co", "owner_phone": "+9647701234567", "owner_password": SECRET})
+        assert retired.status_code == 410 and SECRET not in retired.text
 
     def test_every_error_carries_only_type_location_and_message(self, admin_h):
         r = api("POST", "/api/sales/team", admin_h, {"email": "not-an-email", "password": SECRET, "role_keys": "x", "unknown": SECRET})
@@ -260,10 +264,18 @@ def _calls(f, personas):
         ("lead assign", "POST", f"/leads/{f['lead']}/assign", {"assigned_to": e1}),
         ("lead unassign", "POST", f"/leads/{f['lead']}/unassign", None),
         ("lead stage", "POST", f"/leads/{f['lead']}/stage", {"stage": "lost", "lost_reason": "other"}),
+        ("lead wait list", "POST", f"/leads/{f['lead']}/wait-list", None),                 # the OWNER's tool (f2b6d8a1c4e9)
         ("lead convert", "POST", f"/leads/{f['won_lead']}/convert", {
             "business_name": "Hijack Co", "owner_name": "H", "owner_email": f"h-{uniq()}@example.com", "owner_phone": "+15559990000",
             "owner_password": "Owner#Pass-2026", "subscription_plan_id": active_plan_id()}),
         ("lead convert preflight", "POST", f"/leads/{f['won_lead']}/convert/preflight", {}),
+        # simplified workflow: the Customer Setup (an OPEN lead of somebody else's - it would mark it won and create a company)
+        ("lead setup", "POST", f"/leads/{f['lead']}/setup", {
+            "business_name": "Hijack Setup Co", "owner_name": "H", "owner_email": f"hs-{uniq()}@example.com", "owner_phone": "+15559990001",
+            "owner_password": "Owner#Pass-2026", "subscription_plan_id": active_plan_id(), "subscription_type": "trial",
+            "employees": [{"name": "E", "email": f"he-{uniq()}@example.com", "phone": "+15559990002", "password": "Emp#Pass-2026"}],
+            "tasks": [{"title": "T", "assignee": 0, "due_date": "2030-01-01"}]}),
+        ("lead setup preflight", "POST", f"/leads/{f['lead']}/setup/preflight", {}),
         ("bulk assign", "POST", "/leads/bulk-assign", {"lead_ids": [f["lead"], f["spare"]], "assigned_to": e1}),
         ("call get", "GET", f"/calls/{f['call']}", None),
         ("call update", "PATCH", f"/calls/{f['call']}", {"notes": "hijacked"}),
@@ -311,7 +323,7 @@ class TestObjectsOutsideTheCallersScope:
 
     def test_the_sweep_covers_every_id_taking_route(self, family, personas):
         """Every per-record route (a path parameter, or a lead in the body) is in the sweep - a new endpoint that is not added
-        here fails this test. (Staff, campaigns and reports are not scoped per record: they have their own tests.)"""
+        here fails this test. (Staff, campaigns, reports, batches and performance are not scoped per record: they have their own tests.)"""
         import re
         from sales.router import sales_router
 
@@ -321,8 +333,8 @@ class TestObjectsOutsideTheCallersScope:
         wanted = set()
         for route in sales_router.routes:
             path = route.path.replace("/api/sales", "")
-            if path.startswith(("/team", "/campaigns", "/reports")):
-                continue
+            if path.startswith(("/team", "/campaigns", "/reports", "/batches", "/performance")):
+                continue          # (the batch / performance routes are role-gated, not lead-scoped: test_sales_batches has their sweep)
             for method in route.methods - {"HEAD", "OPTIONS"}:
                 if "{" in path or (method, path) in body_lead_routes:
                     wanted.add((method, norm(path)))
@@ -357,7 +369,10 @@ class TestObjectsOutsideTheCallersScope:
             if "create" in name or name == "bulk assign":
                 continue                                                          # (a phantom lead in a BODY is checked below)
             r = api(method, f"/api/sales{path}", headers, body)
-            assert r.status_code in (403, 404), (caller, name, r.status_code)     # 403: this caller lacks the permission; 404: it exists nowhere
+            # 403: this caller lacks the permission; 404: it exists nowhere; 410: the RETIRED conversion endpoints (a caller who holds
+            # their permission gets the same answer for every id - they look no lead up)
+            allowed = (403, 404, 410) if name in ("lead convert", "lead convert preflight") else (403, 404)
+            assert r.status_code in allowed, (caller, name, r.status_code)
         for bad in ("not-a-uuid", "1", "%00", "' OR 1=1 --", "0" * 200):
             for path in (f"/leads/{bad}", f"/calls/{bad}", f"/followups/{bad}", f"/demos/{bad}", f"/trials/{bad}", f"/customers/{bad}", f"/onboarding/{bad}"):
                 r = api("GET", f"/api/sales{path}", headers)

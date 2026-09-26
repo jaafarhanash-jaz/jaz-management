@@ -4,7 +4,15 @@ The rules that must hold no matter how the API is wired: value normalization, th
 duplicate classifier, the closed vocabularies staying identical across code / schemas / migration, and lead-scope
 semantics. Importing the sales package builds (but never connects) the DB engine, so the scratch guard still applies.
 """
-from sales_test_utils import ALL_MODULES, ALL_PERMISSION_KEYS, SYSTEM_ROLE_PERMISSIONS, assert_scratch_target
+from sales_test_utils import (
+    ALL_MODULES,
+    ALL_PERMISSION_KEYS,
+    SYSTEM_ROLE_PERMISSIONS,
+    WORKFLOW_PERMISSIONS,
+    BATCH_PERMISSIONS,
+    assert_scratch_target,
+    granted_before_workflow,
+)
 
 assert_scratch_target(need_http=False)
 
@@ -172,14 +180,16 @@ class TestVocabulary:
         phase3 = {k for k in P.ALL_PERMISSIONS if k.split(".")[1] in ("calls", "followups", "demos", "trials")}   # e3a9c5b07d12's own seed
         phase4 = {k for k in P.ALL_PERMISSIONS if k.split(".")[1] in ("customers", "onboarding")}                  # f4c8a1d92b63's own seed
         phase5 = {k for k in P.ALL_PERMISSIONS if k.split(".")[1] in ("dashboard", "reports")}                      # b6d1f3a8c294's own seed
-        assert set(phase2) | phase1 | phase3 | phase4 | phase5 == set(P.ALL_PERMISSIONS)
-        assert not set(phase2) & (phase3 | phase4 | phase5)
+        workflow = set(WORKFLOW_PERMISSIONS)                                                                          # a3f8c2d7e915's own seed
+        batches = set(BATCH_PERMISSIONS)                                                                              # f2b6d8a1c4e9's own seed
+        assert set(phase2) | phase1 | phase3 | phase4 | phase5 | workflow | batches == set(P.ALL_PERMISSIONS)
+        assert not set(phase2) & (phase3 | phase4 | phase5 | workflow | batches)
 
         granted = {}
         for role, key in mig._GRANTS:
             granted.setdefault(role, set()).add(key)
         for role, keys in granted.items():
-            assert keys == SYSTEM_ROLE_PERMISSIONS[role] - {"sales.access", "sales.team.view"} - phase3 - phase4 - phase5, role
+            assert keys == granted_before_workflow(role) - {"sales.access", "sales.team.view"} - phase3 - phase4 - phase5 - workflow, role
         assert "onboarding_employee" not in granted  # no lead access for Onboarding Employee
 
         for stage in C.PIPELINE_STAGES:
@@ -232,8 +242,8 @@ class TestTransitions:
         assert err(current, target) is None
 
     @pytest.mark.parametrize("current", C.WORKING_STAGES)
-    def test_working_stages_can_be_won_or_lost_but_never_return_to_new_or_assigned(self, current):
-        assert err(current, "won") is None
+    def test_working_stages_can_be_lost_but_never_won_by_hand_nor_return_to_new_or_assigned(self, current):
+        assert err(current, "won") == "transition_not_allowed"                       # won is reached through the Customer Setup only
         assert err(current, "lost", lost_reason="competitor") is None
         assert err(current, "new", has_assignee=False) == "transition_not_allowed"
         assert err(current, "assigned") == "transition_not_allowed"
@@ -252,14 +262,23 @@ class TestTransitions:
         for reason in C.LOST_REASONS:
             assert err("contacted", "lost", lost_reason=reason) is None, reason
         assert err("contacted", "interested", lost_reason="other") == "lost_reason_not_allowed"
-        assert err("contacted", "won", lost_reason="other") == "lost_reason_not_allowed"
+        assert err("contacted", "negotiation", lost_reason="other") == "lost_reason_not_allowed"
 
-    def test_working_stages_and_won_need_an_owner_but_lost_does_not(self):
-        for target in (*C.WORKING_STAGES, "won"):
+    def test_working_stages_need_an_owner_but_lost_does_not(self):
+        for target in C.WORKING_STAGES:
             if target == "contacted":
                 continue
             assert err("contacted", target, has_assignee=False) == "assignee_required", target
         assert err("contacted", "lost", has_assignee=False, lost_reason="business_closed") is None
+
+    def test_won_is_nobodys_manual_target(self):
+        """`won` is reached through the Customer Setup only: no row of the table lists it, no stage offers it, every manual move to
+        it is refused - whether or not the lead has an owner."""
+        assert all("won" not in targets for targets in C.STAGE_TRANSITIONS.values())
+        for current, has_assignee in itertools.product(C.PIPELINE_STAGES, (True, False)):
+            assert "won" not in allowed_stages(current, has_assignee=has_assignee), (current, has_assignee)
+            assert err(current, "won", has_assignee=has_assignee) == ("same_stage" if current == "won" else "transition_not_allowed"), current
+        assert C.STAGE_TRANSITIONS["won"] == frozenset()                             # ... and a won lead never leaves won by hand
 
     def test_unknown_stages(self):
         assert err("bogus", "won") == "invalid_stage"
@@ -275,8 +294,8 @@ class TestTransitions:
         ("new", True, ("lost",)),
         ("assigned", True, ("contacted", "interested", "demo_scheduled", "demo_completed", "trial", "negotiation", "lost")),
         ("assigned", False, ("lost",)),
-        ("contacted", True, ("interested", "demo_scheduled", "demo_completed", "trial", "negotiation", "won", "lost")),
-        ("negotiation", True, ("contacted", "interested", "demo_scheduled", "demo_completed", "trial", "won", "lost")),
+        ("contacted", True, ("interested", "demo_scheduled", "demo_completed", "trial", "negotiation", "lost")),
+        ("negotiation", True, ("contacted", "interested", "demo_scheduled", "demo_completed", "trial", "lost")),
         ("won", True, ()),
         ("lost", True, ("assigned",)),
         ("lost", False, ("new",)),

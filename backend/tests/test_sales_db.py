@@ -8,7 +8,7 @@ resolution (union, revoked grants, retired roles, inactive accounts).
 Same pattern as test_leave_db_constraints.py (asyncio.run + engine.dispose()).
 Refuses to run unless DATABASE_URL is the scratch database.
 """
-from sales_test_utils import ALL_PERMISSION_KEYS, SYSTEM_ROLE_PERMISSIONS, assert_scratch_target
+from sales_test_utils import ALL_PERMISSION_KEYS, RETIRED_ROLES, SYSTEM_ROLE_PERMISSIONS, assert_scratch_target
 
 assert_scratch_target(need_http=False)  # must run BEFORE importing database (which loads .env)
 
@@ -70,7 +70,9 @@ class TestSeedAndCheckConstraint:
                 # SYSTEM roles only: other test modules create (and later retire) throwaway roles in the same DB
                 roles = {r.key: r for r in (await db.execute(select(StaffRole).where(StaffRole.is_system.is_(True)))).scalars()}
                 assert set(roles) == {"sales_manager", "sales_employee", "lead_data_entry", "onboarding_employee"}
-                assert all(r.is_system and r.is_active and r.module == "sales" for r in roles.values())
+                assert all(r.is_system and r.module == "sales" for r in roles.values())
+                # every system role is active except the RETIRED Onboarding Employee (c5e1b9a4d2f7) - kept, with its grants below
+                assert {k for k, r in roles.items() if not r.is_active} == set(RETIRED_ROLES)
                 perms = {p.key for p in (await db.execute(select(StaffPermission))).scalars()}
                 assert perms == ALL_PERMISSION_KEYS  # Phase 1 + Phase 2 + Phase 3 catalog
                 grants = {(roles_by_id, k) for roles_by_id, k in (await db.execute(

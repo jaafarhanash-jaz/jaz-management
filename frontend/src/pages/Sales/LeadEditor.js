@@ -153,7 +153,7 @@ const SalesLeadEditor = ({ onLogout, language, setLanguage, userRole }) => {
   if (editing && original && (original.archived_at || !original.can.update)) {
     return shell(
       <Card className="p-12 text-center bg-white border border-gray-200" data-testid="lead-not-editable">
-        <p className="text-gray-700 font-medium">{ts(original.archived_at ? 'lead_archived_readonly' : 'lead_not_editable', language)}</p>
+        <p className="text-gray-700 font-medium">{ts(original.archived_at ? 'lead_archived_readonly' : original.can.edit_locked ? 'lead_edit_locked_note' : 'lead_not_editable', language)}</p>
         <Button asChild variant="outline" className="rounded-sm mt-4"><Link to={`/sales/leads/${original.id}`}>{ts('action_back_to_lead', language)}</Link></Button>
       </Card>,
     );

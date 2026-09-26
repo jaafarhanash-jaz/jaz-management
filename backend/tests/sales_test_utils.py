@@ -20,8 +20,9 @@ SCRATCH_DB_NAME = "jaz_sales_scratch"
 STAFF_PASSWORD = "Staff#12345"
 
 # The approved permission catalog and system-role grants: Phase 1 (bb595f6d8dae) + Phase 2 (d764d5f44e91) + Phase 3
-# (e3a9c5b07d12) + Phase 4 (f4c8a1d92b63) + Phase 5 (b6d1f3a8c294). The tests that pin "exactly the approved grants" import these, so a new phase
-# updates ONE place - and any drift between the code catalog (sales/permissions.py), the migrations and this list is caught.
+# (e3a9c5b07d12) + Phase 4 (f4c8a1d92b63) + Phase 5 (b6d1f3a8c294) + the simplified workflow (a3f8c2d7e915). The tests that pin
+# "exactly the approved grants" import these, so a new phase updates ONE place - and any drift between the code catalog
+# (sales/permissions.py), the migrations and this list is caught.
 _PHASE1_PERMISSIONS = {"sales.access", "sales.team.view", "sales.staff.create", "sales.staff.update", "sales.staff.assign_roles"}
 _PHASE2_PERMISSIONS = {
     "sales.leads.view", "sales.leads.create", "sales.leads.update", "sales.leads.delete", "sales.leads.change_stage",
@@ -50,32 +51,70 @@ _PHASE4_ONBOARDING = {"sales.onboarding.view", "sales.onboarding.manage", "sales
 # Phase 5: dashboard and reports. Sales Manager, Sales Employee and Onboarding Employee hold both; Lead Data Entry holds neither
 # (metrics are opt-in). What a section shows is still limited by the permissions of the records it counts.
 _PHASE5_PERMISSIONS = {"sales.dashboard.view", "sales.reports.view"}
-ALL_PERMISSION_KEYS = _PHASE1_PERMISSIONS | _PHASE2_PERMISSIONS | _PHASE3_PERMISSIONS | _PHASE4_PERMISSIONS | _PHASE5_PERMISSIONS
+# Simplified workflow: the Sales Manager's settings (automatic distribution) and the lead export - Sales Manager only. The same
+# migration grants sales.customers.convert to the Sales Employee (Customer Setup) and sales.leads.delete to Lead Data Entry
+# (archive / restore of their own latest leads - the window is enforced in code).
+_WORKFLOW_PERMISSIONS = {"sales.settings.manage", "sales.leads.export", "sales.customers.setup"}   # setup: e7a2d4c9b1f3
+# Batches (f2b6d8a1c4e9): the Sales Manager's view of the Data / Master / Work batches, the reassignment of a completed Work Batch and
+# the employee performance view. Sales Manager ONLY - Sales Employee, Lead Data Entry and the retired Onboarding role get none.
+_BATCH_PERMISSIONS = {"sales.batches.view", "sales.batches.reassign", "sales.performance.view"}
+ALL_PERMISSION_KEYS = (
+    _PHASE1_PERMISSIONS | _PHASE2_PERMISSIONS | _PHASE3_PERMISSIONS | _PHASE4_PERMISSIONS | _PHASE5_PERMISSIONS | _WORKFLOW_PERMISSIONS
+    | _BATCH_PERMISSIONS
+)
 SYSTEM_ROLE_PERMISSIONS = {
     "sales_manager": {
         "sales.access", "sales.team.view",
         "sales.leads.view", "sales.leads.create", "sales.leads.update", "sales.leads.delete", "sales.leads.change_stage",
         "sales.leads.assign", "sales.leads.override_duplicates", "sales.leads.scope_all",
         "sales.campaigns.view", "sales.campaigns.manage",
-    } | _PHASE3_PERMISSIONS | _PHASE4_MANAGER | _PHASE5_PERMISSIONS,
+    } | _PHASE3_PERMISSIONS | _PHASE4_MANAGER | _PHASE5_PERMISSIONS | _WORKFLOW_PERMISSIONS | _BATCH_PERMISSIONS,   # (+ setup, batches)
     "sales_employee": {
         "sales.access", "sales.leads.view", "sales.leads.update", "sales.leads.change_stage",
         "sales.leads.scope_assigned", "sales.campaigns.view",
-    } | _PHASE3_PERMISSIONS | _PHASE4_EMPLOYEE | _PHASE5_PERMISSIONS,
+    } | _PHASE3_PERMISSIONS | _PHASE4_EMPLOYEE | _PHASE5_PERMISSIONS | {"sales.customers.setup"},   # setup - never convert
     "lead_data_entry": {
-        "sales.access", "sales.leads.view", "sales.leads.create", "sales.leads.update",
+        "sales.access", "sales.leads.view", "sales.leads.create", "sales.leads.update", "sales.leads.delete",
         "sales.leads.scope_intake", "sales.campaigns.view",
     },
     "onboarding_employee": {"sales.access"} | _PHASE4_ONBOARDING | _PHASE5_PERMISSIONS,
 }
-# what GET /sales/me lists as `modules` for each system role (server order: sales/permissions.py::MODULES)
+# The grants the simplified workflow (a3f8c2d7e915) added to keys that EARLIER migrations created - so each earlier migration's
+# frozen seed is compared with what the role held before them.
+WORKFLOW_GRANTS = {
+    ("sales_manager", "sales.settings.manage"), ("sales_manager", "sales.leads.export"), ("lead_data_entry", "sales.leads.delete"),
+    ("sales_manager", "sales.customers.setup"), ("sales_employee", "sales.customers.setup"),       # e7a2d4c9b1f3
+}
+WORKFLOW_PERMISSIONS = frozenset(_WORKFLOW_PERMISSIONS)
+BATCH_PERMISSIONS = frozenset(_BATCH_PERMISSIONS)
+BATCH_GRANTS = {("sales_manager", key) for key in _BATCH_PERMISSIONS}       # f2b6d8a1c4e9 - new keys, granted to the manager only
+
+
+def granted_before_workflow(role: str) -> set:
+    """What a system role held before the simplified workflow's migration (so before the batches' one too)."""
+    return SYSTEM_ROLE_PERMISSIONS[role] - {key for r, key in WORKFLOW_GRANTS | BATCH_GRANTS if r == role}
+
+
+# Retired system roles (staff_roles.is_active = false, migration c5e1b9a4d2f7): their GRANTS stay in the database (the pins
+# above), but they give their holders NOTHING. The Onboarding Employee is not part of the simplified workflow.
+RETIRED_ROLES = frozenset({"onboarding_employee"})
+# what a holder of each system role actually gets (GET /sales/me): nothing at all from a retired role
+EFFECTIVE_ROLE_PERMISSIONS = {role: (set() if role in RETIRED_ROLES else keys) for role, keys in SYSTEM_ROLE_PERMISSIONS.items()}
+# The dormant onboarding architecture is exercised through a custom role holding exactly the retired role's keys - "a custom role
+# built from the same keys behaves the same way" - which is what re-enabling the role would give back.
+ONBOARDING_WORKER_KEYS = frozenset(SYSTEM_ROLE_PERMISSIONS["onboarding_employee"])
+
+# what GET /sales/me lists as `modules` for each system role (server order: sales/permissions.py::MODULES). Onboarding is no
+# longer a section (simplified workflow), and the retired Onboarding Employee role reaches nothing.
 SYSTEM_ROLE_MODULES = {
-    "sales_manager": ["home", "team", "leads", "pipeline", "campaigns", "followups", "calls", "demos", "trials", "reports", "customers", "onboarding"],
+    "sales_manager": ["home", "team", "leads", "pipeline", "campaigns", "followups", "calls", "demos", "trials", "reports", "customers",
+                      "batches", "performance"],
     "sales_employee": ["home", "leads", "pipeline", "campaigns", "followups", "calls", "demos", "trials", "reports", "customers"],
     "lead_data_entry": ["home", "leads", "pipeline", "campaigns"],
-    "onboarding_employee": ["home", "reports", "onboarding"],
+    "onboarding_employee": [],
 }
-ALL_MODULES = ["home", "team", "leads", "pipeline", "campaigns", "followups", "calls", "demos", "trials", "reports", "customers", "onboarding"]
+ALL_MODULES = ["home", "team", "leads", "pipeline", "campaigns", "followups", "calls", "demos", "trials", "reports", "customers",
+               "batches", "performance"]
 
 BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "").rstrip("/")
 
@@ -180,6 +219,35 @@ def create_staff(admin_headers: dict, role_keys, label: str = "staff", do_login:
         token = mint_token(staff["id"])
         out.update(token=token, refresh_token=None, headers=auth(token), login=None)
     return out
+
+
+def grant_retired_role(staff_id: str, role_key: str = "onboarding_employee") -> None:
+    """Give an account a grant of a RETIRED system role, as if it had been granted before the role was retired (the API
+    refuses to grant a retired role, so this is a direct write - scratch only). Models a real Onboarding Employee after
+    migration c5e1b9a4d2f7."""
+    import asyncio
+    from sqlalchemy import select
+    from database import SessionLocal, engine
+    from sales.models import StaffRole, StaffUserRole
+
+    async def _go():
+        try:
+            async with SessionLocal() as db:
+                role = (await db.execute(select(StaffRole).where(StaffRole.key == role_key))).scalar_one()
+                assert role.is_active is False, f"{role_key} is not retired"
+                db.add(StaffUserRole(id=uuid.uuid4(), user_id=uuid.UUID(staff_id), role_id=role.id, granted_by=uuid.UUID(staff_id)))
+                await db.commit()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_go())
+
+
+def create_retired_onboarding_employee(admin_headers: dict, label: str = "onboarding") -> dict:
+    """An account holding the RETIRED Onboarding Employee role (created without roles, then the old grant written directly)."""
+    person = create_staff(admin_headers, [], label)
+    grant_retired_role(person["id"])
+    return person
 
 
 def api(method: str, path: str, headers=None, json=None, **kw):

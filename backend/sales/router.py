@@ -1,8 +1,9 @@
 """JAZ Sales API (Phase 1: workspace context, roles, internal staff management;
 Phase 2: lead sources, campaigns, leads, assignment, duplicate detection, pipeline, activity timeline;
 Phase 3: calls, follow-ups, demos, trials;
-Phase 4: conversion of won leads, customers, onboarding;
-Phase 5: dashboard and reports).
+Phase 4: customers, onboarding (its conversion of won leads is retired - the Customer Setup replaces it);
+Phase 5: dashboard and reports;
+simplified workflow: automatic lead distribution, the Sales Employee's work queue, the Customer Setup, lead export).
 
 Mounted by server.py under /api/sales. Access rules:
   * router-level dependency get_staff_context: only an ACTIVE `jaz_staff` or a
@@ -54,14 +55,26 @@ from sales.activity_schemas import (
     TrialOut,
     TrialUpdate,
 )
+from sales.batch_schemas import (
+    BatchesOverview,
+    DataBatchDetail,
+    DataBatchList,
+    DataEntryPerformanceList,
+    EmployeeHistory,
+    EmployeePerformance,
+    LeadTrace,
+    MasterBatchDetail,
+    MasterBatchList,
+    ReassignBatch,
+    SalesPerformanceList,
+    SearchResults,
+    WorkBatchDetail,
+    WorkBatchList,
+)
 from sales.constants import PIPELINE_STAGES
 from sales.customer_params import CustomerFilterParams, OnboardingFilterParams
 from sales.customer_schemas import (
-    ConversionPreflightOut,
     ConversionStatusOut,
-    ConversionValues,
-    ConvertLead,
-    ConvertResult,
     CustomerCounts,
     CustomerList,
     CustomerOut,
@@ -111,6 +124,15 @@ from sales.report_schemas import (
     PipelineReportOut,
     SourceReportOut,
 )
+from sales.setup_schemas import (
+    CustomerSetup,
+    DistributionOut,
+    DistributionUpdate,
+    QueueOut,
+    SetupPreflightOut,
+    SetupPreflightValues,
+    SetupResult,
+)
 from sales.schemas import (
     MeOut,
     PasswordReset,
@@ -122,11 +144,16 @@ from sales.schemas import (
     StaffOut,
     StaffUpdate,
 )
+from sales.services import batch_views as batch_views_service
+from sales.services import batches as batches_service
 from sales.services import calls as calls_service
 from sales.services import campaigns as campaigns_service
 from sales.services import conversion as conversion_service
+from sales.services import customer_setup as customer_setup_service
 from sales.services import customers as customers_service
 from sales.services import dashboard as dashboard_service
+from sales.services import distribution as distribution_service
+from sales.services import export as export_service
 from sales.services import demos as demos_service
 from sales.services import followups as followups_service
 from sales.services import leads as leads_service
@@ -421,6 +448,32 @@ async def lead_stage_counts(
     return await leads_service.stage_counts(db, ctx, params.to_filters(ctx))
 
 
+@sales_router.get("/leads/export")
+async def export_leads(
+    params: LeadFilterParams = Depends(),
+    fmt: Literal["xlsx", "pdf"] = Query(..., alias="format"),
+    lang: Literal["ar", "en"] = Query("ar"),
+    sort: Literal[SORT_FIELDS] = Query("created_at"),
+    order: Literal["asc", "desc"] = Query("desc"),
+    ctx: StaffContext = Depends(require_permission(perms.PERM_LEADS_VIEW, perms.PERM_LEADS_EXPORT)),
+    db: AsyncSession = Depends(get_db),
+    audit: AuditContext = Depends(get_audit_context),
+):
+    """EVERY lead matching the same filters / search / sort as GET /leads (not one page), within the caller's lead scope, as an
+    Excel workbook or a printable PDF (Arabic RTL or English). 413 past sales.constants.EXPORT_MAX_ROWS rows. Audited."""
+    content, filename, rows = await export_service.export_leads(
+        db, ctx, params.to_filters(ctx), sort=sort, descending=order == "desc", fmt=fmt, lang=lang, audit=audit,
+    )
+    return Response(
+        content=content, media_type=export_service.CONTENT_TYPES[fmt],
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+            "X-Export-Row-Count": str(rows),
+        },
+    )
+
+
 @sales_router.post("/leads/bulk-assign", response_model=BulkAssignResult)
 async def bulk_assign_leads(
     body: BulkAssignRequest,
@@ -508,8 +561,25 @@ async def change_lead_stage(
     audit: AuditContext = Depends(get_audit_context),
 ):
     """Moves the lead along the pipeline. The transition is validated here (400 for a bad request such as a
-    missing lost reason, 409 for a move the lead's current state does not allow)."""
-    return await leads_service.change_stage(db, ctx, lead_id, body, audit)
+    missing lost reason, 409 for a move the lead's current state does not allow). `won` is never a manual move, for any caller:
+    403 `won_requires_customer_setup` - a lead is won only through the Customer Setup (POST /leads/{lead_id}/setup)."""
+    result = await leads_service.change_stage(db, ctx, lead_id, body, audit)
+    await batches_service.settle(db)             # committed; then any Work Batch the decision made due (services/batches.py)
+    return result
+
+
+@sales_router.post("/leads/{lead_id}/wait-list", response_model=LeadResult)
+async def wait_list_lead(
+    lead_id: str,
+    ctx: StaffContext = Depends(require_permission(perms.PERM_LEADS_CHANGE_STAGE)),
+    db: AsyncSession = Depends(get_db),
+    audit: AuditContext = Depends(get_audit_context),
+):
+    """Puts one of the caller's open leads on the wait list: a timestamp and a pending status. The lead stays theirs, moves to the
+    end of their queue and ends up won or lost. Idempotent."""
+    result = await leads_service.wait_list_lead(db, ctx, lead_id, audit)
+    await batches_service.settle(db)             # committed; then any Work Batch the decision made due (services/batches.py)
+    return result
 
 
 @sales_router.get("/leads/{lead_id}/activities", response_model=ActivityList)
@@ -522,6 +592,40 @@ async def list_lead_activities(
 ):
     """The lead's immutable timeline, newest first."""
     return await leads_service.list_activities(db, ctx, lead_id, limit, offset)
+
+
+# =============================================================================
+# Simplified workflow - the Sales Manager's lead distribution, the Sales Employee's work queue
+# =============================================================================
+
+@sales_router.get("/settings/distribution", response_model=DistributionOut)
+async def get_distribution_settings(
+    ctx: StaffContext = Depends(require_permission(perms.PERM_SETTINGS_MANAGE)),
+    db: AsyncSession = Depends(get_db),
+):
+    """Automatic lead distribution: ON/OFF, the mode (equal round-robin), and the rotation it uses right now."""
+    return await distribution_service.get_distribution(db)
+
+
+@sales_router.put("/settings/distribution", response_model=DistributionOut)
+async def update_distribution_settings(
+    body: DistributionUpdate,
+    ctx: StaffContext = Depends(require_permission(perms.PERM_SETTINGS_MANAGE)),
+    db: AsyncSession = Depends(get_db),
+    audit: AuditContext = Depends(get_audit_context),
+):
+    """Switch automatic distribution on or off. Audited. Leads assigned by hand are never affected."""
+    return await distribution_service.update_distribution(db, ctx, body, audit)
+
+
+@sales_router.get("/queue", response_model=QueueOut)
+async def my_lead_queue(
+    position: int = Query(0, ge=0, le=100000),
+    ctx: StaffContext = Depends(require_permission(perms.PERM_LEADS_VIEW)),
+    db: AsyncSession = Depends(get_db),
+):
+    """The caller's own work queue: their open assigned leads, the longest-waiting first, one at a time (`position`)."""
+    return await leads_service.my_queue(db, ctx, position)
 
 
 # =============================================================================
@@ -890,37 +994,65 @@ async def get_lead_conversion(
     ctx: StaffContext = Depends(require_permission(perms.PERM_CUSTOMERS_VIEW)),
     db: AsyncSession = Depends(get_db),
 ):
-    """Whether the lead has been converted (and to which customer), whether THIS caller can convert it, and why not."""
+    """Whether the lead has been converted (and to which customer) and whether THIS caller can start the Customer Setup on it
+    (`can_setup`, else `setup_blocker`). `can_convert` is always false: the Phase-4 conversion is retired."""
     return await conversion_service.conversion_status(db, ctx, lead_id)
 
 
-@sales_router.post("/leads/{lead_id}/convert/preflight", response_model=ConversionPreflightOut)
+# The Phase-4 conversion is RETIRED. Both endpoints stay (so an old client gets an answer, not a 404) and both keep their
+# permission guard (a caller without it is still refused with 403), but they do NOTHING: every permitted caller gets the same
+# 410 `conversion_retired`, whatever the lead or the body - no lookup, no write, nothing to probe. The retired flow created a
+# company with an active subscription and no dates (one that never ends); the Customer Setup below replaces it.
+_CONVERSION_RETIRED = {410: {"description": "The conversion is retired: use the Customer Setup (POST /leads/{lead_id}/setup)."}}
+
+
+@sales_router.post("/leads/{lead_id}/convert/preflight", deprecated=True, responses=_CONVERSION_RETIRED)
 async def preflight_lead_conversion(
     lead_id: str,
-    body: Optional[ConversionValues] = None,
     ctx: StaffContext = Depends(require_permission(perms.PERM_CUSTOMERS_CONVERT)),
-    db: AsyncSession = Depends(get_db),
 ):
-    """Read-only. The values the company would be created from (what the body gives, else what the lead holds), what would
-    stop the conversion (lead state, an email or phone a JAZ account already uses, an exact JAZ company duplicate), any
-    POSSIBLE duplicate the caller would have to confirm, and the subscription plans on offer."""
-    return await conversion_service.preflight(db, ctx, lead_id, body or ConversionValues())
+    """RETIRED - always 410 `conversion_retired`. Use POST /leads/{lead_id}/setup/preflight."""
+    raise conversion_service.conversion_retired()
 
 
-@sales_router.post("/leads/{lead_id}/convert", response_model=ConvertResult, status_code=201)
+@sales_router.post("/leads/{lead_id}/convert", deprecated=True, responses=_CONVERSION_RETIRED)
 async def convert_lead(
     lead_id: str,
-    body: ConvertLead,
-    response: Response,
     ctx: StaffContext = Depends(require_permission(perms.PERM_CUSTOMERS_CONVERT)),
+):
+    """RETIRED - always 410 `conversion_retired`. Use POST /leads/{lead_id}/setup (the Customer Setup)."""
+    raise conversion_service.conversion_retired()
+
+
+# ---- customer setup (simplified workflow) ------------------------------------
+
+@sales_router.post("/leads/{lead_id}/setup/preflight", response_model=SetupPreflightOut)
+async def preflight_customer_setup(
+    lead_id: str,
+    body: Optional[SetupPreflightValues] = None,
+    ctx: StaffContext = Depends(require_permission(perms.PERM_CUSTOMERS_SETUP, perms.PERM_LEADS_CHANGE_STAGE)),
+    db: AsyncSession = Depends(get_db),
+):
+    """Read-only. What completing the Customer Setup of this lead with these values would do: the values the company would be
+    created from, what would stop it (lead state, a taken owner email / phone, an exact JAZ company duplicate), any POSSIBLE
+    duplicate to confirm, the plans on offer and the subscription options (trial / paid)."""
+    return await customer_setup_service.preflight(db, ctx, lead_id, body or SetupPreflightValues())
+
+
+@sales_router.post("/leads/{lead_id}/setup", response_model=SetupResult, status_code=201)
+async def complete_customer_setup(
+    lead_id: str,
+    body: CustomerSetup,
+    response: Response,
+    ctx: StaffContext = Depends(require_permission(perms.PERM_CUSTOMERS_SETUP, perms.PERM_LEADS_CHANGE_STAGE)),
     db: AsyncSession = Depends(get_db),
     audit: AuditContext = Depends(get_audit_context),
 ):
-    """Converts a WON lead: creates the JAZ company (through the platform's own company service), its owner account, the
-    customer and its onboarding, in one transaction. IDEMPOTENT: a lead that was already converted answers 200 with the
-    existing customer and `already_converted: true` and creates nothing. 409 when the lead is not won / is archived, when
-    a JAZ company already exists for the owner, and (until `confirm_duplicates`) when only a possible duplicate does."""
-    result = await conversion_service.convert_lead(db, ctx, lead_id, body, audit)
+    """The Sales Employee's "Agreed": moves an open lead to won and creates the customer, the JAZ company and its owner, the
+    trial / paid subscription and - optionally - the company's first employees and tasks, in one transaction. IDEMPOTENT: a
+    lead converted before answers 200 with the existing customer and `already_converted: true`, creating nothing."""
+    result = await customer_setup_service.complete_setup(db, ctx, lead_id, body, audit)
+    await batches_service.settle(db)             # committed; then any Work Batch the decision made due (services/batches.py)
     if result["already_converted"]:
         response.status_code = 200
     return result
@@ -1060,6 +1192,176 @@ async def list_onboarding_timeline(
 ):
     """The onboarding's own immutable timeline (assignments, stage changes, notes), newest first."""
     return await onboarding_service.list_timeline(db, ctx, onboarding_id, limit, offset)
+
+
+# =============================================================================
+# Batches, search and performance - the Sales Manager only (migration f2b6d8a1c4e9)
+#
+# Every route below demands the batch / performance permission AND the all-leads scope: the permissions are granted to the Sales
+# Manager alone, and the second requirement keeps a custom role that was handed one of them from reading every lead through
+# it. Data Entry and Sales Employee routes never return a batch id, number or statistic.
+# =============================================================================
+
+_BATCH_VIEW = (perms.PERM_BATCHES_VIEW, perms.PERM_LEADS_SCOPE_ALL)
+_PERFORMANCE_VIEW = (perms.PERM_PERFORMANCE_VIEW, perms.PERM_LEADS_SCOPE_ALL)
+
+
+@sales_router.get("/batches/overview", response_model=BatchesOverview)
+async def batches_overview(
+    ctx: StaffContext = Depends(require_permission(*_BATCH_VIEW)),
+    db: AsyncSession = Depends(get_db),
+):
+    """Where the batches stand: the open Data Batch's progress, the next Master Batch's, the Work Batches and the wait list."""
+    return await batch_views_service.overview(db)
+
+
+@sales_router.get("/batches/data", response_model=DataBatchList)
+async def list_data_batches(
+    status: Optional[Literal["open", "full"]] = Query(None),
+    master_batch_id: Optional[str] = Query(None, max_length=64),
+    limit: int = Query(25, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    ctx: StaffContext = Depends(require_permission(*_BATCH_VIEW)),
+    db: AsyncSession = Depends(get_db),
+):
+    """Data Batches (every 100 leads entered by all Data Entry staff combined), newest first."""
+    return await batch_views_service.list_data_batches(db, status=status, master_batch_id=master_batch_id, limit=limit, offset=offset)
+
+
+@sales_router.get("/batches/data/{batch_id}", response_model=DataBatchDetail)
+async def get_data_batch(
+    batch_id: str,
+    ctx: StaffContext = Depends(require_permission(*_BATCH_VIEW)),
+    db: AsyncSession = Depends(get_db),
+):
+    """One Data Batch with its leads - each with who entered it and when - and how many each Data Entry person contributed."""
+    return await batch_views_service.get_data_batch(db, batch_id)
+
+
+@sales_router.get("/batches/master", response_model=MasterBatchList)
+async def list_master_batches(
+    limit: int = Query(25, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    ctx: StaffContext = Depends(require_permission(*_BATCH_VIEW)),
+    db: AsyncSession = Depends(get_db),
+):
+    """Master Batches (every 10 completed Data Batches), newest first."""
+    return await batch_views_service.list_master_batches(db, limit=limit, offset=offset)
+
+
+@sales_router.get("/batches/master/{batch_id}", response_model=MasterBatchDetail)
+async def get_master_batch(
+    batch_id: str,
+    ctx: StaffContext = Depends(require_permission(*_BATCH_VIEW)),
+    db: AsyncSession = Depends(get_db),
+):
+    return await batch_views_service.get_master_batch(db, batch_id)
+
+
+@sales_router.get("/batches/work", response_model=WorkBatchList)
+async def list_work_batches(
+    status: Optional[Literal["open", "closed"]] = Query(None),
+    employee_id: Optional[str] = Query(None, max_length=64),
+    limit: int = Query(25, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    ctx: StaffContext = Depends(require_permission(*_BATCH_VIEW)),
+    db: AsyncSession = Depends(get_db),
+):
+    """Sales Work Batches (100 leads a salesperson has worked): open while any lead waits on the wait list, closed when all have a
+    final result - with the accepted / rejected / wait-list split."""
+    return await batch_views_service.list_work_batches(db, ctx, status=status, employee_id=employee_id, limit=limit, offset=offset)
+
+
+@sales_router.get("/batches/work/{batch_id}", response_model=WorkBatchDetail)
+async def get_work_batch(
+    batch_id: str,
+    ctx: StaffContext = Depends(require_permission(*_BATCH_VIEW)),
+    db: AsyncSession = Depends(get_db),
+):
+    """One Work Batch: every attempt (who worked it, when, the split) and every lead with its own history of attempts."""
+    return await batch_views_service.get_work_batch(db, ctx, batch_id)
+
+
+@sales_router.post("/batches/work/{batch_id}/reassign", response_model=WorkBatchDetail)
+async def reassign_work_batch(
+    batch_id: str,
+    body: ReassignBatch,
+    ctx: StaffContext = Depends(require_permission(perms.PERM_BATCHES_VIEW, perms.PERM_BATCHES_REASSIGN, perms.PERM_LEADS_SCOPE_ALL)),
+    db: AsyncSession = Depends(get_db),
+    audit: AuditContext = Depends(get_audit_context),
+):
+    """Hands a COMPLETED batch to another Sales Employee: a new attempt over the same leads (never copies), the earlier attempts kept
+    as they were. Leads already won stay won; the rest go to the new person, lost ones reopened. Audited."""
+    return await batch_views_service.reassign_work_batch(db, ctx, audit, batch_id, body.employee_id)
+
+
+@sales_router.get("/batches/search", response_model=SearchResults)
+async def search_batches(
+    q: str = Query(..., min_length=2, max_length=100),
+    field: Literal["any", "business_name", "contact_name", "phone", "business_type"] = Query("any"),
+    limit: int = Query(25, ge=1, le=100),
+    ctx: StaffContext = Depends(require_permission(*_BATCH_VIEW)),
+    db: AsyncSession = Depends(get_db),
+):
+    """Every lead matching a business name, person name, phone or activity type - each traced: Data Batch, Master Batch, Work
+    Batches and every attempt with its result."""
+    return await batch_views_service.search(db, q=q, field=field, limit=limit)
+
+
+@sales_router.get("/batches/trace/{lead_id}", response_model=LeadTrace)
+async def trace_lead(
+    lead_id: str,
+    ctx: StaffContext = Depends(require_permission(*_BATCH_VIEW)),
+    db: AsyncSession = Depends(get_db),
+):
+    """The whole trail of one lead, with its immutable timeline."""
+    return await batch_views_service.trace(db, ctx, lead_id)
+
+
+@sales_router.get("/performance/data-entry", response_model=DataEntryPerformanceList)
+async def data_entry_performance(
+    q: Optional[str] = Query(None, max_length=100, description="Part of the employee's name"),
+    limit: int = Query(25, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    ctx: StaffContext = Depends(require_permission(*_PERFORMANCE_VIEW)),
+    db: AsyncSession = Depends(get_db),
+):
+    """Each Data Entry employee (by name, paginated): leads entered and work hours - today, this month, this year, lifetime."""
+    return await batch_views_service.data_entry_performance(db, q=q, limit=limit, offset=offset)
+
+
+@sales_router.get("/performance/sales", response_model=SalesPerformanceList)
+async def sales_performance(
+    q: Optional[str] = Query(None, max_length=100, description="Part of the employee's name"),
+    limit: int = Query(25, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    ctx: StaffContext = Depends(require_permission(*_PERFORMANCE_VIEW)),
+    db: AsyncSession = Depends(get_db),
+):
+    """Each Sales employee (by name, paginated): leads worked, accepted / rejected (direct and after the wait list), wait list,
+    completed batches and work hours - today, this month, this year, lifetime."""
+    return await batch_views_service.sales_performance(db, q=q, limit=limit, offset=offset)
+
+
+@sales_router.get("/performance/employees/{user_id}", response_model=EmployeePerformance)
+async def employee_performance(
+    user_id: str,
+    ctx: StaffContext = Depends(require_permission(*_PERFORMANCE_VIEW)),
+    db: AsyncSession = Depends(get_db),
+):
+    return await batch_views_service.employee_performance(db, user_id)
+
+
+@sales_router.get("/performance/employees/{user_id}/history", response_model=EmployeeHistory)
+async def employee_history(
+    user_id: str,
+    days: int = Query(30, ge=1, le=366),
+    sessions: int = Query(30, ge=1, le=200),
+    ctx: StaffContext = Depends(require_permission(*_PERFORMANCE_VIEW)),
+    db: AsyncSession = Depends(get_db),
+):
+    """The employee's persistent work history: per day (leads entered, decisions, hours) and their latest work sessions."""
+    return await batch_views_service.employee_history(db, user_id, days=days, sessions=sessions)
 
 
 # =============================================================================

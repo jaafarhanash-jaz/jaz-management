@@ -11,6 +11,7 @@ import concurrent.futures
 import pytest
 
 from sales_customer_test_utils import (
+    legacy_win,
     ONBOARDING_EVENTS,
     PHANTOM_ID,
     api,
@@ -32,6 +33,7 @@ from sales_customer_test_utils import (
     onboarding_id,
     onboarding_timeline,
     onboarding_worker,
+    onboarding_worker_role,
     phase4_events,
     reactivate,
     retire_roles,
@@ -177,9 +179,10 @@ class TestWhoCanReceiveAnOnboarding:
 
     def test_an_employee_whose_role_was_revoked_cannot_receive_one_and_can_again_once_regranted(self, fresh, mgr, admin_h):
         worker = onboarding_worker(admin_h, "r1")
-        assert api("DELETE", f"/api/sales/team/{worker['id']}/roles/onboarding_employee", admin_h).status_code == 200
+        role = onboarding_worker_role()          # the retired system role cannot be granted: the same keys, through a custom role
+        assert api("DELETE", f"/api/sales/team/{worker['id']}/roles/{role}", admin_h).status_code == 200
         self._refused(mgr, fresh["onboarding_id"], worker["id"])
-        assert api("POST", f"/api/sales/team/{worker['id']}/roles", admin_h, {"role_key": "onboarding_employee"}).status_code == 200
+        assert api("POST", f"/api/sales/team/{worker['id']}/roles", admin_h, {"role_key": role}).status_code == 200
         assert assign_onboarding(mgr, fresh["onboarding_id"], worker["id"])["assigned_to"]["id"] == worker["id"]
 
     def test_wrong_role_accounts_and_made_up_ids_get_the_same_answer(self, fresh, mgr, p, owner_user):
@@ -296,7 +299,7 @@ class TestStages:
         assert event["actor"]["id"] == owned["worker"]["id"] and event["note"] == "all set up"
         assert event["before"] == {"stage": "assigned", "customer_status": "onboarding", "completed_at": None}
         assert event["after"]["stage"] == "activated" and event["after"]["customer_status"] == "activated" and event["after"]["completed_at"]
-        assert event["metadata"]["actor_roles"] == ["onboarding_employee"]
+        assert event["metadata"]["actor_roles"] == [onboarding_worker_role()]
 
     def test_the_database_holds_the_same_state(self, mgr, owned):
         from sales.models import SalesCustomer, SalesOnboarding
@@ -408,7 +411,7 @@ class TestTimeline:
         lead = create_lead(p["data_entry"]["headers"])                                                          # THEIR lead (in their intake scope) ...
         assign(mgr, lead["id"], p["employee"]["id"])
         set_stage(mgr, lead["id"], "contacted")
-        set_stage(mgr, lead["id"], "won")
+        legacy_win(mgr, lead["id"])                                                                             # (a lead won before the no-manual-win rule)
         customer_id = convert(mgr, lead)["customer"]["id"]
         assign_onboarding(mgr, onboarding_id(mgr, customer_id), onboarding_worker(admin_h, "e1")["id"])       # so onboarding events exist as well
         seen = {e["event_type"] for e in activities(p["data_entry"]["headers"], lead["id"])}
@@ -547,7 +550,8 @@ class TestWhatAnOnboardingEmployeeReaches:
 
     def test_their_workspace_shows_onboarding_and_nothing_else(self, setup):
         me = api("GET", "/api/sales/me", setup["h"]).json()
-        assert me["modules"] == ["home", "reports", "onboarding"]        # Phase 5 added the reports section: for them it holds the onboarding report only
+        # simplified workflow: onboarding is no longer a section (the role is dormant); the API below still serves their records
+        assert me["modules"] == ["home", "reports"]
         assert {k for k in me["permissions"] if k != "sales.access"} == {
             "sales.onboarding.view", "sales.onboarding.manage", "sales.onboarding.scope_assigned",
             "sales.dashboard.view", "sales.reports.view",                 # Phase 5: the dashboard / reports doors - no lead, work-item or customer permission behind them

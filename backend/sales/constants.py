@@ -1,5 +1,6 @@
 """JAZ Sales (Phases 2-4) - the lead vocabulary, the pipeline rules, the work-item (call / follow-up / demo /
-trial) vocabulary and the customer / onboarding vocabulary.
+trial) vocabulary and the customer / onboarding vocabulary; plus the simplified-workflow rules (distribution, customer
+setup, the Lead Data Entry edit window, export limits).
 
 Pure Python, no database or framework imports, so it is unit-testable on its own.
 
@@ -98,13 +99,18 @@ OPEN_STAGES: Tuple[str, ...] = tuple(s for s in PIPELINE_STAGES if s not in CLOS
 # `new` and `assigned` are managed by assignment, not by hand: a lead is `new` exactly while nobody owns it
 # and moves to `assigned` the moment it gets an owner (and back when the owner is removed). So the only manual
 # ways out of `new` are closing it as lost, and the only manual way INTO new/assigned is reopening a lost lead.
+#
+# `won` is NOT a manual target for anybody - not a Sales Employee, not a Sales Manager, not the Super Admin. A lead becomes won in
+# exactly one way: the Customer Setup (services/customer_setup.py), which wins it in the same transaction that creates the customer,
+# the JAZ company and its dated subscription. So no row here lists `won` as a destination; services/leads.change_stage answers
+# 403 `won_requires_customer_setup` to any attempt.
 _WORKING = frozenset(WORKING_STAGES)
 STAGE_TRANSITIONS: Dict[str, FrozenSet[str]] = {
     STAGE_NEW: frozenset({STAGE_LOST}),
     STAGE_ASSIGNED: _WORKING | {STAGE_LOST},
-    # forward (skipping allowed) or back among the working stages, straight to won once contact was made, or lost
-    **{stage: (_WORKING - {stage}) | {STAGE_WON, STAGE_LOST} for stage in WORKING_STAGES},
-    STAGE_WON: frozenset(),  # terminal in Phase 2 (conversion / reopening a won lead belongs to a later phase)
+    # forward (skipping allowed) or back among the working stages, or lost
+    **{stage: (_WORKING - {stage}) | {STAGE_LOST} for stage in WORKING_STAGES},
+    STAGE_WON: frozenset(),  # terminal: reached through the Customer Setup only, and never left by hand
     STAGE_LOST: frozenset({STAGE_NEW, STAGE_ASSIGNED}),  # reopen: `new` if nobody owns it, else `assigned`
 }
 
@@ -234,3 +240,81 @@ def onboarding_transition_error(current: str, target: str, *, has_assignee: bool
 
 def onboarding_allowed_stages(current: str, *, has_assignee: bool) -> Tuple[str, ...]:
     return tuple(t for t in ONBOARDING_STAGES if onboarding_transition_error(current, t, has_assignee=has_assignee) is None)
+
+
+# =============================================================================
+# Simplified workflow (migration a3f8c2d7e915)
+# =============================================================================
+# ---- automatic lead distribution ------------------------------------------------------
+# 'equal' = simple deterministic round-robin over the staff who may receive leads (sales/services/distribution.py). A closed
+# set in the database too (ck_sales_settings_distribution_mode): a new mode needs a migration.
+DISTRIBUTION_MODES: Tuple[str, ...] = ("equal",)
+DEFAULT_DISTRIBUTION_MODE = "equal"
+
+# ---- customer setup -------------------------------------------------------------------
+# What the JAZ company starts on. The platform has no "trial" subscription status of its own: a trial is an ACTIVE
+# subscription on the chosen plan that lasts EXACTLY TRIAL_DURATION (7 x 24 hours) from the moment it is created - e.g.
+# 25/09 15:00 -> 02/10 15:00, never "7 calendar dates". Its end is stored as an exact instant
+# (companies.subscription_ends_exactly), so the platform's own expiry check (services/auth.py::subscription_has_ended)
+# ends it at that moment. A paid subscription (no payment step in Sales - the MVP decision) runs for the plan's own
+# duration from today, counted like the platform's Renew action (30 days per month, calendar dates, the UTC day the
+# platform expires on).
+SUBSCRIPTION_TYPES: Tuple[str, ...] = ("trial", "paid")
+TRIAL_DAYS = 7
+TRIAL_DURATION = timedelta(hours=TRIAL_DAYS * 24)
+DAYS_PER_PLAN_MONTH = 30
+# The optional parts of a customer setup. Bounded so one request stays one reasonable transaction.
+MAX_SETUP_EMPLOYEES = 50
+MAX_SETUP_TASKS = 50
+# Priorities a JAZ task may have (the core tasks table's own CHECK, ck_tasks_priority).
+TASK_PRIORITIES: Tuple[str, ...] = ("low", "medium", "high", "critical")
+
+# ---- Lead Data Entry edit window ------------------------------------------------------
+# A caller whose ONLY route to a lead is the intake scope (Lead Data Entry) may edit / archive / restore just the most recent
+# leads they created themselves - archived ones included, so archiving cannot slide older leads back into the window - and only
+# while such a lead is still UNASSIGNED: once it has been handed to Sales it is Sales' to work. Every older lead, and every
+# assigned one, is left to a Sales Manager (scope_all). Enforced by services/leads.py on every write.
+RECENT_EDIT_WINDOW = 10
+
+# ---- export ---------------------------------------------------------------------------
+# One export is one synchronous response: past this many rows it answers 413 and asks for narrower filters instead of
+# building a file the browser (or a printer) could not handle.
+EXPORT_MAX_ROWS = 10000
+
+
+# =============================================================================
+# Batches and performance (migration f2b6d8a1c4e9)
+# =============================================================================
+# ---- Data Batches / Master Batches (the Data Entry side; a Sales Manager reporting layer, invisible to everybody else) -------
+# Every DATA_BATCH_SIZE leads entered by ALL Data Entry staff combined form one Data Batch (a batch belongs to nobody: each lead
+# keeps its own created_by / created_at). A batch is `open` while it fills and `full` once it holds DATA_BATCH_SIZE leads;
+# every MASTER_BATCH_SIZE full batches (oldest first, never reused) automatically form one Master Batch, the batches under it
+# staying intact. Batches never gate anything: a lead is workable by Sales the moment it exists.
+DATA_BATCH_SIZE = 100
+MASTER_BATCH_SIZE = 10
+DATA_BATCH_STATUSES: Tuple[str, ...] = ("open", "full")
+
+# ---- Sales attempts and Sales Work Batches ---------------------------------------------------------------------------------
+# A lead ATTEMPT is one salesperson's try at one lead: what they first decided (accepted / rejected / put on the wait list) and
+# how it ended. Direct outcomes are final at once; a wait-listed lead stays pending (timestamp + pending, nothing more) until it
+# is accepted or rejected - or `released` (the manager took the lead back before the salesperson decided).
+FIRST_OUTCOMES: Tuple[str, ...] = ("accepted", "rejected", "wait_list")
+ATTEMPT_RESULTS: Tuple[str, ...] = ("accepted", "rejected", "released")
+# the five ways an attempt reads (derived, never stored): what the batch statistics split on
+ATTEMPT_PATHS: Tuple[str, ...] = ("direct_accepted", "direct_rejected", "wait_accepted", "wait_rejected", "wait_pending", "released")
+# Once a salesperson has recorded an outcome for WORK_BATCH_SIZE leads that are in no batch yet, those leads (the oldest first)
+# become a Sales Work Batch. It is `open` while any of its leads is still pending and `closed` once every one has a final
+# result. A closed batch can be handed to another salesperson for another ATTEMPT AT THE SAME LEADS (never copies).
+WORK_BATCH_SIZE = 100
+WORK_BATCH_STATUSES: Tuple[str, ...] = ("open", "closed")
+BATCH_ATTEMPT_KINDS: Tuple[str, ...] = ("initial", "reassignment")
+
+# ---- work hours ------------------------------------------------------------------------------------------------------------
+# The platform has no clock-in. A person's work time is derived from their recorded work actions (the immutable lead timeline):
+# consecutive actions less than SESSION_GAP apart belong to one persisted work session, and each session counts from its
+# first to its last action plus SESSION_TAIL_CREDIT for the last action itself.
+SESSION_GAP = timedelta(minutes=15)
+SESSION_TAIL_CREDIT = timedelta(minutes=1)
+
+# performance windows, in the application time zone (sales/timezone.py)
+PERFORMANCE_PERIODS: Tuple[str, ...] = ("today", "month", "year", "lifetime")

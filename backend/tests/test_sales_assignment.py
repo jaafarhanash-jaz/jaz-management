@@ -9,6 +9,7 @@ import concurrent.futures
 import pytest
 
 from sales_lead_test_utils import (
+    legacy_win,
     PHANTOM_ID,
     activities,
     assign,
@@ -252,7 +253,7 @@ class TestAssigneesEndpoint:
         won = create_lead(mgr)
         assign(mgr, won["id"], fresh["id"])
         set_stage(mgr, won["id"], "contacted")
-        set_stage(mgr, won["id"], "won")                                            # closed: not workload
+        legacy_win(mgr, won["id"])                                                  # closed: not workload (won before the no-manual-win rule)
         lost = create_lead(mgr)
         assign(mgr, lost["id"], fresh["id"])
         set_stage(mgr, lost["id"], "lost", lost_reason="wrong_number")              # closed: not workload

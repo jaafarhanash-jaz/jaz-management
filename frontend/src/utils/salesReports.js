@@ -119,7 +119,8 @@ export const REPORTS = [
   { key: 'activities', path: 'activities', nameKey: 'rep_name_activities', descKey: 'rep_desc_activities', filters: ['employee'], paged: true,
     available: (can) => can('sales.reports.view') && ['calls', 'followups', 'demos', 'trials'].some((k) => can(`sales.${k}.view`)) },
   { key: 'onboarding', path: 'onboarding', nameKey: 'rep_name_onboarding', descKey: 'rep_desc_onboarding', filters: ['onb_stage', 'onb_employee'], paged: true,
-    available: (can) => has(can, 'sales.reports.view', 'sales.onboarding.view') && (can('sales.onboarding.scope_all') || can('sales.onboarding.scope_assigned')) },
+    // Simplified workflow: onboarding is not part of the active workflow any more - the report stays (API and view) but is not offered.
+    available: () => false },
 ];
 
 export const REPORT_PAGE_SIZE = 25;

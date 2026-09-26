@@ -322,13 +322,14 @@ class TestRecordedInTheSameTransaction:
         events = event_types(mgr, lead["id"])
         before = get_lead(mgr, lead["id"])
         for method, path, body in [
-            ("POST", f"/api/sales/leads/{lead['id']}/stage", {"stage": "won"}),                        # not allowed from `new`
             ("POST", f"/api/sales/leads/{lead['id']}/stage", {"stage": "lost"}),                       # reason missing
             ("POST", f"/api/sales/leads/{lead['id']}/assign", {"assigned_to": p["manager"]["id"]}),    # ineligible assignee
             ("PATCH", f"/api/sales/leads/{lead['id']}", {"source": "nope", "priority": "high"}),       # one bad field spoils the request
             ("PATCH", f"/api/sales/leads/{lead['id']}", {"campaign_id": PHANTOM_ID}),
         ]:
             assert api(method, path, mgr, body).status_code in (400, 409), (method, path, body)
+        # `won` is never a manual move (403, whoever asks): a refused one records nothing either
+        assert api("POST", f"/api/sales/leads/{lead['id']}/stage", mgr, {"stage": "won"}).status_code == 403
         assert event_types(mgr, lead["id"]) == events and get_lead(mgr, lead["id"]) == before
 
     def test_a_blocked_duplicate_creates_neither_lead_nor_events(self, mgr):

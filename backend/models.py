@@ -137,6 +137,10 @@ class Company(Base, TimestampMixin, SoftDeleteMixin):
     # both uniformly (a date-only value normalizes to midnight UTC).
     subscription_start_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     subscription_end_date: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # True = subscription_end_date is an exact INSTANT (a Sales trial: exactly 7 x 24 hours) and the subscription ends at
+    # that moment; False = the end date keeps its calendar-day meaning (see services/auth.py::subscription_has_ended).
+    # Added by migration c5e1b9a4d2f7; the Super Admin's Activate / Renew always set it back to False.
+    subscription_ends_exactly: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     subscription_price: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False, server_default="0")
     subscription_duration_months: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     subscription_features: Mapped[Optional[List[str]]] = mapped_column(ARRAY(String), nullable=True)

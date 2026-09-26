@@ -10,14 +10,22 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from sqlalchemy import and_, case, exists, func, or_, select
+from sqlalchemy import and_, case, exists, func, or_, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from models import Company, User
 from sales import permissions as perms
 from sales.constants import CLOSED_STAGES, PIPELINE_STAGES, PRIORITY_RANK, STAGE_RANK
-from sales.models import SalesCampaign, SalesLead, SalesLeadSource, StaffRole, StaffRolePermission, StaffUserRole
+from sales.models import (
+    SalesCampaign,
+    SalesLead,
+    SalesLeadAttempt,
+    SalesLeadSource,
+    StaffRole,
+    StaffRolePermission,
+    StaffUserRole,
+)
 from sales.timezone import day_start
 from sales.services.normalize import (
     digits_only,
@@ -62,6 +70,7 @@ class LeadRow:
     assignee_name: Optional[str]
     assignee_status: Optional[str]
     creator_name: Optional[str]
+    wait_listed_at: Optional[datetime] = None     # f2b6d8a1c4e9: since when the lead is pending on its owner's wait list
 
 
 _Assignee = aliased(User)
@@ -77,16 +86,22 @@ def _row_select():
             _Assignee.name,
             _Assignee.status,
             _Creator.name,
+            SalesLeadAttempt.wait_listed_at,
         )
         .select_from(SalesLead)
         .outerjoin(SalesCampaign, SalesCampaign.id == SalesLead.campaign_id)
         .outerjoin(_Assignee, _Assignee.id == SalesLead.assigned_to)
         .outerjoin(_Creator, _Creator.id == SalesLead.created_by)
+        # a lead's pending attempt (at most one - uq_sales_lead_attempts_one_pending), so this never multiplies rows
+        .outerjoin(SalesLeadAttempt, and_(SalesLeadAttempt.lead_id == SalesLead.id, SalesLeadAttempt.result.is_(None)))
     )
 
 
 def _to_row(t) -> LeadRow:
-    return LeadRow(lead=t[0], campaign_name=t[1], campaign_status=t[2], assignee_name=t[3], assignee_status=t[4], creator_name=t[5])
+    return LeadRow(
+        lead=t[0], campaign_name=t[1], campaign_status=t[2], assignee_name=t[3], assignee_status=t[4], creator_name=t[5],
+        wait_listed_at=t[6],
+    )
 
 
 async def get_row(db: AsyncSession, lead_id: uuid.UUID) -> Optional[LeadRow]:
@@ -225,6 +240,54 @@ async def list_leads(
     return [_to_row(t) for t in (await db.execute(stmt)).all()], total
 
 
+async def list_all_rows(
+    db: AsyncSession, *, visibility, filters: LeadFilters, sort: str, descending: bool, max_rows: int
+) -> List[LeadRow]:
+    """EVERY matching lead (the export), in the listing's order - one query, no pagination. Reads at most max_rows + 1 rows,
+    so the caller can tell "exactly max_rows" from "more than that" without counting first."""
+    conds = _conditions(visibility, filters)
+    expr = _sort_expression(sort)
+    ordered = expr.desc() if descending else expr.asc()
+    if sort == "estimated_value":
+        ordered = ordered.nulls_last()
+    stmt = _row_select().where(*conds).order_by(ordered, SalesLead.id.desc() if descending else SalesLead.id).limit(max_rows + 1)
+    return [_to_row(t) for t in (await db.execute(stmt)).all()]
+
+
+async def queue_row(
+    db: AsyncSession, *, visibility, user_id: uuid.UUID, stages: Sequence[str], position: int
+) -> Tuple[Optional[LeadRow], int, int]:
+    """One lead of a person's work queue: their OPEN assigned leads (not archived, in `stages`), the longest-waiting first
+    (assigned_at, then id) - and the leads they put on the wait list after all the others, the longest-waiting of those first.
+    Returns (row, position actually used, total) - a position past the end falls back to the last."""
+    conds = [
+        visibility, SalesLead.assigned_to == user_id, SalesLead.archived_at.is_(None), SalesLead.pipeline_stage.in_(list(stages)),
+    ]
+    total = (await db.execute(select(func.count()).select_from(SalesLead).where(*conds))).scalar_one()
+    if total == 0:
+        return None, 0, 0
+    position = max(0, min(position, total - 1))
+    stmt = (
+        _row_select().where(*conds)
+        .order_by(SalesLeadAttempt.wait_listed_at.is_not(None), SalesLeadAttempt.wait_listed_at.asc(), SalesLead.assigned_at.asc(), SalesLead.id)
+        .offset(position).limit(1)
+    )
+    row = (await db.execute(stmt)).first()
+    return (_to_row(row) if row else None), position, total
+
+
+async def recent_created_ids(db: AsyncSession, user_id: uuid.UUID, limit: int) -> frozenset:
+    """The ids of the `limit` leads this person created most recently - archived ones included (the Lead Data Entry edit
+    window, services/lead_access.may_modify). Served by ix_sales_leads_creator_recent."""
+    result = await db.execute(
+        select(SalesLead.id)
+        .where(SalesLead.created_by == user_id)
+        .order_by(SalesLead.created_at.desc(), SalesLead.id.desc())
+        .limit(limit)
+    )
+    return frozenset(result.scalars().all())
+
+
 async def stage_counts(db: AsyncSession, *, visibility, filters: LeadFilters) -> Dict[str, int]:
     conds = _conditions(visibility, filters, with_stage=False)
     result = await db.execute(
@@ -269,14 +332,18 @@ async def get_assignable_user(db: AsyncSession, user_id: uuid.UUID, *, lock: boo
     return (await db.execute(stmt)).scalar_one_or_none()
 
 
-async def list_assignees(db: AsyncSession) -> List[Tuple[User, int]]:
-    """Everyone who may receive assignments, with their OPEN workload (not archived, not won/lost)."""
-    open_counts = (
+def _open_counts():
+    return (
         select(SalesLead.assigned_to.label("uid"), func.count().label("n"))
         .where(SalesLead.archived_at.is_(None), SalesLead.pipeline_stage.not_in(list(CLOSED_STAGES)))
         .group_by(SalesLead.assigned_to)
         .subquery()
     )
+
+
+async def list_assignees(db: AsyncSession) -> List[Tuple[User, int]]:
+    """Everyone who may receive assignments, with their OPEN workload (not archived, not won/lost)."""
+    open_counts = _open_counts()
     result = await db.execute(
         select(User, func.coalesce(open_counts.c.n, 0))
         .outerjoin(open_counts, open_counts.c.uid == User.id)
@@ -284,6 +351,47 @@ async def list_assignees(db: AsyncSession) -> List[Tuple[User, int]]:
         .order_by(User.name, User.id)
     )
     return [(user, int(n)) for user, n in result.all()]
+
+
+# ---- automatic distribution: the round-robin order -----------------------------------------------------------------
+# The rotation is everyone who may receive leads RIGHT NOW (the same eligibility as a manual assignment: an active, not
+# deleted jaz_staff account holding sales.leads.scope_assigned through an active grant of an active role), in the order
+# their accounts were created (id breaks ties). Someone deactivated or revoked simply drops out; someone new joins at the end.
+
+RotationKey = Tuple[datetime, uuid.UUID]
+
+
+def _rotation_order():
+    return (User.created_at, User.id)
+
+
+async def list_rotation(db: AsyncSession) -> List[Tuple[User, int]]:
+    """The rotation, in order, with each person's open workload (the manager's settings view)."""
+    open_counts = _open_counts()
+    result = await db.execute(
+        select(User, func.coalesce(open_counts.c.n, 0))
+        .outerjoin(open_counts, open_counts.c.uid == User.id)
+        .where(_is_staff_account_usable(), _may_receive_leads(User.id))
+        .order_by(*_rotation_order())
+    )
+    return [(user, int(n)) for user, n in result.all()]
+
+
+async def rotation_key(db: AsyncSession, user_id: uuid.UUID) -> Optional[RotationKey]:
+    """Where a person stands in the rotation order - read whatever their state now (they may have left the rotation)."""
+    row = (await db.execute(select(User.created_at, User.id).where(User.id == user_id))).first()
+    return (row[0], row[1]) if row else None
+
+
+async def next_in_rotation(db: AsyncSession, after: Optional[RotationKey]) -> Optional[User]:
+    """The first eligible person strictly after `after` in the rotation order, wrapping round to the first one; None when
+    nobody may receive leads. Two indexed LIMIT 1 reads - never the whole team."""
+    base = select(User).where(_is_staff_account_usable(), _may_receive_leads(User.id)).order_by(*_rotation_order()).limit(1)
+    if after is not None:
+        following = (await db.execute(base.where(tuple_(User.created_at, User.id) > tuple_(*after)))).scalar_one_or_none()
+        if following is not None:
+            return following
+    return (await db.execute(base)).scalar_one_or_none()
 
 
 # ---- duplicate detection -----------------------------------------------------------------------------------

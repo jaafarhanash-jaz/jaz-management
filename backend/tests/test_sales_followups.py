@@ -207,7 +207,9 @@ class TestWhoCanReceiveAFollowup:
         _deactivate(admin_h, a["id"])
         shown = fetch(mgr, "followups", f["id"])
         assert shown["assigned_to"] == {"id": a["id"], "name": "Test fu-a", "status": "inactive"} and shown["is_overdue"] is True   # nothing is lost or reassigned silently
-        assert f["id"] in ids_of(listing(mgr, "/api/sales/followups?due=overdue&limit=100"))                                      # ...and the manager sees it overdue
+        # ...and the manager sees it overdue (narrowed to the lead: the scratch DB accumulates far-past overdue items from other runs,
+        # so the GLOBAL first page is not a meaningful place to look)
+        assert f["id"] in ids_of(listing(mgr, f"/api/sales/followups?due=overdue&lead_id={lead['id']}&limit=100"))
         assert patch(mgr, "followups", f["id"], {"notes": "still editable"})["notes"] == "still editable"            # the current assignee is never re-checked
         # handing it to B: B must be eligible AND see the lead, so the lead moves first
         assert api("PATCH", f"/api/sales/followups/{f['id']}", mgr, {"assigned_to": b["id"]}).status_code == 400

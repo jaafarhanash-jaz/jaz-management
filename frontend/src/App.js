@@ -60,6 +60,8 @@ const SalesCalls = lazy(() => import('./pages/Sales/Calls'));
 const SalesDemos = lazy(() => import('./pages/Sales/Demos'));
 const SalesTrials = lazy(() => import('./pages/Sales/Trials'));
 const SalesReports = lazy(() => import('./pages/Sales/Reports'));
+const SalesBatches = lazy(() => import('./pages/Sales/Batches'));
+const SalesPerformance = lazy(() => import('./pages/Sales/Performance'));
 
 // Shown only for the brief moment a lazy page chunk is being fetched
 // (typically a single-digit-ms cache hit after the first visit to that
@@ -449,6 +451,8 @@ function App() {
             <Route path="/sales/onboarding" element={<SalesOnboarding onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole={userRole} />} />
             <Route path="/sales/onboarding/:onboardingId" element={<SalesOnboardingDetail onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole={userRole} />} />
             <Route path="/sales/reports" element={<SalesReports onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole={userRole} />} />
+            <Route path="/sales/batches" element={<SalesBatches onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole={userRole} />} />
+            <Route path="/sales/performance" element={<SalesPerformance onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole={userRole} />} />
             <Route path="/sales/team" element={<SalesTeam onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole={userRole} />} />
             <Route path="/sales/profile" element={<Profile onLogout={handleLogout} language={language} setLanguage={setLanguage} userRole={userRole} />} />
           </Route>

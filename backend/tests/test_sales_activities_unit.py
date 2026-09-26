@@ -288,6 +288,7 @@ class TestTimelineVocabularyAndVisibility:
         "trial_started", "trial_updated", "trial_completed", "trial_cancelled",
     }
     PHASE4_EVENTS = {"lead_converted", "onboarding_assigned", "onboarding_stage_changed", "onboarding_notes_updated"}
+    WAIT_LIST_EVENTS = {"lead_wait_listed"}       # f2b6d8a1c4e9: the salesperson's own working state - read by whoever decides on leads
     REQUIRED_BY_THE_SPEC = {
         "call_created", "call_updated", "followup_created", "followup_completed", "followup_cancelled", "demo_scheduled", "demo_rescheduled",
         "demo_completed", "demo_cancelled", "demo_no_show", "trial_started", "trial_completed", "trial_cancelled",
@@ -304,7 +305,7 @@ class TestTimelineVocabularyAndVisibility:
         assert len(work_events) == len(set(work_events))                                     # no event under two permissions
         assert constants == set(A.LEAD_EVENT_TYPES) | set(work_events)                         # nothing unclassified ...
         assert not set(A.LEAD_EVENT_TYPES) & set(work_events)                                  # ... and no overlap
-        assert set(work_events) == self.PHASE3_EVENTS | self.PHASE4_EVENTS
+        assert set(work_events) == self.PHASE3_EVENTS | self.PHASE4_EVENTS | self.WAIT_LIST_EVENTS
 
     def test_event_names_fit_the_databases_format_check(self):
         for event in {v for k, v in vars(A).items() if k.startswith("EVENT_")}:
@@ -313,6 +314,9 @@ class TestTimelineVocabularyAndVisibility:
     def test_each_kinds_events_sit_under_that_kinds_view_permission(self):
         for permission, types in A.WORK_EVENT_TYPES.items():
             kind = permission.split(".")[1]
+            if permission == P.PERM_LEADS_CHANGE_STAGE:       # the wait list: read by whoever may decide on leads (Data Entry may not)
+                assert types == self.WAIT_LIST_EVENTS
+                continue
             prefix = {"calls": "call_", "followups": "followup_", "demos": "demo_", "trials": "trial_", "customers": "lead_converted", "onboarding": "onboarding_"}[kind]
             assert permission.endswith(".view") and all(t.startswith(prefix) for t in types), permission
 

@@ -189,7 +189,7 @@ class TestListAndDetail:
         page, ids = _ids(mgr, world)
         assert page["total"] == 5 and set(ids) == {r["customer"]["id"] for r in world["rows"]}
         item = page["items"][0]
-        assert set(item) == {"id", "status", "converted_at", "converted_by", "created_at", "updated_at", "lead", "company", "onboarding", "can"}
+        assert set(item) == {"id", "status", "subscription_type", "converted_at", "converted_by", "created_at", "updated_at", "lead", "company", "onboarding", "can"}
         assert set(item["can"]) == {"view_lead", "view_onboarding"}
         second = listing(mgr, f"/api/sales/customers?q={world['token']}&limit=2&offset=2&order=asc")
         assert second["total"] == 5 and len(second["items"]) == 2 and second["limit"] == 2 and second["offset"] == 2

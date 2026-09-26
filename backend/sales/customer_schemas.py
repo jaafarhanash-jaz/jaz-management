@@ -26,7 +26,9 @@ _NOTES_MAX = 5000
 
 
 # =============================================================================
-# requests - conversion
+# requests - conversion  (RETIRED: POST /leads/{id}/convert[/preflight] answer 410; ConvertLead, ConvertResult and
+# ConversionPreflightOut below are kept for the record - no route uses them. ConversionValues and ConversionDuplicates are still
+# used by the Customer Setup's preflight.)
 # =============================================================================
 class ConversionValues(_Strict):
     """What the preflight is asked about. Everything optional: what is not given is taken from the lead (its business
@@ -128,6 +130,7 @@ class CustomerCan(BaseModel):
 class CustomerOut(BaseModel):
     id: str
     status: str
+    subscription_type: Optional[str] = None     # what the customer setup started the company on (trial | paid)
     converted_at: datetime
     converted_by: Optional[UserRef] = None
     created_at: datetime
@@ -160,8 +163,10 @@ class ConversionStatusOut(BaseModel):
     archived: bool
     converted: bool
     customer: Optional[CustomerOut] = None
-    can_convert: bool              # holds the convert permission AND the lead is won, not archived and not yet converted
-    blocker: Optional[str] = None  # why not, when the lead is not convertible: lead_not_won | lead_archived
+    can_convert: bool              # ALWAYS false: the Phase-4 conversion is retired (410) - the Customer Setup (`can_setup`) replaces it
+    blocker: Optional[str] = None  # `conversion_retired` until the lead has a customer
+    can_setup: bool = False        # the Customer Setup may start from this lead now (won, or open and assigned)
+    setup_blocker: Optional[str] = None   # lead_archived | lead_lost | lead_unassigned
 
 
 class PlanOut(BaseModel):

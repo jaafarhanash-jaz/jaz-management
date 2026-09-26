@@ -7,7 +7,7 @@ rows + one for the total, never one per customer. Lists apply the caller's LEAD 
 """
 import uuid
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from typing import List, Optional, Sequence, Tuple
 
 from sqlalchemy import func, or_, select
@@ -47,6 +47,8 @@ class CustomerRow:
     onboarding_assigned_to: Optional[uuid.UUID]
     onboarding_assignee_name: Optional[str]
     onboarding_assignee_status: Optional[str]
+    company_subscription_end_date: Optional[datetime] = None     # with the flag below: whether the period is over by now
+    company_subscription_ends_exactly: bool = False
 
 
 @dataclass
@@ -65,6 +67,7 @@ def _row_select():
             Company.name, Company.subscription_status, Company.deleted_at.is_not(None),
             _Owner.name, _Owner.email, _Owner.phone, _Converter.name,
             SalesOnboarding.id, SalesOnboarding.stage, SalesOnboarding.assigned_to, _OnboardingOwner.name, _OnboardingOwner.status,
+            Company.subscription_end_date, Company.subscription_ends_exactly,
         )
         .select_from(SalesCustomer)
         .join(SalesLead, SalesLead.id == SalesCustomer.lead_id)
@@ -85,6 +88,7 @@ def _to_row(t) -> CustomerRow:
         owner_name=t[n + 7], owner_email=t[n + 8], owner_phone=t[n + 9], converter_name=t[n + 10],
         onboarding_id=t[n + 11], onboarding_stage=t[n + 12], onboarding_assigned_to=t[n + 13], onboarding_assignee_name=t[n + 14],
         onboarding_assignee_status=t[n + 15],
+        company_subscription_end_date=t[n + 16], company_subscription_ends_exactly=bool(t[n + 17]),
     )
 
 

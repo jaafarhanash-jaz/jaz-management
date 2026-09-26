@@ -137,7 +137,10 @@ const DashboardBody = ({ data, language, showDefinitions, setShowDefinitions }) 
     if (k.key === 'conversion_rate') return hasLeadFigures;              // null with leads = "no data"; null without lead access = not shown
     return kpis[k.key] !== null && kpis[k.key] !== undefined;
   });
-  const anything = cards.length > 0 || data.pipeline || data.performance || data.sources || data.campaigns || data.activity || data.onboarding;
+  // Simplified workflow: onboarding is no longer part of the active workflow (the customer setup completes a customer), so its
+  // section is not shown; the API still returns it for a later expansion.
+  const showOnboarding = false;
+  const anything = cards.length > 0 || data.pipeline || data.performance || data.sources || data.campaigns || data.activity || (showOnboarding && data.onboarding);
 
   if (!anything) {
     return <Card className="p-10 text-center bg-white border border-gray-200 text-gray-500" data-testid="dashboard-nothing">{ts('dash_nothing', language)}</Card>;
@@ -233,7 +236,7 @@ const DashboardBody = ({ data, language, showDefinitions, setShowDefinitions }) 
         </Section>
       )}
 
-      {data.onboarding && (
+      {showOnboarding && data.onboarding && (
         <Section id="onboarding" title={ts('sec_onboarding', language)} hint={ts('def_onboarding', language)} language={language}>
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-5">
             <Figure id="onb-active" value={data.onboarding.active} label={ts('rc_active', language)} basis="now" language={language} />

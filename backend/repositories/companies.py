@@ -67,9 +67,11 @@ async def update_working_hours(db: AsyncSession, company_id, working_days, start
 
 
 async def activate_subscription(db: AsyncSession, company_id, plan_id, end_date) -> None:
+    # A paid activation runs to a calendar date: a trial's exact end (subscription_ends_exactly) no longer applies.
     await db.execute(
         update(Company).where(Company.id == company_id).values(
             subscription_status="active", subscription_plan_id=plan_id, subscription_end_date=end_date,
+            subscription_ends_exactly=False,
         )
     )
 

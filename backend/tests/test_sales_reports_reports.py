@@ -5,6 +5,7 @@ test_sales_reports_onboarding.py): the filters, pagination, aggregation correctn
 from the Python oracle over the dataset the fixture created (sales_reports_test_utils.py), never from the code under test.
 WHO may open which report is in test_sales_reports_rbac.py.
 """
+import time
 from datetime import date, timedelta
 
 import pytest
@@ -254,12 +255,20 @@ def _find_row(headers, person_id, **params):
             return None, page["total"]
 
 
+def _first_by_name(label: str) -> str:
+    """A staff label whose account name sorts BEFORE every other name in the shared scratch database. The idle list is the first
+    MAX_GROUPS (5000) assignable staff BY NAME, and thousands of test accounts pile up across runs: a fixed label such as "rr-idle"
+    sorts among them and is cut off once enough of them sort before it. A leading digit sorts before every lettered name, and the
+    number that follows shrinks as time passes, so it also sorts before the same label of every earlier run."""
+    return f"0{10 ** 13 - int(time.time() * 1000):013d}-{label}"
+
+
 class TestIdleEmployeesAreListed:
     """A manager comparing employees must see the one who did nothing, not have them silently missing. The names come from the
     assignment picker's rule (sales.leads.assign): a team caller without that privilege gets no extra names."""
 
     def test_an_employee_with_nothing_to_report_is_a_zero_row_for_a_manager(self, admin_h, world, m):
-        idle = create_staff(admin_h, ["sales_employee"], "rr-idle")
+        idle = create_staff(admin_h, ["sales_employee"], _first_by_name("rr-idle"))       # always inside the capped list (see _first_by_name)
         w = window_params(world.window)
         for who, headers in (("manager", m), ("super admin", admin_h)):
             row, total = _find_row(headers, idle["id"], **w)
@@ -279,8 +288,10 @@ class TestIdleEmployeesAreListed:
     def test_staff_who_cannot_receive_leads_are_not_listed(self, admin_h, world, m):
         """The list is the assignment picker's people: a Lead Data Entry or Onboarding account is nobody's "employee with no leads"."""
         w = window_params(world.window)
-        for role in ("lead_data_entry", "onboarding_employee"):
-            other = create_staff(admin_h, [role], f"rr-not-{role[:4]}")
+        from sales_customer_test_utils import onboarding_worker
+        others = {"lead_data_entry": create_staff(admin_h, ["lead_data_entry"], "rr-not-lead"),
+                  "onboarding": onboarding_worker(admin_h, "rr-not-onbo")}          # the (retired) onboarding keys, via a custom role
+        for role, other in others.items():
             for headers in (m, admin_h):
                 assert _find_row(headers, other["id"], **w)[0] is None, role
 

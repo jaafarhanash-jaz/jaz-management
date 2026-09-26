@@ -17,6 +17,7 @@ from services.auth import (
     SUBSCRIPTION_SUSPENDED,
     hash_password,
     resolve_subscription_status,
+    subscription_has_ended,
     validate_password_strength,
 )
 
@@ -345,7 +346,10 @@ async def update_company(db: AsyncSession, company_id: str, updates) -> dict:
     return {"message": "Company updated successfully"}
 
 
-async def activate_subscription(db: AsyncSession, company_id: str, data) -> dict:
+async def activate_subscription(db: AsyncSession, company_id: str, data, *, exact: bool = False) -> dict:
+    """Active from start to end. exact=False (the Super Admin's screen): calendar dates - the end day is included.
+    exact=True (a Sales trial): the end is an exact instant and the subscription ends at that moment
+    (services/auth.py::subscription_has_ended)."""
     company = await companies_repo.get_by_id(db, parse_uuid(company_id)) if parse_uuid(company_id) else None
     if not company:
         raise HTTPException(status_code=404, detail="Company not found")
@@ -362,6 +366,7 @@ async def activate_subscription(db: AsyncSession, company_id: str, data) -> dict
     company.subscription_status = SUBSCRIPTION_ACTIVE
     company.subscription_start_date = start
     company.subscription_end_date = end
+    company.subscription_ends_exactly = exact
     await db.flush()
     return {"message": "Subscription activated successfully"}
 
@@ -383,7 +388,7 @@ async def reactivate_subscription(db: AsyncSession, company_id: str) -> dict:
     if company.subscription_status != SUBSCRIPTION_SUSPENDED:
         raise HTTPException(status_code=400, detail="Company is not suspended")
 
-    if company.subscription_end_date and company.subscription_end_date.date() < datetime.now(timezone.utc).date():
+    if subscription_has_ended(company):
         raise HTTPException(
             status_code=400,
             detail="Subscription has expired and must be renewed by updating the subscription dates first",
@@ -419,6 +424,7 @@ async def renew_subscription(db: AsyncSession, company_id: str, data) -> dict:
         setattr(company, field, value)
     company.subscription_status = SUBSCRIPTION_ACTIVE
     company.subscription_end_date = new_end
+    company.subscription_ends_exactly = False      # a renewal runs to a calendar date (a trial's exact end no longer applies)
     await db.flush()
     return {"message": "Subscription renewed successfully"}
 

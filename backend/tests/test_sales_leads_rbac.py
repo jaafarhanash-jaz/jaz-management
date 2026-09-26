@@ -147,26 +147,45 @@ class TestMutationsStayInsideTheScope:
             assert api(method, path, h, body).status_code == 403, path
         assert get_lead(H(p, "manager"), target) == before
 
-    def test_data_entry_cannot_touch_a_lead_assigned_to_an_employee_unless_they_created_it(self, p, world):
+    def test_data_entry_cannot_touch_a_lead_assigned_to_an_employee_even_one_they_created(self, p, world):
         # L2 was created by the manager and assigned to employee: outside data_entry's scope
         assert api("PATCH", f"/api/sales/leads/{world['leads']['L2']}", H(p, "data_entry"), {"priority": "high"}).status_code == 403
-        # L6 was created by data_entry2 and is assigned to employee: still theirs to correct
+        # L6 was created by data_entry2 and is assigned to employee: it is the salesperson's now - visible to its creator, no longer theirs to correct
+        before = get_lead(H(p, "manager"), world["leads"]["L6"])
+        seen = api("GET", f"/api/sales/leads/{world['leads']['L6']}", H(p, "data_entry2"))
+        assert seen.status_code == 200 and seen.json()["can"]["update"] is False and seen.json()["can"]["edit_locked"] is True
         r = api("PATCH", f"/api/sales/leads/{world['leads']['L6']}", H(p, "data_entry2"), {"notes": "typo fixed"})
-        assert r.status_code == 200 and r.json()["notes"] == "typo fixed"
-        # ...but data_entry (not the creator) cannot
+        assert r.status_code == 403 and r.json()["detail"]["code"] == "lead_edit_window"
+        # ...and data_entry (not the creator) cannot either
         assert api("PATCH", f"/api/sales/leads/{world['leads']['L6']}", H(p, "data_entry"), {"notes": "hijack"}).status_code == 403
+        assert get_lead(H(p, "manager"), world["leads"]["L6"]) == before
 
-    def test_data_entry_can_manage_unassigned_leads_even_when_created_by_someone_else(self, p, world):
-        r = api("PATCH", f"/api/sales/leads/{world['leads']['L1']}", H(p, "data_entry"), {"contact_name": "Corrected by intake"})
-        assert r.status_code == 200 and r.json()["contact_name"] == "Corrected by intake"
+    def test_data_entry_sees_unassigned_leads_created_by_someone_else_but_cannot_change_them(self, p, world):
+        # Simplified workflow: the intake scope still SEES the unassigned pool, but changes only the caller's own latest leads.
+        target = world["leads"]["L1"]                                              # manager-created, unassigned
+        before = get_lead(H(p, "manager"), target)
+        seen = api("GET", f"/api/sales/leads/{target}", H(p, "data_entry"))
+        assert seen.status_code == 200 and seen.json()["can"]["update"] is False and seen.json()["can"]["edit_locked"] is True
+        r = api("PATCH", f"/api/sales/leads/{target}", H(p, "data_entry"), {"contact_name": "Corrected by intake"})
+        assert r.status_code == 403 and r.json()["detail"]["code"] == "lead_edit_window"
+        assert api("DELETE", f"/api/sales/leads/{target}", H(p, "data_entry")).status_code == 403
+        assert get_lead(H(p, "manager"), target) == before
 
-    def test_once_assigned_the_lead_leaves_an_intake_users_scope_unless_they_created_it(self, p, admin_h):
+    def test_once_assigned_the_lead_leaves_an_intake_users_scope_unless_they_created_it_and_then_it_is_read_only(self, p, admin_h):
         manager = H(p, "manager")
-        lead = create_lead(manager)                                                # manager-created, unassigned: intake can work it
-        assert api("PATCH", f"/api/sales/leads/{lead['id']}", H(p, "data_entry"), {"notes": "before"}).status_code == 200
+        lead = create_lead(manager)                                                # manager-created, unassigned: intake sees it
+        assert api("GET", f"/api/sales/leads/{lead['id']}", H(p, "data_entry")).status_code == 200
         assign(manager, lead["id"], p["employee"]["id"])
         assert api("PATCH", f"/api/sales/leads/{lead['id']}", H(p, "data_entry"), {"notes": "after"}).status_code == 403
         assert api("GET", f"/api/sales/leads/{lead['id']}", H(p, "data_entry")).status_code == 403
+        own = create_lead(H(p, "data_entry"))                                      # their own creation: theirs to correct while it is unassigned ...
+        assert api("PATCH", f"/api/sales/leads/{own['id']}", H(p, "data_entry"), {"notes": "fixed"}).status_code == 200
+        assign(manager, own["id"], p["employee"]["id"])                            # ... until a salesperson holds it: still visible, no longer changeable
+        assert api("GET", f"/api/sales/leads/{own['id']}", H(p, "data_entry")).status_code == 200
+        r = api("PATCH", f"/api/sales/leads/{own['id']}", H(p, "data_entry"), {"notes": "too late"})
+        assert r.status_code == 403 and r.json()["detail"]["code"] == "lead_edit_window"
+        assert api("DELETE", f"/api/sales/leads/{own['id']}", H(p, "data_entry")).status_code == 403
+        assert get_lead(manager, own["id"])["notes"] == "fixed"
 
     def test_a_reassignment_moves_the_lead_out_of_the_old_owners_scope(self, p, admin_h):
         manager = H(p, "manager")
@@ -221,8 +240,10 @@ ENDPOINTS = {
     "leads.assign":              ("POST", "/leads/{lead}/assign", {"admin", "manager"}),
     "leads.unassign":            ("POST", "/leads/{lead}/unassign", {"admin", "manager"}),
     "leads.bulk_assign":         ("POST", "/leads/bulk-assign", {"admin", "manager"}),
-    "leads.archive":             ("DELETE", "/leads/{lead}", {"admin", "manager"}),
-    "leads.restore":             ("POST", "/leads/{lead}/restore", {"admin", "manager"}),
+    # simplified workflow: Lead Data Entry archives / restores its own latest leads (the window: test_sales_workflow.py)
+    "leads.archive":             ("DELETE", "/leads/{lead}", {"admin", "manager", "data_entry"}),
+    "leads.restore":             ("POST", "/leads/{lead}/restore", {"admin", "manager", "data_entry"}),
+    "leads.export":              ("GET", "/leads/export", {"admin", "manager"}),
 }
 
 
@@ -242,6 +263,8 @@ def _request_for(p, admin_h, campaign_id, who, name):
     method, template, _ = ENDPOINTS[name]
     lead = _lead_in_scope_for(p, who)
     path = "/api/sales" + template.format(lead=lead, campaign=campaign_id)
+    if name == "leads.export":
+        path += f"?format=xlsx&lang=en&campaign_id={campaign_id}"
     body = {
         "campaigns.create": {"name": f"Matrix {uniq()}"},
         "campaigns.update": {"description": "matrix"},
@@ -275,7 +298,9 @@ class TestActionPermissionMatrix:
         routes = {(m, r.path.removeprefix("/api/sales")) for r in app.routes if getattr(r, "path", "").startswith("/api/sales/")
                   for m in r.methods if m not in ("HEAD", "OPTIONS")}
         phase2 = {(m, path) for m, path in routes if path.split("/")[1] in ("sources", "assignees", "campaigns", "leads")
-                  and not path.startswith(("/leads/{lead_id}/convert", "/leads/{lead_id}/conversion"))}   # those are Phase 4's (test_sales_customers_rbac)
+                  and not path.startswith(("/leads/{lead_id}/convert", "/leads/{lead_id}/conversion",   # Phase 4's (test_sales_customers_rbac)
+                                           "/leads/{lead_id}/setup",                               # the Customer Setup's (test_sales_workflow)
+                                           "/leads/{lead_id}/wait-list"))}                         # the owner's wait list (test_sales_batches)
         covered = {(m, t.replace("{lead}", "{lead_id}").replace("{campaign}", "{campaign_id}")) for m, t, _ in ENDPOINTS.values()}
         assert phase2 == covered, f"uncovered: {phase2 - covered}; stale: {covered - phase2}"
 

@@ -9,6 +9,16 @@ A lead outside the caller's scope answers 403 "Access denied"; an unknown or mal
 Every state change runs under a row lock on the lead (read -> validate -> write -> record its timeline event in
 one transaction), so concurrent operations on a lead are applied one after another and the before/after values
 in the timeline are always true.
+
+Simplified workflow: CHANGING a lead (edit, archive, restore) additionally passes the edit window
+(lead_access.may_modify - through the intake scope only the caller's own latest RECENT_EDIT_WINDOW leads, and only while
+they are still unassigned; 403 `lead_edit_window` otherwise), and a lead created without a chosen owner is handed to the
+next person in the round-robin when automatic distribution is on (services/distribution.py).
+
+Batches (f2b6d8a1c4e9, services/batches.py - internal bookkeeping for the Sales Manager, invisible in every response here):
+a lead Data Entry creates takes the next slot of the open Data Batch; winning / losing a lead records its owner's attempt
+(accepted / rejected); the new wait-list action records a pending one; a lead leaving its owner (reassigned, unassigned,
+archived) releases a pending wait-list attempt. None of it changes what these operations do or return.
 """
 import logging
 import uuid
@@ -24,6 +34,9 @@ from sales import permissions as perms
 from sales.constants import (
     AUTO_STAGE_ON_ASSIGN,
     AUTO_STAGE_ON_UNASSIGN,
+    CLOSED_STAGES,
+    OPEN_STAGES,
+    RECENT_EDIT_WINDOW,
     STAGE_ASSIGNED,
     STAGE_LOST,
     STAGE_NEW,
@@ -36,11 +49,13 @@ from sales.repositories import campaigns as campaigns_repo
 from sales.repositories import leads as leads_repo
 from sales.repositories.leads import LeadFilters, LeadRow
 from sales.services import activity as activity_service
+from sales.services import batches as batches_service
+from sales.services import distribution as distribution_service
 from sales.services import duplicates as duplicates_service
 from sales.services.access import StaffContext
 from sales.services.audit import AuditContext
 from sales.services.common import access_denied, field_error
-from sales.services.lead_access import can_see, lead_visibility
+from sales.services.lead_access import can_see, lead_visibility, may_modify, needs_recent_leads
 from sales.services.normalize import norm_text
 from services.admin import parse_uuid
 from services.identifiers import phone_error
@@ -78,13 +93,18 @@ _SUMMARY_COLUMNS = (
 )
 
 
-def lead_out(row: LeadRow, ctx: StaffContext, *, detail: bool) -> dict:
+def lead_out(row: LeadRow, ctx: StaffContext, *, detail: bool, recent_ids: frozenset = frozenset()) -> dict:
     """The API shape of a lead. Explicit field list - the normalized duplicate columns never leave the server.
     `allowed_stages` and `can` are what THIS caller may do to THIS lead right now; the UI mirrors them, and the
-    endpoints enforce the same rules regardless."""
+    endpoints enforce the same rules regardless. `recent_ids`: the caller's latest created leads (the edit window -
+    only needed when lead_access.needs_recent_leads(ctx))."""
     lead = row.lead
     archived = lead.archived_at is not None
     can_stage = ctx.has(perms.PERM_LEADS_CHANGE_STAGE) and not archived
+    # the wait list is the salesperson's own tool: only callers who decide on leads see or use it
+    wait_listed_at = row.wait_listed_at if ctx.has(perms.PERM_LEADS_CHANGE_STAGE) else None
+    modifiable = may_modify(ctx, lead_id=lead.id, created_by=lead.created_by, assigned_to=lead.assigned_to, recent_ids=recent_ids)
+    holds_change = ctx.has(perms.PERM_LEADS_UPDATE) or ctx.has(perms.PERM_LEADS_DELETE)
     out: Dict[str, Any] = {
         "id": str(lead.id),
         **{column: getattr(lead, column) for column in _SUMMARY_COLUMNS},
@@ -96,12 +116,17 @@ def lead_out(row: LeadRow, ctx: StaffContext, *, detail: bool) -> dict:
         "created_by": _ref(lead.created_by, row.creator_name),
         "allowed_stages": list(allowed_stages(lead.pipeline_stage, has_assignee=lead.assigned_to is not None)) if can_stage else [],
         "can": {
-            "update": ctx.has(perms.PERM_LEADS_UPDATE) and not archived,
+            "update": ctx.has(perms.PERM_LEADS_UPDATE) and not archived and modifiable,
             "change_stage": can_stage,
             "assign": ctx.has(perms.PERM_LEADS_ASSIGN) and not archived,
-            "archive": ctx.has(perms.PERM_LEADS_DELETE) and not archived,
-            "restore": ctx.has(perms.PERM_LEADS_DELETE) and archived,
+            "archive": ctx.has(perms.PERM_LEADS_DELETE) and not archived and modifiable,
+            "restore": ctx.has(perms.PERM_LEADS_DELETE) and archived and modifiable,
+            # the caller could change leads, but not THIS one any more (outside their edit window): a Sales Manager can
+            "edit_locked": holds_change and not modifiable,
+            "wait_list": can_stage and lead.assigned_to == ctx.user_id and lead.pipeline_stage not in CLOSED_STAGES
+            and row.wait_listed_at is None,
         },
+        "wait_listed_at": wait_listed_at,
     }
     if detail:
         out["description"] = lead.description
@@ -109,9 +134,16 @@ def lead_out(row: LeadRow, ctx: StaffContext, *, detail: bool) -> dict:
     return out
 
 
+async def _recent_ids(db: AsyncSession, ctx: StaffContext) -> frozenset:
+    """The caller's latest created lead ids - read only for a caller whose edit window depends on them."""
+    if not needs_recent_leads(ctx):
+        return frozenset()
+    return await leads_repo.recent_created_ids(db, ctx.user_id, RECENT_EDIT_WINDOW)
+
+
 async def _detail(db: AsyncSession, ctx: StaffContext, lead_id: uuid.UUID) -> dict:
     row = await leads_repo.get_row(db, lead_id)
-    return lead_out(row, ctx, detail=True)
+    return lead_out(row, ctx, detail=True, recent_ids=await _recent_ids(db, ctx))
 
 
 # ---- loading and guards ------------------------------------------------------------------------------------
@@ -128,6 +160,19 @@ async def _load_for_update(db: AsyncSession, ctx: StaffContext, lead_id: str) ->
     if not can_see(ctx, created_by=lead.created_by, assigned_to=lead.assigned_to):
         raise access_denied()
     return lead
+
+
+async def _ensure_may_modify(db: AsyncSession, ctx: StaffContext, lead: SalesLead) -> None:
+    """The edit window (lead_access.may_modify): 403 `lead_edit_window` for a lead the caller sees but may not change - one
+    outside their latest RECENT_EDIT_WINDOW, or (through the intake scope) one that has been handed to Sales."""
+    recent = await _recent_ids(db, ctx)
+    if not may_modify(ctx, lead_id=lead.id, created_by=lead.created_by, assigned_to=lead.assigned_to, recent_ids=recent):
+        raise field_error(
+            "lead",
+            f"You can edit or archive only your {RECENT_EDIT_WINDOW} most recent leads, and only while they are unassigned. "
+            "Ask a Sales Manager to change this lead.",
+            403, code="lead_edit_window",
+        )
 
 
 def _ensure_active(lead: SalesLead) -> None:
@@ -202,7 +247,8 @@ async def list_leads(
     rows, total = await leads_repo.list_leads(
         db, visibility=lead_visibility(ctx), filters=filters, sort=sort, descending=descending, limit=limit, offset=offset
     )
-    return {"items": [lead_out(row, ctx, detail=False) for row in rows], "total": total, "limit": limit, "offset": offset}
+    recent = await _recent_ids(db, ctx)
+    return {"items": [lead_out(row, ctx, detail=False, recent_ids=recent) for row in rows], "total": total, "limit": limit, "offset": offset}
 
 
 async def stage_counts(db: AsyncSession, ctx: StaffContext, filters: LeadFilters) -> dict:
@@ -217,7 +263,21 @@ async def get_lead(db: AsyncSession, ctx: StaffContext, lead_id: str) -> dict:
         raise _not_found()
     if not can_see(ctx, created_by=row.lead.created_by, assigned_to=row.lead.assigned_to):
         raise access_denied()
-    return lead_out(row, ctx, detail=True)
+    return lead_out(row, ctx, detail=True, recent_ids=await _recent_ids(db, ctx))
+
+
+# The leads waiting in a salesperson's queue: owned and still open (a won / lost lead has been decided).
+QUEUE_STAGES = tuple(stage for stage in OPEN_STAGES if stage != STAGE_NEW)
+
+
+async def my_queue(db: AsyncSession, ctx: StaffContext, position: int) -> dict:
+    """The Sales Employee's primary workflow: one of THEIR open assigned leads at a time, the longest-waiting first. Only
+    ever the caller's own leads (assigned to them AND within their lead scope) - there is no way to ask for anybody else's."""
+    row, position, total = await leads_repo.queue_row(
+        db, visibility=lead_visibility(ctx), user_id=ctx.user_id, stages=QUEUE_STAGES, position=position,
+    )
+    lead = lead_out(row, ctx, detail=True, recent_ids=await _recent_ids(db, ctx)) if row is not None else None
+    return {"lead": lead, "position": position, "total": total}
 
 
 async def list_activities(db: AsyncSession, ctx: StaffContext, lead_id: str, limit: int, offset: int) -> dict:
@@ -264,12 +324,21 @@ async def create_lead(db: AsyncSession, ctx: StaffContext, body, audit: AuditCon
     keys = duplicates_service.Keys.of(**{k: values[k] for k in ("business_name", "city", "phone", "whatsapp", "email", "website")})
     override = await duplicates_service.enforce(db, ctx, keys, confirm=body.confirm_duplicates)
 
+    # Nobody chosen: automatic distribution (when the Sales Manager switched it on) gives the lead the next person's turn.
+    automatic = False
+    if assignee is None:
+        assignee = await distribution_service.pick_assignee(db)
+        automatic = assignee is not None
+
     lead = SalesLead(id=uuid.uuid4(), created_by=ctx.user_id, pipeline_stage=STAGE_NEW)
     leads_repo.apply_fields(lead, values)
     if assignee is not None:
         lead.assigned_to = assignee.id
         lead.assigned_at = func.clock_timestamp()
         lead.pipeline_stage = STAGE_ASSIGNED
+    if batches_service.enters_data_batch(ctx):
+        # Data Entry's lead takes the next slot of the open Data Batch - bookkeeping only: it is handed out right now regardless
+        lead.data_batch_id = await batches_service.take_data_batch_slot(db)
     try:
         async with db.begin_nested():  # savepoint: a lost race must not poison the outer transaction
             db.add(lead)
@@ -288,9 +357,9 @@ async def create_lead(db: AsyncSession, ctx: StaffContext, body, audit: AuditCon
         await activity_service.record(
             db, ctx, audit, lead.id, activity_service.EVENT_LEAD_ASSIGNED,
             before={"assigned_to": None}, after={"assigned_to": _person(assignee)},
-            metadata={"at_creation": True},
+            metadata={"at_creation": True, **({"automatic": True, "cause": "auto_distribution"} if automatic else {})},
         )
-    logger.info("lead_created actor=%s lead=%s assigned=%s", ctx.user_id, lead.id, assignee is not None)
+    logger.info("lead_created actor=%s lead=%s assigned=%s automatic=%s", ctx.user_id, lead.id, assignee is not None, automatic)
     return await _detail(db, ctx, lead.id)
 
 
@@ -304,6 +373,7 @@ def _differs(current: Any, new: Any) -> bool:
 
 async def update_lead(db: AsyncSession, ctx: StaffContext, lead_id: str, body, audit: AuditContext) -> dict:
     lead = await _load_for_update(db, ctx, lead_id)
+    await _ensure_may_modify(db, ctx, lead)
     _ensure_active(lead)
 
     values = body.model_dump(exclude_unset=True, exclude={"confirm_duplicates"})
@@ -365,6 +435,7 @@ async def archive_lead(db: AsyncSession, ctx: StaffContext, lead_id: str, audit:
     """The application's 'delete': the lead is hidden from listings but nothing is removed, and its whole history
     stays. Idempotent."""
     lead = await _load_for_update(db, ctx, lead_id)
+    await _ensure_may_modify(db, ctx, lead)
     changed = lead.archived_at is None
     if changed:
         lead.archived_at = func.clock_timestamp()
@@ -373,12 +444,14 @@ async def archive_lead(db: AsyncSession, ctx: StaffContext, lead_id: str, audit:
         await activity_service.record(
             db, ctx, audit, lead.id, activity_service.EVENT_LEAD_ARCHIVED, before={"archived": False}, after={"archived": True}
         )
+        await batches_service.lead_left_owner(db, lead.id)
         logger.info("lead_archived actor=%s lead=%s", ctx.user_id, lead.id)
     return {"changed": changed, "lead": await _detail(db, ctx, lead.id)}
 
 
 async def restore_lead(db: AsyncSession, ctx: StaffContext, lead_id: str, audit: AuditContext) -> dict:
     lead = await _load_for_update(db, ctx, lead_id)
+    await _ensure_may_modify(db, ctx, lead)
     changed = lead.archived_at is not None
     if changed:
         lead.archived_at = None
@@ -422,6 +495,8 @@ async def _apply_assignment(
             before={"pipeline_stage": old_stage}, after={"pipeline_stage": new_stage},
             metadata={"automatic": True, "cause": "assignment"},
         )
+    if previous is not None:
+        await batches_service.lead_left_owner(db, lead.id)
     logger.info("lead_assigned actor=%s lead=%s assignee=%s previous=%s", ctx.user_id, lead.id, assignee.id,
                 previous.id if previous is not None else None)
     return True
@@ -459,6 +534,7 @@ async def unassign_lead(db: AsyncSession, ctx: StaffContext, lead_id: str, audit
                 before={"pipeline_stage": old_stage}, after={"pipeline_stage": new_stage},
                 metadata={"automatic": True, "cause": "unassignment"},
             )
+        await batches_service.lead_left_owner(db, lead.id)
         logger.info("lead_unassigned actor=%s lead=%s previous=%s", ctx.user_id, lead.id, previous.id if previous else None)
     return {"changed": changed, "lead": await _detail(db, ctx, lead.id)}
 
@@ -482,6 +558,9 @@ async def bulk_assign(
     if archived:
         raise field_error("lead_ids", "Archived leads cannot be assigned", 409, code="lead_archived", archived=archived)
     assignee = await _require_assignee(db, assignee_id)
+    # the open batch attempts these leads belong to, locked now in id order - the per-lead wait-list releases below re-take them in
+    # whatever order the leads come, which would otherwise let two bulk operations lock the same two in opposite orders
+    await batches_service.lock_open_attempts_of(db, [lead.id for lead in leads])
 
     changed = 0
     for lead in leads:  # id order, the order they were locked in
@@ -494,9 +573,18 @@ async def bulk_assign(
 
 async def change_stage(db: AsyncSession, ctx: StaffContext, lead_id: str, body, audit: AuditContext) -> dict:
     """Move a lead along the pipeline. The transition rules live in sales/constants.py (transition_error) and are
-    the ONLY authority: the UI merely mirrors `allowed_stages`. Won and lost are explicit, validated states;
-    lost always carries a reason; every change is recorded with who, when and before/after."""
+    the ONLY authority: the UI merely mirrors `allowed_stages`. Lost is an explicit, validated state that always carries a reason;
+    every change is recorded with who, when and before/after.
+    `won` is NOT a manual move for anybody - Sales Employee, Sales Manager or Super Admin: a lead is won only by the Customer Setup
+    (services/customer_setup.py), in the same transaction that creates its customer, company and subscription. Asking for it here is
+    refused - 403 `won_requires_customer_setup`, whoever asks - and nothing is written."""
     lead = await _load_for_update(db, ctx, lead_id)
+    if body.stage == STAGE_WON:
+        raise field_error(
+            "stage",
+            "A lead is won only through the Customer Setup (\"Agreed\"), which also creates the customer. It cannot be moved to won by hand.",
+            403, code="won_requires_customer_setup",
+        )
     _ensure_active(lead)
 
     old_stage, old_reason = lead.pipeline_stage, lead.lost_reason
@@ -511,7 +599,7 @@ async def change_stage(db: AsyncSession, ctx: StaffContext, lead_id: str, body, 
 
     lead.pipeline_stage = target
     lead.lost_reason = body.lost_reason if target == STAGE_LOST else None
-    lead.closed_at = func.clock_timestamp() if target in (STAGE_WON, STAGE_LOST) else None
+    lead.closed_at = func.clock_timestamp() if target == STAGE_LOST else None
     await db.flush()
 
     await activity_service.record(
@@ -521,16 +609,30 @@ async def change_stage(db: AsyncSession, ctx: StaffContext, lead_id: str, body, 
         note=body.note,
         metadata={"reopened": True} if old_stage == STAGE_LOST else None,
     )
-    if target == STAGE_WON:
-        await activity_service.record(
-            db, ctx, audit, lead.id, activity_service.EVENT_LEAD_MARKED_WON,
-            before={"pipeline_stage": old_stage}, after={"pipeline_stage": STAGE_WON}, note=body.note,
-        )
-    elif target == STAGE_LOST:
+    if target == STAGE_LOST:
         await activity_service.record(
             db, ctx, audit, lead.id, activity_service.EVENT_LEAD_MARKED_LOST,
             before={"pipeline_stage": old_stage}, after={"pipeline_stage": STAGE_LOST, "lost_reason": body.lost_reason},
             note=body.note,
         )
+        await batches_service.record_decision(db, ctx, lead, batches_service.OUTCOME_REJECTED)
     logger.info("lead_stage_changed actor=%s lead=%s from=%s to=%s", ctx.user_id, lead.id, old_stage, target)
     return await _detail(db, ctx, lead.id)
+
+
+# ---- the wait list (f2b6d8a1c4e9) ---------------------------------------------------------------------------
+
+async def wait_list_lead(db: AsyncSession, ctx: StaffContext, lead_id: str, audit: AuditContext) -> dict:
+    """The salesperson's "Wait List": the lead stays theirs, in its stage, and moves to the end of their queue - a timestamp and a
+    pending status, nothing else. It ends when the lead is won or lost (or leaves them). Idempotent: the first timestamp stands.
+    It is the OWNER's own tool: nobody else - a manager included - puts somebody's lead on their wait list (403); an unassigned,
+    won, lost or archived lead cannot wait."""
+    lead = await _load_for_update(db, ctx, lead_id)
+    if lead.assigned_to != ctx.user_id:
+        raise access_denied()
+    _ensure_active(lead)
+    if lead.pipeline_stage in CLOSED_STAGES:
+        raise field_error("lead", "A won or lost lead cannot go on the wait list", 409, code="lead_closed")
+    changed = await batches_service.wait_list(db, ctx, audit, lead)
+    logger.info("lead_wait_listed actor=%s lead=%s changed=%s", ctx.user_id, lead.id, changed)
+    return {"changed": changed, "lead": await _detail(db, ctx, lead.id)}

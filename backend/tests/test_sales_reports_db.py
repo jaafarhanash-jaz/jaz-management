@@ -354,8 +354,8 @@ class TestMigrationState:
         from pathlib import Path
 
         head = ScriptDirectory.from_config(Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))).get_heads()
-        assert head == ["b6d1f3a8c294"]
-        assert self._q("select version_num from alembic_version") == [("b6d1f3a8c294",)]
+        assert head == ["f2b6d8a1c4e9"]                                  # the simplified workflow's and the batches' revisions, chained after Phase 5
+        assert self._q("select version_num from alembic_version") == [("f2b6d8a1c4e9",)]
 
     def test_the_catalog_and_the_grants_are_exactly_the_approved_ones(self):
         assert {k for (k,) in self._q("select key from staff_permissions")} == ALL_PERMISSION_KEYS
@@ -389,4 +389,8 @@ class TestMigrationState:
             "staff_permissions", "staff_roles", "staff_role_permissions", "staff_user_roles", "staff_audit_events",
             "sales_lead_sources", "sales_campaigns", "sales_leads", "sales_lead_activities",
             "sales_calls", "sales_followups", "sales_demos", "sales_trials", "sales_customers", "sales_onboarding",
+            "sales_settings",                                            # the simplified workflow's (a3f8c2d7e915), not Phase 5's
+            # the batches' (f2b6d8a1c4e9), not Phase 5's
+            "sales_master_batches", "sales_data_batches", "sales_work_batches", "sales_batch_attempts", "sales_batch_attempt_leads",
+            "sales_lead_attempts", "sales_work_sessions",
         }

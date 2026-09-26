@@ -28,7 +28,8 @@ const EMPTY = { business_name: '', owner_name: '', owner_email: '', owner_phone:
 
 const KIND_STYLES = { exact: 'bg-red-100 text-red-800 border-red-200', possible: 'bg-amber-100 text-amber-900 border-amber-200' };
 
-const CompanyMatches = ({ duplicates, language }) => (
+// Also used by the Customer Setup wizard (CustomerSetupWizard.js).
+export const CompanyMatches = ({ duplicates, language }) => (
   <ul className="mt-2 space-y-2" data-testid="conv-duplicate-list">
     {duplicates.companies.map((company) => (
       <li key={company.id} className="rounded-md bg-white/70 border border-gray-200 p-2.5" data-testid={`conv-duplicate-${company.id}`}>

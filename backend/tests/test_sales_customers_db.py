@@ -1,10 +1,11 @@
-"""JAZ Sales - Phase 4: customers, onboarding and conversion at the DATABASE level.
+"""JAZ Sales - Phase 4: customers, onboarding and the Customer Setup at the DATABASE level.
 
 Three things live in the schema and are checked here directly, not through the API: the constraints that make bad states
 unrepresentable (one customer per lead and per company, an owner exactly when an onboarding has left `won`, a completion
-time exactly while it is `activated`, RESTRICT foreign keys), the atomicity of every write (company, owner account,
-customer, onboarding and timeline event commit or roll back together - proved by making the timeline / audit writer fail
-under the REAL request transaction), and the queries themselves (constant statement counts, row locks, scope predicates).
+time exactly while it is `activated`, RESTRICT foreign keys), the atomicity of every write (the lead's win, company, owner
+account, customer and timeline event commit or roll back together - proved by making the timeline / audit writer fail under
+the REAL request transaction; the Customer Setup replaced the retired Phase-4 conversion, which no longer writes anything),
+and the queries themselves (constant statement counts, row locks, scope predicates).
 Direct-DB helpers create rows only in the disposable scratch database (sales_test_utils.assert_scratch_target).
 """
 from sales_test_utils import assert_scratch_target
@@ -34,6 +35,7 @@ from sales.models import (
     SalesCustomer,
     SalesLead,
     SalesLeadActivity,
+    SalesLeadAttempt,
     SalesOnboarding,
     StaffAuditEvent,
     StaffRole,
@@ -46,12 +48,13 @@ from sales.repositories.customers import CustomerFilters
 from sales.repositories.onboarding import OnboardingFilters
 from sales.services import activity as activity_service
 from sales.services import audit as audit_service
-from sales.services import conversion as conversion_service
+from sales.services import customer_setup as customer_setup_service
 from sales.services import customers as customers_service
 from sales.services import onboarding as onboarding_service
 from sales.services.access import StaffContext
 from sales.services.lead_access import lead_visibility
 from sales.services.onboarding_access import can_see_onboarding, onboarding_visibility
+from sales.setup_schemas import CustomerSetup
 
 TABLES = (SalesCustomer, SalesOnboarding)
 MANAGER_KEYS = [
@@ -123,13 +126,15 @@ async def _plan_id(db) -> uuid.UUID:
     return plan.id
 
 
-async def _body(db, lead, **kw) -> S.ConvertLead:
+async def _body(db, lead, **kw) -> CustomerSetup:
+    """A valid Customer Setup request (a trial) whose owner email / phone are unique."""
     values = dict(
         business_name=lead.business_name, owner_name="Owner", owner_email=f"owner-{uuid.uuid4().hex[:10]}@p4db.example.com",
         owner_phone=f"+1888{random.randint(1000000, 9999999)}", owner_password="Owner#Pass-2026", subscription_plan_id=await _plan_id(db),
+        subscription_type="trial",
     )
     values.update(kw)
-    return S.ConvertLead(**values)
+    return CustomerSetup(**values)
 
 
 async def _company(db) -> Company:
@@ -501,7 +506,7 @@ class TestAtomicity:
             manager, ctx, _ = await _staff(db, MANAGER_KEYS)
             worker, _, _ = await _staff(db, WORKER_KEYS)
             other, _, _ = await _staff(db, WORKER_KEYS)
-            lead = _lead(manager.id, won=True)                                                              # for the conversion
+            lead = _lead(manager.id, pipeline_stage="assigned", assigned_to=manager.id, assigned_at=now())   # for the Customer Setup: OPEN, so its "Agreed" wins it
             db.add(lead)
             made = await _customer(db, manager, worker=worker, stage="assigned")                            # for the onboarding operations
             unowned = await _customer(db, manager)
@@ -516,7 +521,8 @@ class TestAtomicity:
     async def _fingerprint(w):
         """Everything this test's world can change, and only that (other test workers create companies and users at the
         same time, so nothing global is compared): the customer / onboarding rows of its leads, the timeline and audit
-        events of those leads, and the company and owner account the conversion would create."""
+        events of those leads, the setup lead's own stage and its decision (attempt) rows, and the company and owner account
+        the setup would create."""
         leads = [w.lead, w.lead_of_customer, w.unowned_lead]
         async with SessionLocal() as db:
             customers = (await db.execute(select(SalesCustomer).where(SalesCustomer.lead_id.in_(leads)).order_by(SalesCustomer.id))).scalars().all()
@@ -524,10 +530,12 @@ class TestAtomicity:
             rows = [[tuple(getattr(r, c.name) for c in r.__table__.columns) for r in group] for group in (customers, onboardings)]
             events = (await db.execute(select(func.count()).select_from(SalesLeadActivity).where(SalesLeadActivity.lead_id.in_(leads)))).scalar_one()
             audits = (await db.execute(select(func.count()).select_from(StaffAuditEvent).where(
-                StaffAuditEvent.action == "customer_converted", StaffAuditEvent.after_data["lead_id"].astext == str(w.lead)))).scalar_one()
+                StaffAuditEvent.action == "customer_setup_completed", StaffAuditEvent.after_data["lead_id"].astext == str(w.lead)))).scalar_one()
             companies = (await db.execute(select(func.count()).select_from(Company).where(Company.name == w.body.business_name))).scalar_one()
             owners = (await db.execute(select(func.count()).select_from(User).where(User.email == w.body.owner_email))).scalar_one()
-            return {"rows": rows, "events": events, "audits": audits, "companies": companies, "owners": owners}
+            lead = (await db.execute(select(SalesLead.pipeline_stage, SalesLead.closed_at, SalesLead.updated_at).where(SalesLead.id == w.lead))).one()
+            attempts = (await db.execute(select(func.count()).select_from(SalesLeadAttempt).where(SalesLeadAttempt.lead_id == w.lead))).scalar_one()
+            return {"rows": rows, "events": events, "audits": audits, "companies": companies, "owners": owners, "lead": tuple(lead), "attempts": attempts}
 
     OPERATIONS = {
         "assign": lambda db, w, a: onboarding_service.assign_onboarding(db, w.ctx, str(w.onboarding), S.OnboardingAssign(assigned_to=w.other, note="handing over"), a),
@@ -557,35 +565,39 @@ class TestAtomicity:
         run(_run())
 
     @pytest.mark.parametrize("failing", ["timeline", "audit"])
-    def test_a_conversion_leaves_nothing_behind_when_its_trail_cannot_be_written(self, failing, monkeypatch):
+    def test_a_customer_setup_leaves_nothing_behind_when_its_trail_cannot_be_written(self, failing, monkeypatch):
         async def _run():
             w = await self._world()
             audit = audit_service.new_audit_context("atomicity")
             before = await self._fingerprint(w)
+            assert before["lead"][0] == "assigned" and before["attempts"] == 0
 
             async def broken_writer(*args, **kwargs):
                 raise RuntimeError("trail unavailable")
             target = activity_service if failing == "timeline" else audit_service
             monkeypatch.setattr(target, "record", broken_writer)
             with pytest.raises(RuntimeError, match="trail unavailable"):
-                await self._in_request(lambda db: conversion_service.convert_lead(db, w.ctx, str(w.lead), w.body, audit))
+                await self._in_request(lambda db: customer_setup_service.complete_setup(db, w.ctx, str(w.lead), w.body, audit))
             monkeypatch.undo()
-            assert await self._fingerprint(w) == before                                                     # no company, no owner ACCOUNT, no customer, no onboarding
+            # no company, no owner ACCOUNT, no customer - and the "Agreed" itself is undone: still open, no decision recorded
+            assert await self._fingerprint(w) == before
 
-            result = await self._in_request(lambda db: conversion_service.convert_lead(db, w.ctx, str(w.lead), w.body, audit))
+            result = await self._in_request(lambda db: customer_setup_service.complete_setup(db, w.ctx, str(w.lead), w.body, audit))
             assert result["already_converted"] is False
             after = await self._fingerprint(w)
-            assert (after["events"], after["audits"], after["companies"], after["owners"]) == (before["events"] + 1, 1, 1, 1)
-            assert len(after["rows"][0]) == len(before["rows"][0]) + 1 and len(after["rows"][1]) == len(before["rows"][1]) + 1     # a customer AND its onboarding
+            # two events for the win (stage_changed + lead_marked_won) and one for the setup; one audit; the company and its owner
+            assert (after["events"], after["audits"], after["companies"], after["owners"]) == (before["events"] + 3, 1, 1, 1)
+            assert after["lead"][0] == "won" and after["attempts"] == 1                                       # the lead is won and the decision recorded
+            assert len(after["rows"][0]) == len(before["rows"][0]) + 1                                        # a customer ...
+            assert len(after["rows"][1]) == len(before["rows"][1])                                            # ... and no onboarding: the setup IS the onboarding
         run(_run())
 
-    def test_a_failure_after_the_company_was_created_still_rolls_the_company_back(self, monkeypatch):
-        """The company (and its owner account) is created BEFORE the customer row: make the customer insert fail and check the
-        company is not left behind."""
+    def test_a_failure_after_the_company_was_created_still_rolls_the_company_and_the_win_back(self, monkeypatch):
+        """The lead is won and the company (with its owner account) created BEFORE the customer row: make the customer insert
+        fail and check neither the win nor the company is left behind."""
         async def _run():
             w = await self._world()
             audit = audit_service.new_audit_context("atomicity")
-            before = await self._fingerprint(w)
             # a customer already exists for this lead behind the service's back (as a racing writer would leave it)
             async with SessionLocal() as db:
                 company = await _company(db)
@@ -597,10 +609,11 @@ class TestAtomicity:
                 return None
             monkeypatch.setattr(customers_repo, "get_row_by_lead", blind)                                 # the idempotency read misses it
             with pytest.raises(Exception) as exc:
-                await self._in_request(lambda db: conversion_service.convert_lead(db, w.ctx, str(w.lead), w.body, audit))
+                await self._in_request(lambda db: customer_setup_service.complete_setup(db, w.ctx, str(w.lead), w.body, audit))
             monkeypatch.undo()
             assert getattr(exc.value, "status_code", None) == 409 and exc.value.detail["code"] == "already_converted"     # the unique index answered, cleanly
-            assert await self._fingerprint(w) == before                                                     # and the company the service had just created is gone
+            assert await self._fingerprint(w) == before                                                     # the company, its owner, the win, its events and decision: all gone
+            assert before["lead"][0] == "assigned"
         run(_run())
 
 
@@ -640,7 +653,7 @@ class TestLocks:
             assert stage == "training"
         run(_run())
 
-    def test_a_conversion_locks_the_lead_for_its_whole_duration(self):
+    def test_a_customer_setup_locks_the_lead_for_its_whole_duration(self):
         async def _run():
             async with SessionLocal() as db:
                 manager, ctx, _ = await _staff(db, MANAGER_KEYS)
@@ -654,7 +667,7 @@ class TestLocks:
                 async with SessionLocal() as db:
                     await db.execute(text("SET LOCAL lock_timeout = '300ms'"))
                     with pytest.raises(DBAPIError) as exc:
-                        await conversion_service.convert_lead(db, ctx, str(lead.id), body, audit_service.new_audit_context())
+                        await customer_setup_service.complete_setup(db, ctx, str(lead.id), body, audit_service.new_audit_context())
                     assert "lock" in str(exc.value).lower()
                     await db.rollback()
                 await holder.rollback()
@@ -862,8 +875,9 @@ class TestModelMatchesDatabase:
                 for role, key in grants:
                     by_role.setdefault(role, set()).add(key)
                 assert by_role == {
-                    "sales_manager": {"sales.customers.view", "sales.customers.convert", "sales.onboarding.view", "sales.onboarding.manage", "sales.onboarding.assign", "sales.onboarding.scope_all"},
-                    "sales_employee": {"sales.customers.view"},
+                    "sales_manager": {"sales.customers.view", "sales.customers.convert", "sales.onboarding.view", "sales.onboarding.manage", "sales.onboarding.assign", "sales.onboarding.scope_all",
+                                      "sales.customers.setup"},                                                # setup: e7a2d4c9b1f3
+                    "sales_employee": {"sales.customers.view", "sales.customers.setup"},                        # setup, never convert
                     "onboarding_employee": {"sales.onboarding.view", "sales.onboarding.manage", "sales.onboarding.scope_assigned"},
                 }                                                                                                  # and nothing for lead_data_entry
         run(_run())

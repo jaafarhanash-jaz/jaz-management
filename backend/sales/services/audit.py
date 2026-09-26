@@ -41,10 +41,20 @@ ACTION_STAFF_ROLE_GRANTED = "staff_role_granted"
 ACTION_STAFF_ROLE_REVOKED = "staff_role_revoked"
 # Phase 4: converting a lead creates a real JAZ company and its owner ACCOUNT, which is security-relevant on its own.
 ACTION_CUSTOMER_CONVERTED = "customer_converted"
+# Simplified workflow: the customer setup (company + owner + optional employee ACCOUNTS), who changed how leads are handed
+# out, and every lead export (personal data leaving the system as a file).
+ACTION_CUSTOMER_SETUP_COMPLETED = "customer_setup_completed"
+ACTION_SALES_SETTINGS_UPDATED = "sales_settings_updated"
+ACTION_LEADS_EXPORTED = "leads_exported"
+# f2b6d8a1c4e9: the Sales Manager handed a completed Sales Work Batch to another salesperson (who gets which leads)
+ACTION_WORK_BATCH_REASSIGNED = "work_batch_reassigned"
 
 TARGET_STAFF_USER = "staff_user"
 TARGET_STAFF_ROLE_GRANT = "staff_role_grant"
 TARGET_SALES_CUSTOMER = "sales_customer"
+TARGET_SALES_SETTINGS = "sales_settings"
+TARGET_SALES_LEADS = "sales_leads"
+TARGET_SALES_WORK_BATCH = "sales_work_batch"
 
 # ---- what may appear in before/after: the account fields an investigator needs, nothing else ----
 STAFF_USER_FIELDS = ("name", "email", "phone", "status")

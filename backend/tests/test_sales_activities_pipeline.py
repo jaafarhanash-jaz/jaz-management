@@ -38,6 +38,7 @@ from sales_activity_test_utils import (
     work_types,
     worked_lead,
 )
+from sales_customer_test_utils import agree
 from sales_test_utils import admin_token, assert_scratch_target, auth  # noqa: F401
 
 # the working stages a salesperson moves a lead through once they own it
@@ -153,15 +154,23 @@ class TestStageChangesStayServerValidated:
         assert set_stage(emp, lead["id"], "trial")["pipeline_stage"] == "trial"
         act(emp, "trials", trial["id"], "complete")
         assert set_stage(emp, lead["id"], "negotiation")["pipeline_stage"] == "negotiation"
-        assert set_stage(emp, lead["id"], "won")["pipeline_stage"] == "won"
+        # `won` is nobody's stage move - not the salesperson's, not the manager's (a lead is won only by the Customer Setup,
+        # test_sales_workflow.py): the server refuses it whatever they completed
+        for headers in (emp, mgr):
+            r = api("POST", f"/api/sales/leads/{lead['id']}/stage", headers, {"stage": "won"})
+            assert r.status_code == 403 and errors_of(r)["code"] == "won_requires_customer_setup" and stage_of(mgr, lead["id"]) == "negotiation"
+        agree(emp, lead)                                                                                          # ... the Customer Setup is what wins it
+        assert stage_of(mgr, lead["id"]) == "won"
 
     def test_an_activity_does_not_make_an_invalid_move_valid(self, p, mgr, emp):
         # an UNASSIGNED lead ("new") can only be closed as lost - a demo on it changes nothing about that
         lead = create_lead(mgr)
         demo = create_demo(mgr, lead["id"])                                                                       # a manager may schedule one for themselves
-        for stage in ("demo_scheduled", "demo_completed", "trial", "won", "contacted"):
+        for stage in ("demo_scheduled", "demo_completed", "trial", "contacted"):
             r = api("POST", f"/api/sales/leads/{lead['id']}/stage", mgr, {"stage": stage})
             assert r.status_code == 409 and errors_of(r)["code"] == "transition_not_allowed", stage
+        r = api("POST", f"/api/sales/leads/{lead['id']}/stage", mgr, {"stage": "won"})                            # (won is never a manual move)
+        assert r.status_code == 403 and errors_of(r)["code"] == "won_requires_customer_setup"
         assert stage_of(mgr, lead["id"]) == "new" and fetch(mgr, "demos", demo["id"])["status"] == "scheduled"
 
     def test_an_active_trial_does_not_open_the_way_from_new_to_trial(self, p, mgr):
@@ -185,7 +194,8 @@ class TestStageChangesStayServerValidated:
         act(emp, "demos", create_demo(emp, lead["id"])["id"], "complete")
         r = api("POST", f"/api/sales/leads/{lead['id']}/stage", emp, {"stage": "lost"})
         assert r.status_code == 400 and errors_of(r)["code"] == "lost_reason_required"
-        assert set_stage(emp, lead["id"], "won")["closed_at"] is not None
+        agree(emp, lead)                                                                                          # the Customer Setup wins it
+        assert get_lead(mgr, lead["id"])["closed_at"] is not None
         r = api("POST", f"/api/sales/leads/{lead['id']}/stage", emp, {"stage": "negotiation"})
         assert r.status_code == 409 and errors_of(r)["code"] == "transition_not_allowed"                          # won is terminal, activities or not
 
@@ -236,7 +246,7 @@ class TestAWholeSalesJourney:
         set_stage(emp, lead["id"], "trial")
         act(emp, "trials", trial["id"], "complete", {"note": "they want to buy"})
         set_stage(emp, lead["id"], "negotiation")
-        set_stage(emp, lead["id"], "won", note="signed")
+        agree(emp, lead)                                                                                          # "Agreed": the Customer Setup wins the lead and makes the customer
 
         events = activities(mgr, lead["id"])
         assert [e["event_type"] for e in events] == [
@@ -245,7 +255,7 @@ class TestAWholeSalesJourney:
             "followup_created", "call_created", "stage_changed", "followup_completed",
             "demo_scheduled", "stage_changed", "demo_rescheduled", "demo_completed", "stage_changed",
             "trial_started", "stage_changed", "trial_completed",
-            "stage_changed", "stage_changed", "lead_marked_won",
+            "stage_changed", "stage_changed", "lead_marked_won", "lead_converted",
         ]
         assert [e["seq"] for e in events] == sorted(e["seq"] for e in events)                                     # one ordered, immutable history
         stages = [e["after"]["pipeline_stage"] for e in events if e["event_type"] == "stage_changed"]
@@ -279,7 +289,7 @@ class TestActivitiesFollowTheLead:
         assert set_stage(mgr, lead["id"], "assigned", note="reopened")["pipeline_stage"] == "assigned"           # reopening works, items intact
         assert listing(emp, f"/api/sales/followups?lead_id={lead['id']}&status=pending")["total"] == 1
         won = _in_stage(mgr, emp, p, "negotiation")
-        set_stage(emp, won["id"], "won")
+        agree(emp, won)                                                                                           # the salesperson's win: the Customer Setup
         assert create_followup(emp, won["id"], notes="check they are happy")
 
     def test_reassigning_a_lead_moves_who_can_see_its_work_but_not_who_authored_it(self, p, mgr, emp):

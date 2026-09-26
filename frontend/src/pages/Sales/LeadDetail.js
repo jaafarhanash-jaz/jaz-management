@@ -90,6 +90,17 @@ const SalesLeadDetail = ({ onLogout, language, setLanguage, userRole }) => {
     }
   };
 
+  // The customer setup / "not interested" changed the lead (won / lost): re-read it quietly and refresh the timeline.
+  const refreshLead = async () => {
+    setTimelineKey((k) => k + 1);
+    try {
+      const res = await api.get(`/sales/leads/${leadId}`);
+      setLead(res.data);
+    } catch (err) {
+      // the change itself succeeded; if the refresh fails the page keeps showing what it has
+    }
+  };
+
   const act = async (request, messageKey) => {
     setBusy(true);
     try {
@@ -181,6 +192,12 @@ const SalesLeadDetail = ({ onLogout, language, setLanguage, userRole }) => {
       {archived && (
         <div className="rounded-md border border-gray-300 bg-gray-50 px-4 py-3 text-sm text-gray-700" role="status" data-testid="lead-archived-banner">
           {ts('lead_archived_banner', language)}
+        </div>
+      )}
+
+      {can.edit_locked && (
+        <div className="rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900" role="status" data-testid="lead-edit-locked">
+          {ts('lead_edit_locked_note', language)}
         </div>
       )}
 
@@ -306,7 +323,7 @@ const SalesLeadDetail = ({ onLogout, language, setLanguage, userRole }) => {
         </Card>
       )}
 
-      <ConversionPanel lead={lead} language={language} onConverted={() => setTimelineKey((k) => k + 1)} />
+      <ConversionPanel lead={lead} language={language} onConverted={refreshLead} />
 
       <LeadActivities lead={lead} language={language} onChanged={workChanged} />
 

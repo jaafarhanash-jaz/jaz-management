@@ -1,5 +1,10 @@
 """JAZ Sales - Phase 4: RBAC for conversion, customers and onboarding (HTTP integration tier).
 
+The conversion endpoints are RETIRED (410 for whoever holds sales.customers.convert - test_sales_conversion.py). What is left to
+prove here is who still REACHES them (the permission guard, decided before anything else, and no lead lookup after it) and that
+the customers and onboarding records the conversion used to create - now historical data, seeded by the `convert()` fixture -
+keep their rules.
+
 Two layers, tested separately and together (the same design as the lead and work-item routes):
   * ACTION permissions - sales.customers.view / .convert, sales.onboarding.view / .manage / .assign (403 otherwise,
     decided BEFORE validation, so a denied caller learns nothing from the error);
@@ -11,6 +16,7 @@ Personas are real accounts created through the real API by the seeded Super Admi
 import pytest
 
 from sales_customer_test_utils import (
+    legacy_win,
     PHANTOM_ID,
     api,
     assign,
@@ -28,6 +34,7 @@ from sales_customer_test_utils import (
     make_personas,
     onboarding,
     onboarding_id,
+    onboarding_worker,
     retire_roles,
     set_stage,
     uniq,
@@ -48,7 +55,9 @@ PHASE4_KEYS = {
     "sales.customers.view", "sales.customers.convert", "sales.onboarding.view", "sales.onboarding.manage",
     "sales.onboarding.assign", "sales.onboarding.scope_all", "sales.onboarding.scope_assigned",
 }
-ROLES = ["admin", "manager", "employee", "data_entry", "onboarding", "no_roles"]
+# "onboarding" holds the RETIRED Onboarding Employee system role (it reaches nothing); "worker" holds a custom role with exactly
+# that role's permission keys - the dormant onboarding architecture, as re-enabling the role would give it back.
+ROLES = ["admin", "manager", "employee", "data_entry", "onboarding", "worker", "no_roles"]
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -63,7 +72,9 @@ def admin_h(admin_token):
 
 @pytest.fixture(scope="module")
 def p(admin_h):
-    return make_personas(admin_h, "crbac")
+    personas = make_personas(admin_h, "crbac")
+    personas["worker"] = onboarding_worker(admin_h, "crbac-worker")
+    return personas
 
 
 def H(p, who):
@@ -76,11 +87,11 @@ def headers_for(p, admin_h, who):
 
 @pytest.fixture(scope="module")
 def world(p, admin_h):
-    """One converted customer whose lead is the Sales Employee's and whose onboarding is assigned to the Onboarding Employee."""
+    """One converted customer whose lead is the Sales Employee's and whose onboarding is assigned to the onboarding worker."""
     mgr = H(p, "manager")
     made = converted(mgr, p["employee"]["id"])
     oid = onboarding_id(mgr, made["customer"]["id"])
-    assign_onboarding(mgr, oid, p["onboarding"]["id"])
+    assign_onboarding(mgr, oid, p["worker"]["id"])
     return {"lead": made["lead"], "customer": made["customer"], "oid": oid, "body": made["body"]}
 
 
@@ -90,15 +101,18 @@ def world(p, admin_h):
 class TestWhatEachRoleGets:
     def test_the_grants_are_exactly_the_approved_ones(self):
         assert PHASE4_KEYS & SYSTEM_ROLE_PERMISSIONS["sales_manager"] == PHASE4_KEYS - {"sales.onboarding.scope_assigned"}
-        assert PHASE4_KEYS & SYSTEM_ROLE_PERMISSIONS["sales_employee"] == {"sales.customers.view"}                # NO conversion for a Sales Employee
+        # NO Phase-4 conversion for a Sales Employee: they complete the Customer Setup with its own key (sales.customers.setup)
+        assert PHASE4_KEYS & SYSTEM_ROLE_PERMISSIONS["sales_employee"] == {"sales.customers.view"}
         assert PHASE4_KEYS & SYSTEM_ROLE_PERMISSIONS["onboarding_employee"] == {"sales.onboarding.view", "sales.onboarding.manage", "sales.onboarding.scope_assigned"}
         assert not PHASE4_KEYS & SYSTEM_ROLE_PERMISSIONS["lead_data_entry"]                                       # Lead Data Entry: nothing
 
     def test_me_reports_them(self, p, admin_h):
         expected = {
-            "manager": (PHASE4_KEYS - {"sales.onboarding.scope_assigned"}, {"customers", "onboarding"}),
+            # onboarding is no longer a workspace section (simplified workflow) - its permissions stay, dormant
+            "manager": (PHASE4_KEYS - {"sales.onboarding.scope_assigned"}, {"customers"}),
             "employee": ({"sales.customers.view"}, {"customers"}),
-            "onboarding": ({"sales.onboarding.view", "sales.onboarding.manage", "sales.onboarding.scope_assigned"}, {"onboarding"}),
+            "onboarding": (set(), set()),                                     # the retired role gives nothing at all
+            "worker": ({"sales.onboarding.view", "sales.onboarding.manage", "sales.onboarding.scope_assigned"}, set()),
             "data_entry": (set(), set()),
             "no_roles": (set(), set()),
         }
@@ -107,7 +121,7 @@ class TestWhatEachRoleGets:
             assert PHASE4_KEYS & set(me["permissions"]) == keys, who
             assert {"customers", "onboarding"} & set(me["modules"]) == modules, who
         me = api("GET", "/api/sales/me", admin_h).json()
-        assert PHASE4_KEYS <= set(me["permissions"]) and {"customers", "onboarding"} <= set(me["modules"])          # Super Admin: everything
+        assert PHASE4_KEYS <= set(me["permissions"]) and {"customers", "onboarding"} & set(me["modules"]) == {"customers"}   # Super Admin
 
 
 
@@ -122,14 +136,14 @@ ENDPOINTS = {
     "customers.list": ("GET", "/customers", {"admin", "manager", "employee"}, "sales.customers.view"),
     "customers.counts": ("GET", "/customers/counts", {"admin", "manager", "employee"}, "sales.customers.view"),
     "customers.get": ("GET", "/customers/{customer}", {"admin", "manager", "employee"}, "sales.customers.view"),
-    "onboarding.list": ("GET", "/onboarding", {"admin", "manager", "onboarding"}, "sales.onboarding.view"),
-    "onboarding.counts": ("GET", "/onboarding/counts", {"admin", "manager", "onboarding"}, "sales.onboarding.view"),
+    "onboarding.list": ("GET", "/onboarding", {"admin", "manager", "worker"}, "sales.onboarding.view"),
+    "onboarding.counts": ("GET", "/onboarding/counts", {"admin", "manager", "worker"}, "sales.onboarding.view"),
     "onboarding.assignees": ("GET", "/onboarding/assignees", {"admin", "manager"}, "sales.onboarding.assign"),
-    "onboarding.get": ("GET", "/onboarding/{ob}", {"admin", "manager", "onboarding"}, "sales.onboarding.view"),
-    "onboarding.timeline": ("GET", "/onboarding/{ob}/timeline", {"admin", "manager", "onboarding"}, "sales.onboarding.view"),
-    "onboarding.update": ("PATCH", "/onboarding/{ob}", {"admin", "manager", "onboarding"}, "sales.onboarding.manage"),
+    "onboarding.get": ("GET", "/onboarding/{ob}", {"admin", "manager", "worker"}, "sales.onboarding.view"),
+    "onboarding.timeline": ("GET", "/onboarding/{ob}/timeline", {"admin", "manager", "worker"}, "sales.onboarding.view"),
+    "onboarding.update": ("PATCH", "/onboarding/{ob}", {"admin", "manager", "worker"}, "sales.onboarding.manage"),
     "onboarding.assign": ("POST", "/onboarding/{ob}/assign", {"admin", "manager"}, "sales.onboarding.assign"),
-    "onboarding.stage": ("POST", "/onboarding/{ob}/stage", {"admin", "manager", "onboarding"}, "sales.onboarding.manage"),
+    "onboarding.stage": ("POST", "/onboarding/{ob}/stage", {"admin", "manager", "worker"}, "sales.onboarding.manage"),
 }
 
 
@@ -140,7 +154,7 @@ def _request_for(p, world, name):
         "conversion.preflight": {},
         "conversion.convert": convert_body(world["lead"]),
         "onboarding.update": {"notes": "rbac"},
-        "onboarding.assign": {"assigned_to": p["onboarding"]["id"]},
+        "onboarding.assign": {"assigned_to": p["worker"]["id"]},
         "onboarding.stage": {"stage": "contacted"},
     }.get(name)
     return method, path, body
@@ -193,6 +207,8 @@ class TestActionPermissionMatrix:
             assert api(method, path, h, body).status_code == 403, path                            # no schema leak, no existence leak
 
     def test_a_sales_employee_cannot_convert_even_their_own_won_lead(self, p, world):
+        # The Phase-4 conversion (retired) created a company with NO subscription dates: it was never the employee's. A Sales
+        # Employee sets a customer up through the Customer Setup instead (its own key, Trial / Paid rules: test_sales_workflow.py).
         lead = won_lead(H(p, "manager"), p["employee"]["id"])
         before = count_customers(lead["id"])
         r = api("POST", f"/api/sales/leads/{lead['id']}/convert", H(p, "employee"), convert_body(lead))
@@ -203,7 +219,7 @@ class TestActionPermissionMatrix:
     def test_a_denied_conversion_creates_nothing(self, p):
         lead = won_lead(H(p, "manager"), p["employee"]["id"])
         body = convert_body(lead)
-        for who in ("employee", "employee2", "data_entry", "onboarding", "no_roles"):
+        for who in ("employee", "employee2", "data_entry", "onboarding", "worker", "no_roles"):
             assert api("POST", f"/api/sales/leads/{lead['id']}/convert", H(p, who), body).status_code == 403, who
         assert count_customers(lead["id"]) == 0
         assert count_users(body["owner_email"]) == 0
@@ -242,18 +258,17 @@ class TestPermissionGranularity:
         finally:
             retire_roles([role])
 
-    def test_customers_convert_alone_converts_but_cannot_view_customers(self, p, admin_h):
+    def test_customers_convert_alone_reaches_only_the_retired_endpoints_and_cannot_view_customers(self, p, admin_h):
         person, role = _person(admin_h, ["sales.access", "sales.customers.convert", "sales.leads.scope_all"], "cc")
         try:
             h = person["headers"]
             lead = won_lead(H(p, "manager"), p["employee"]["id"])
             assert api("GET", f"/api/sales/leads/{lead['id']}/conversion", h).status_code == 403     # that is a VIEW
             assert api("GET", "/api/sales/customers", h).status_code == 403
-            pre = api("POST", f"/api/sales/leads/{lead['id']}/convert/preflight", h, {})
-            assert pre.status_code == 200 and pre.json()["can_convert"] is True
-            r = api("POST", f"/api/sales/leads/{lead['id']}/convert", h, convert_body(lead))
-            assert r.status_code == 201                                                              # the response itself is built without checking view
-            assert api("GET", f"/api/sales/customers/{r.json()['customer']['id']}", h).status_code == 403
+            for path, body in (("convert/preflight", {}), ("convert", convert_body(lead))):
+                r = api("POST", f"/api/sales/leads/{lead['id']}/{path}", h, body)
+                assert r.status_code == 410 and r.json()["detail"]["code"] == "conversion_retired", path      # the guard passes; the endpoint is gone
+            assert count_customers(lead["id"]) == 0                                                  # ... and nothing was made
         finally:
             retire_roles([role])
 
@@ -266,7 +281,7 @@ class TestPermissionGranularity:
             assert o["can"]["update"] is False and o["can"]["change_stage"] is False and o["can"]["assign"] is False and o["allowed_stages"] == []
             assert api("PATCH", f"/api/sales/onboarding/{world['oid']}", h, {"notes": "x"}).status_code == 403
             assert api("POST", f"/api/sales/onboarding/{world['oid']}/stage", h, {"stage": "training"}).status_code == 403
-            assert api("POST", f"/api/sales/onboarding/{world['oid']}/assign", h, {"assigned_to": p["onboarding"]["id"]}).status_code == 403
+            assert api("POST", f"/api/sales/onboarding/{world['oid']}/assign", h, {"assigned_to": p["worker"]["id"]}).status_code == 403
             assert o["company"] is None and o["lead_id"] is None                                    # no customers.view: no company, no lead link
         finally:
             retire_roles([role])
@@ -277,7 +292,7 @@ class TestPermissionGranularity:
             h = person["headers"]
             made = converted(H(p, "manager"), p["employee"]["id"])
             oid = onboarding_id(H(p, "manager"), made["customer"]["id"])
-            assign_onboarding(H(p, "manager"), oid, p["onboarding"]["id"])
+            assign_onboarding(H(p, "manager"), oid, p["worker"]["id"])
             assert api("GET", f"/api/sales/onboarding/{oid}", h).status_code == 403                 # manage does not imply view ...
             assert api("POST", f"/api/sales/onboarding/{oid}/stage", h, {"stage": "training"}).status_code == 200      # ... and view does not imply manage
         finally:
@@ -290,7 +305,7 @@ class TestPermissionGranularity:
             made = converted(H(p, "manager"), p["employee"]["id"])
             oid = onboarding_id(H(p, "manager"), made["customer"]["id"])
             assert api("GET", "/api/sales/onboarding/assignees", h).status_code == 200
-            assert api("POST", f"/api/sales/onboarding/{oid}/assign", h, {"assigned_to": p["onboarding"]["id"]}).status_code == 200
+            assert api("POST", f"/api/sales/onboarding/{oid}/assign", h, {"assigned_to": p["worker"]["id"]}).status_code == 200
             assert api("GET", f"/api/sales/onboarding/{oid}", h).status_code == 403
             assert api("POST", f"/api/sales/onboarding/{oid}/stage", h, {"stage": "training"}).status_code == 403
         finally:
@@ -303,10 +318,12 @@ class TestPermissionGranularity:
             assert listing(h, "/api/sales/onboarding")["total"] == 0 and listing(h, "/api/sales/customers")["total"] == 0     # empty, not an error
             assert api("GET", f"/api/sales/onboarding/{world['oid']}", h).status_code == 403
             assert api("POST", f"/api/sales/onboarding/{world['oid']}/stage", h, {"stage": "training"}).status_code == 403
-            assert api("POST", f"/api/sales/onboarding/{world['oid']}/assign", h, {"assigned_to": p["onboarding"]["id"]}).status_code == 403
+            assert api("POST", f"/api/sales/onboarding/{world['oid']}/assign", h, {"assigned_to": p["worker"]["id"]}).status_code == 403
             assert api("GET", f"/api/sales/customers/{world['customer']['id']}", h).status_code == 403
             lead = won_lead(H(p, "manager"), p["employee"]["id"])
-            assert api("POST", f"/api/sales/leads/{lead['id']}/convert", h, convert_body(lead)).status_code == 403
+            assert api("GET", f"/api/sales/leads/{lead['id']}/conversion", h).status_code == 403     # the status read follows the lead scope: none
+            # the retired endpoint looks no lead up, so a scope changes nothing about it: the same 410 - and nothing is made
+            assert api("POST", f"/api/sales/leads/{lead['id']}/convert", h, convert_body(lead)).status_code == 410
             assert count_customers(lead["id"]) == 0
         finally:
             retire_roles([role])
@@ -390,7 +407,9 @@ class TestOnboardingScope:
 
 
 class TestLeadScopeOnConversion:
-    def test_scope_assigned_converts_only_the_leads_assigned_to_that_person(self, p, admin_h):
+    """The conversion status read follows the LEAD scope; the retired endpoints look no lead up (so the scope is moot: 410)."""
+
+    def test_scope_assigned_sees_the_status_of_only_the_leads_assigned_to_that_person(self, p, admin_h):
         person, role = _person(admin_h, ["sales.access", "sales.customers.convert", "sales.customers.view", "sales.leads.scope_assigned"], "ls1")
         try:
             h = person["headers"]
@@ -398,11 +417,13 @@ class TestLeadScopeOnConversion:
             others = won_lead(mgr, p["employee"]["id"])
             mine = won_lead(mgr, p["employee"]["id"])
             assign(mgr, mine["id"], person["id"])                                                   # this role holds scope_assigned: it can be given a lead
-            r = api("POST", f"/api/sales/leads/{others['id']}/convert", h, convert_body(others))
-            assert r.status_code == 403 and count_customers(others["id"]) == 0
-            assert api("POST", f"/api/sales/leads/{others['id']}/convert/preflight", h, {}).status_code == 403
             assert api("GET", f"/api/sales/leads/{others['id']}/conversion", h).status_code == 403
-            assert api("POST", f"/api/sales/leads/{mine['id']}/convert", h, convert_body(mine)).status_code == 201     # the one assigned to them: yes
+            status = api("GET", f"/api/sales/leads/{mine['id']}/conversion", h)                     # the one assigned to them: yes - and no conversion on offer
+            assert status.status_code == 200 and status.json()["can_convert"] is False
+            for lead in (others, mine):                                                             # the retired endpoints answer the same for both
+                for path, body in (("convert", convert_body(lead)), ("convert/preflight", {})):
+                    assert api("POST", f"/api/sales/leads/{lead['id']}/{path}", h, body).status_code == 410, (lead["id"], path)
+                assert count_customers(lead["id"]) == 0
         finally:
             retire_roles([role])
 
@@ -416,9 +437,9 @@ class TestLeadScopeOnConversion:
         finally:
             retire_roles([role])
 
-    def test_scope_intake_reaches_the_leads_they_created_only_if_they_can_see_the_lead(self, p, admin_h):
-        """A Lead Data Entry-style scope (created by me / unassigned) plus the convert permission: only a WON lead can be
-        converted, and a won lead is assigned - so only ones they created remain in scope."""
+    def test_scope_intake_sees_the_status_of_the_leads_they_created_only(self, p, admin_h):
+        """A Lead Data Entry-style scope (created by me / unassigned) plus the convert permission: a won lead is assigned, so
+        only the ones they created remain in scope - for the status read. The retired endpoints ignore the scope (410)."""
         person, role = _person(admin_h, ["sales.access", "sales.leads.create", "sales.customers.convert", "sales.customers.view", "sales.leads.scope_intake"], "ls3")
         try:
             h = person["headers"]
@@ -426,10 +447,13 @@ class TestLeadScopeOnConversion:
             theirs = create_lead(h)                                                                  # created by this person
             assign(mgr, theirs["id"], p["employee"]["id"])
             set_stage(mgr, theirs["id"], "contacted")
-            set_stage(mgr, theirs["id"], "won")
+            legacy_win(mgr, theirs["id"])                                                            # (won before the no-manual-win rule)
             elses = won_lead(mgr, p["employee"]["id"])
-            assert api("POST", f"/api/sales/leads/{elses['id']}/convert", h, convert_body(elses)).status_code == 403
-            assert api("POST", f"/api/sales/leads/{theirs['id']}/convert", h, convert_body(theirs)).status_code == 201
+            assert api("GET", f"/api/sales/leads/{elses['id']}/conversion", h).status_code == 403
+            assert api("GET", f"/api/sales/leads/{theirs['id']}/conversion", h).status_code == 200
+            for lead in (elses, theirs):
+                assert api("POST", f"/api/sales/leads/{lead['id']}/convert", h, convert_body(lead)).status_code == 410
+                assert count_customers(lead["id"]) == 0
         finally:
             retire_roles([role])
 
@@ -456,7 +480,7 @@ class TestStaffWhoseAccessChanged:
         assert set(self._try_everything(boss["headers"], world).values()) == {200}
 
     def test_a_deactivated_onboarding_employee_is_denied_on_their_own_records(self, p, admin_h):
-        worker = create_staff(admin_h, ["onboarding_employee"], "crbac-obdeact")
+        worker = onboarding_worker(admin_h, "crbac-obdeact")
         made = converted(H(p, "manager"), p["employee"]["id"])
         oid = onboarding_id(H(p, "manager"), made["customer"]["id"])
         assign_onboarding(H(p, "manager"), oid, worker["id"])
@@ -483,7 +507,7 @@ class TestStaffWhoseAccessChanged:
     def test_permissions_are_read_live_on_every_request(self, p, admin_h):
         person, role = _person(admin_h, ["sales.access", "sales.customers.convert", "sales.leads.scope_all"], "crbac-live")
         lead = won_lead(H(p, "manager"), p["employee"]["id"])
-        assert api("POST", f"/api/sales/leads/{lead['id']}/convert/preflight", person["headers"], {}).status_code == 200
+        assert api("POST", f"/api/sales/leads/{lead['id']}/convert/preflight", person["headers"], {}).status_code == 410     # reaches the (retired) endpoint
         retire_roles([role])
         assert api("POST", f"/api/sales/leads/{lead['id']}/convert/preflight", person["headers"], {}).status_code == 403
 

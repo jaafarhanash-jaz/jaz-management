@@ -8,9 +8,9 @@ tests isolate their rows with their own campaign or search token instead of assu
 import asyncio
 import random
 import uuid
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Optional
 
-from sales_test_utils import api, create_staff
+from sales_test_utils import api, create_retired_onboarding_employee, create_staff
 
 PHANTOM_ID = "00000000-0000-4000-8000-000000000000"
 
@@ -103,7 +103,8 @@ def make_personas(admin_h: dict, prefix: str = "lp") -> Dict[str, dict]:
         "employee2": create_staff(admin_h, ["sales_employee"], f"{prefix}-employee2"),
         "data_entry": create_staff(admin_h, ["lead_data_entry"], f"{prefix}-entry"),
         "data_entry2": create_staff(admin_h, ["lead_data_entry"], f"{prefix}-entry2"),
-        "onboarding": create_staff(admin_h, ["onboarding_employee"], f"{prefix}-onboarding"),
+        # a holder of the RETIRED Onboarding Employee role (migration c5e1b9a4d2f7): reaches nothing in Sales
+        "onboarding": create_retired_onboarding_employee(admin_h, f"{prefix}-onboarding"),
         "no_roles": create_staff(admin_h, [], f"{prefix}-noroles"),
     }
 
@@ -132,6 +133,52 @@ def run_db(fn):
             await engine.dispose()
 
     return asyncio.run(_go())
+
+
+def legacy_win(headers: dict, lead_id: str, *, note: Optional[str] = None) -> None:
+    """LEGACY DATA FIXTURE - a lead that was WON BY HAND, seeded straight into the scratch database (never through the API).
+
+    Nobody can move a lead to `won` any more: POST /leads/{id}/stage refuses it for EVERY caller (403 won_requires_customer_setup) -
+    a lead is won only by the Customer Setup, which creates its customer with it. But leads won by hand BEFORE that rule exist in
+    every deployed database, and the customer / onboarding / report / retirement code has to keep handling them, so the tests that
+    need such a lead (a won lead with no customer) seed it here. It writes exactly what the removed manual move wrote - the stage and
+    `closed_at`, the `stage_changed` and `lead_marked_won` timeline events and the owner's accepted decision - through the same
+    services. `headers` names the staff account that "won" it; the lead must be open, owned and not archived."""
+    me = api("GET", "/api/sales/me", headers).json()["user"]
+
+    async def _win(db):
+        from sqlalchemy import func, select
+
+        from models import User
+        from sales.models import SalesLead
+        from sales.services import activity as activity_service
+        from sales.services import audit as audit_service
+        from sales.services import batches as batches_service
+        from sales.services.access import resolve_staff_context
+
+        user = await db.get(User, uuid.UUID(me["id"]))
+        ctx = await resolve_staff_context(
+            db, {"id": str(user.id), "name": user.name, "email": user.email, "phone": user.phone, "role": user.role, "status": user.status},
+        )
+        audit = audit_service.new_audit_context("pytest-legacy-win")
+        lead = (await db.execute(select(SalesLead).where(SalesLead.id == uuid.UUID(lead_id)).with_for_update())).scalar_one()
+        assert lead.archived_at is None and lead.assigned_to is not None and lead.pipeline_stage not in ("new", "won", "lost"), (
+            "the legacy fixture wins only an open, owned, live lead", lead.pipeline_stage)
+        old_stage, old_reason = lead.pipeline_stage, lead.lost_reason
+        lead.pipeline_stage, lead.lost_reason, lead.closed_at = "won", None, func.clock_timestamp()
+        await db.flush()
+        await activity_service.record(
+            db, ctx, audit, lead.id, activity_service.EVENT_STAGE_CHANGED,
+            before={"pipeline_stage": old_stage, "lost_reason": old_reason}, after={"pipeline_stage": "won", "lost_reason": None}, note=note,
+        )
+        await activity_service.record(
+            db, ctx, audit, lead.id, activity_service.EVENT_LEAD_MARKED_WON,
+            before={"pipeline_stage": old_stage}, after={"pipeline_stage": "won"}, note=note,
+        )
+        await batches_service.record_decision(db, ctx, lead, batches_service.OUTCOME_ACCEPTED)
+        await batches_service.settle(db)           # commits, then forms any Work Batch the decision made due (as the route did)
+
+    run_db(_win)
 
 
 def make_custom_role(permission_keys: Iterable[str]) -> str:

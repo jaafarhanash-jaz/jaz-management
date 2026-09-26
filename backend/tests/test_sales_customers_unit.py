@@ -3,10 +3,11 @@
 The customer / onboarding vocabulary and the onboarding state machine (every pair of stages), the request schemas (and that
 the owner's password never prints), the permission catalog, the timeline's event vocabulary and who may read which
 events, the query-string filters, the small shared helpers, and the DRIFT GUARDS that keep the code, the migration and the
-test expectations saying the same thing. Also static guarantees over the source: conversion reuses the platform's company
-service instead of reimplementing it, the password is unwrapped in exactly one place, nothing is hard-deleted.
+test expectations saying the same thing. Also static guarantees over the source: the Customer Setup (which replaced the RETIRED
+conversion - test_sales_conversion.py) reuses the platform's company service instead of reimplementing it, a password is
+unwrapped only where it is hashed, nothing is hard-deleted.
 """
-from sales_test_utils import ALL_MODULES, ALL_PERMISSION_KEYS, SYSTEM_ROLE_PERMISSIONS, assert_scratch_target
+from sales_test_utils import ALL_MODULES, ALL_PERMISSION_KEYS, SYSTEM_ROLE_PERMISSIONS, assert_scratch_target, granted_before_workflow
 
 assert_scratch_target(need_http=False)  # must run BEFORE importing database (which loads .env)
 
@@ -120,7 +121,8 @@ class TestOnboardingStateMachine:
 # =============================================================================
 class TestPermissionCatalog:
     def test_the_phase_4_keys(self):
-        assert {k for k in P.ALL_PERMISSIONS if k.split(".")[1] in ("customers", "onboarding")} == PHASE4
+        # (+ sales.customers.setup: the simplified workflow's Customer Setup key, e7a2d4c9b1f3)
+        assert {k for k in P.ALL_PERMISSIONS if k.split(".")[1] in ("customers", "onboarding")} - {P.PERM_CUSTOMERS_SETUP} == PHASE4
         assert PHASE4 <= ALL_PERMISSION_KEYS and set(P.ALL_PERMISSIONS) == ALL_PERMISSION_KEYS
         for key in PHASE4:
             assert re.fullmatch(r"sales\.[a-z]+\.[a-z_]+", key) and P.ALL_PERMISSIONS[key].strip()
@@ -131,13 +133,15 @@ class TestPermissionCatalog:
 
     def test_the_modules_and_their_order(self):
         keys = [m["key"] for m in P.MODULES]
-        assert keys == ALL_MODULES and keys[-2:] == ["customers", "onboarding"]
+        # simplified workflow: onboarding is no longer a workspace section (its permissions and routes stay, dormant)
+        # (+ the Sales Manager's "batches" and "performance" sections after it, f2b6d8a1c4e9)
+        assert keys == ALL_MODULES and keys[keys.index("customers") + 1:] == ["batches", "performance"] and "onboarding" not in keys
         by_key = {m["key"]: m["permission"] for m in P.MODULES}
-        assert by_key["customers"] == "sales.customers.view" and by_key["onboarding"] == "sales.onboarding.view"
+        assert by_key["customers"] == "sales.customers.view"
 
     def test_who_sees_which_module(self):
         assert ctx(P.PERM_CUSTOMERS_VIEW).visible_modules() == ["customers"]
-        assert ctx(P.PERM_ONBOARDING_VIEW, P.PERM_ACCESS).visible_modules() == ["home", "onboarding"]
+        assert ctx(P.PERM_ONBOARDING_VIEW, P.PERM_ACCESS).visible_modules() == ["home"]                  # no onboarding section any more
         assert ctx(P.PERM_CUSTOMERS_CONVERT, P.PERM_ONBOARDING_MANAGE, P.PERM_ONBOARDING_ASSIGN).visible_modules() == []      # acting is not seeing
 
     def test_the_approved_grants_of_each_system_role(self):
@@ -147,6 +151,8 @@ class TestPermissionCatalog:
         assert not PHASE4 & SYSTEM_ROLE_PERMISSIONS["lead_data_entry"]
         for role in ("sales_employee", "lead_data_entry", "onboarding_employee"):
             assert P.PERM_CUSTOMERS_CONVERT not in SYSTEM_ROLE_PERMISSIONS[role], role                # only a manager (or the Super Admin) converts
+        # the Customer Setup has its own key (e7a2d4c9b1f3): Sales Manager and Sales Employee
+        assert {r for r, keys in SYSTEM_ROLE_PERMISSIONS.items() if P.PERM_CUSTOMERS_SETUP in keys} == {"sales_manager", "sales_employee"}
         assert not {P.PERM_LEADS_VIEW, P.PERM_LEADS_SCOPE_ALL, P.PERM_LEADS_SCOPE_ASSIGNED, P.PERM_LEADS_SCOPE_INTAKE} & SYSTEM_ROLE_PERMISSIONS["onboarding_employee"]
 
 
@@ -310,12 +316,26 @@ class TestHelpers:
     def lead(self, **kw):
         return SimpleNamespace(**{"archived_at": None, "pipeline_stage": "won", "business_name": "Lead Co", "contact_name": "Contact", "email": "lead@x.com", "phone": "+9647700000000", "address": "Addr", **kw})
 
-    def test_lead_blocker(self):
-        assert conversion.lead_blocker(self.lead()) is None
-        assert conversion.lead_blocker(self.lead(pipeline_stage="lost")) == "lead_not_won"
-        assert conversion.lead_blocker(self.lead(pipeline_stage="negotiation")) == "lead_not_won"
-        assert conversion.lead_blocker(self.lead(archived_at=datetime.now(timezone.utc))) == "lead_archived"
-        assert conversion.lead_blocker(self.lead(archived_at=datetime.now(timezone.utc), pipeline_stage="new")) == "lead_archived"      # archived is reported first
+    def test_setup_lead_blocker(self):
+        owner = uuid.uuid4()
+        assert conversion.setup_lead_blocker(self.lead(assigned_to=owner)) is None                                  # won and owned
+        assert conversion.setup_lead_blocker(self.lead(assigned_to=owner, pipeline_stage="negotiation")) is None    # open and owned: "Agreed" wins it
+        assert conversion.setup_lead_blocker(self.lead(assigned_to=owner, pipeline_stage="lost")) == "lead_lost"
+        assert conversion.setup_lead_blocker(self.lead(assigned_to=None)) == "lead_unassigned"
+        assert conversion.setup_lead_blocker(self.lead(assigned_to=owner, archived_at=datetime.now(timezone.utc))) == "lead_archived"
+        assert conversion.setup_lead_blocker(self.lead(assigned_to=None, pipeline_stage="lost", archived_at=datetime.now(timezone.utc))) == "lead_archived"   # archived first
+        assert set(conversion.SETUP_LEAD_BLOCKERS) == {"lead_archived", "lead_lost", "lead_unassigned"}
+
+    def test_the_retired_conversion_leaves_no_way_to_run_it(self):
+        for gone in ("convert_lead", "preflight", "lead_blocker", "_LEAD_BLOCKERS"):
+            assert not hasattr(conversion, gone), gone
+
+    def test_the_retired_answer_is_a_410_with_a_stable_code_and_the_replacement(self):
+        e = conversion.conversion_retired()
+        assert isinstance(e, HTTPException) and e.status_code == 410
+        assert e.detail["code"] == "conversion_retired" and e.detail["field"] == "lead"
+        assert e.detail["replacement"] == conversion.CONVERSION_REPLACEMENT == "POST /api/sales/leads/{lead_id}/setup"
+        assert "Customer Setup" in e.detail["message"]
 
     def test_effective_values_prefer_the_callers_and_fall_back_to_the_lead(self):
         lead = self.lead()
@@ -403,9 +423,9 @@ class TestMigrationDriftGuard:
         from alembic.script import ScriptDirectory
         script = ScriptDirectory.from_config(Config(str(BACKEND / "alembic.ini")))
         heads = script.get_heads()
-        assert heads == ["b6d1f3a8c294"], heads                                                            # no branch: exactly one head (Phase 5's), chained after this one
+        assert heads == ["f2b6d8a1c4e9"], heads                                                            # no branch: exactly one head (the batches)
         chain = [rev.revision for rev in script.walk_revisions()]
-        assert chain.index("b6d1f3a8c294") < chain.index("f4c8a1d92b63") < chain.index("e3a9c5b07d12") < chain.index("d764d5f44e91")   # walk_revisions is head -> base
+        assert chain.index("f2b6d8a1c4e9") < chain.index("e7a2d4c9b1f3") < chain.index("c5e1b9a4d2f7") < chain.index("a3f8c2d7e915") < chain.index("b6d1f3a8c294") < chain.index("f4c8a1d92b63") < chain.index("e3a9c5b07d12") < chain.index("d764d5f44e91")   # head -> base
         for rev in script.walk_revisions():
             assert not isinstance(rev.down_revision, tuple), rev.revision                                 # nothing merges two branches either
 
@@ -420,7 +440,7 @@ class TestMigrationDriftGuard:
         assert set(granted) == {"sales_manager", "sales_employee", "onboarding_employee"}                   # Lead Data Entry: nothing
         for role, keys in granted.items():
             assert sorted(keys) == sorted(set(keys)), role                                                   # no grant twice
-            assert set(keys) == SYSTEM_ROLE_PERMISSIONS[role] & PHASE4, role
+            assert set(keys) == granted_before_workflow(role) & PHASE4, role                                # a3f8c2d7e915 added convert for the employee
         phase1 = load_migration(BACKEND / "migrations" / "versions" / "bb595f6d8dae_sales_rbac_foundation.py", "mig_bb595_for_roles")
         ids = {key: rid for rid, key, *_ in phase1._ROLES}
         assert mig._ROLE_IDS == {r: ids[r] for r in ("sales_manager", "sales_employee", "onboarding_employee")}   # the same seeded roles
@@ -451,7 +471,11 @@ class TestMigrationDriftGuard:
     def test_every_check_and_foreign_key_of_the_migration_is_declared_on_the_models(self):
         from sales.models import SalesCustomer, SalesOnboarding
         source = MIGRATION.read_text()
-        declared = {c.name for m in (SalesCustomer, SalesOnboarding) for c in m.__table__.constraints if c.name and c.name.startswith("ck_")}
+        # the simplified workflow (a3f8c2d7e915) later added one check to sales_customers - declared on the model too
+        later = {"ck_sales_customers_subscription_type"}
+        workflow = (BACKEND / "migrations" / "versions" / "a3f8c2d7e915_sales_simplified_workflow.py").read_text()
+        assert all(f"'{name}'" in workflow for name in later)
+        declared = {c.name for m in (SalesCustomer, SalesOnboarding) for c in m.__table__.constraints if c.name and c.name.startswith("ck_")} - later
         assert set(re.findall(r"name='(ck_[a-z_]+)'", source)) == declared
         indexes = {i.name for m in (SalesCustomer, SalesOnboarding) for i in m.__table__.indexes}
         assert set(re.findall(r"op\.create_index\('([a-z_]+)'", source)) == indexes
@@ -465,32 +489,41 @@ class TestSourceGuarantees:
     REPOS = [BACKEND / "sales" / "repositories" / n for n in ("customers.py", "onboarding.py")]
     ALL = SERVICES + REPOS
 
-    def test_conversion_reuses_the_platforms_company_service_and_reimplements_none_of_it(self):
-        source = (BACKEND / "sales" / "services" / "conversion.py").read_text()
+    def test_the_customer_setup_reuses_the_platforms_company_service_and_reimplements_none_of_it(self):
+        source = (BACKEND / "sales" / "services" / "customer_setup.py").read_text()
         assert source.count("admin_service.create_company(") == 1                                          # the ONE place a company is made
-        for reimplemented in ("hash_password", "generate_qr_code", "qr_token", "companies_repo", "users_repo", "Company(", "User(", "plan_config_for_company", "uuid.uuid4().hex"):
+        assert source.count("admin_service.activate_subscription(") == 1                                   # ... and given its dated period
+        for reimplemented in ("hash_password", "generate_qr_code", "qr_token", "companies_repo", "users_repo", "Company(", "plan_config_for_company", "uuid.uuid4().hex"):
             assert reimplemented not in source, reimplemented
         imports = "\n".join(re.findall(r"^(?:from|import) .*$", source, re.M))
         assert "import services.admin as admin_service" in imports
-        assert "from models import" not in imports                                                         # not even the models: nothing to construct
+        assert "Company" not in imports                                                                   # nothing to construct
+
+    def test_the_retired_conversion_neither_hashes_nor_creates_anything(self):
+        tree = ast.parse((BACKEND / "sales" / "services" / "conversion.py").read_text())           # code only: its docstring names what was retired
+        used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)} | {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+        used |= {a.name for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom)) for a in n.names}
+        for gone in ("create_company", "activate_subscription", "hash_password", "get_secret_value", "activity_service", "audit_service", "SalesCustomer", "SalesOnboarding"):
+            assert gone not in used, gone
 
     def test_a_password_is_unwrapped_only_where_it_is_hashed_and_never_logged_or_recorded(self):
-        # The Owner password in conversion.py, a staff member's password (create / reset) in team.py: the only services that
-        # hash one. No route, schema or repository ever holds the plain text.
+        # The Owner's and employees' passwords in customer_setup.py, a staff member's password (create / reset) in team.py: the
+        # only services that hash one. No route, schema or repository ever holds the plain text - and the retired conversion,
+        # which used to be one of them, no longer sees a password at all.
         unwrapped = sorted(p.relative_to(BACKEND) for p in (BACKEND / "sales").rglob("*.py") if "get_secret_value" in p.read_text())
-        assert unwrapped == [Path("sales/services/conversion.py"), Path("sales/services/team.py")]
+        assert unwrapped == [Path("sales/services/customer_setup.py"), Path("sales/services/team.py")]
         team = (BACKEND / "sales" / "services" / "team.py").read_text()
         assert team.count("get_secret_value") == 2                                                         # create + reset
         for line in team.splitlines():
             if re.search(r"logger\.|activity_service\.record|audit_service\.record", line):
                 assert not re.search(r"\b(password|new_password|plain)\b", line), line
-        source = (BACKEND / "sales" / "services" / "conversion.py").read_text()
-        assert source.count("get_secret_value") == 1
+        source = (BACKEND / "sales" / "services" / "customer_setup.py").read_text()
+        assert source.count("get_secret_value") == 3                                                       # the owner's, a candidate employee's, a created employee's
         for line in source.splitlines():
             if re.search(r"logger\.|activity_service\.record|audit_service\.record", line):
                 assert "password" not in line.lower(), line
         for match in re.finditer(r"(activity_service|audit_service)\.record\((.*?)\n    \)", source, re.S):
-            assert "password" not in match.group(2).lower() and "body." not in match.group(2)                # the request body never reaches a trail
+            assert "password" not in match.group(2).lower(), match.group(2)                                # nothing secret reaches a trail
 
     def test_nothing_is_ever_hard_deleted(self):
         for path in self.ALL:
@@ -519,13 +552,12 @@ class TestSourceGuarantees:
             assert not re.search(r"\blead\.(pipeline_stage|assigned_to|assigned_at|lost_reason|closed_at|archived_at|updated_at|business_name)\s*=(?!=)", source), path.name
             assert not re.search(r"\bcompany\.\w+\s*=(?!=)", source), path.name
 
-    def test_conversion_does_not_touch_the_pipeline(self):
+    def test_the_retired_conversion_does_not_touch_the_pipeline(self):
         source = (BACKEND / "sales" / "services" / "conversion.py").read_text()
-        assert "transition_error" not in source and "AUTO_STAGE" not in source
-        assert source.count("STAGE_WON") == 2                                                              # imported, and compared: never assigned
+        assert "transition_error" not in source and "AUTO_STAGE" not in source and "STAGE_WON" not in source
 
     def test_every_function_that_writes_also_records_its_timeline_event(self):
-        for name in ("conversion", "onboarding"):
+        for name, at_least in (("conversion", 0), ("onboarding", 3), ("customer_setup", 2)):
             source = (BACKEND / "sales" / "services" / f"{name}.py").read_text()
             writers = 0
             for fn in ast.walk(ast.parse(source)):
@@ -534,15 +566,17 @@ class TestSourceGuarantees:
                     if "db.flush()" in text:
                         writers += 1
                         assert "activity_service.record(" in text, (name, fn.name)                          # a change can never be saved without its event
-            assert writers >= (1 if name == "conversion" else 3), name
+            assert writers >= at_least, name
+            if name == "conversion":
+                assert writers == 0                                                                        # the retired module can not write at all
 
     def test_every_write_takes_a_row_lock_first(self):
         source = (BACKEND / "sales" / "services" / "onboarding.py").read_text()
         for fn in ("assign_onboarding", "change_stage", "update_onboarding"):
             body = source[source.index(f"async def {fn}("):]
             assert "_load_for_update(" in body.split("\nasync def ")[0], fn
-        conv = (BACKEND / "sales" / "services" / "conversion.py").read_text()
-        assert "for_update=True" in conv[conv.index("async def convert_lead("):]
+        setup = (BACKEND / "sales" / "services" / "customer_setup.py").read_text()
+        assert "for_update=True" in setup[setup.index("async def complete_setup("):].split("\nasync def ")[0]
 
     def test_the_sales_models_of_phase_4_point_only_where_they_should(self):
         from sales.models import SalesCustomer, SalesOnboarding

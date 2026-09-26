@@ -269,7 +269,7 @@ class TestCatalogAndMigration:
         assert len({P.ALL_PERMISSIONS[k] for k in PHASE5}) == 2
         assert [m["key"] for m in P.MODULES] == ALL_MODULES
         assert {m["key"]: m["permission"] for m in P.MODULES}["reports"] == P.PERM_REPORTS_VIEW
-        assert [m["key"] for m in P.MODULES][-2:] == ["customers", "onboarding"]      # earlier phases' order is untouched
+        assert [m["key"] for m in P.MODULES][-4:] == ["reports", "customers", "batches", "performance"]   # onboarding left the sections (simplified workflow); the batches' two follow
 
     def test_the_grants_of_the_system_roles(self):
         for role in ("sales_manager", "sales_employee", "onboarding_employee"):
@@ -302,7 +302,8 @@ class TestCatalogAndMigration:
         mig = load_migration()
         assert mig.revision == "b6d1f3a8c294" and mig.down_revision == "f4c8a1d92b63" and mig.branch_labels is None and mig.depends_on is None
         script = ScriptDirectory.from_config(Config(str(BACKEND / "alembic.ini")))
-        assert script.get_heads() == ["b6d1f3a8c294"]
+        assert script.get_heads() == ["f2b6d8a1c4e9"]                                                # the simplified workflow's and the batches' revisions, chained after this one
+        assert script.get_revision("a3f8c2d7e915").down_revision == "b6d1f3a8c294"
         assert all(not isinstance(r.down_revision, tuple) for r in script.walk_revisions())          # nothing merges two branches
 
     def test_the_migration_creates_no_table_and_touches_only_the_catalog_and_its_own_indexes(self):

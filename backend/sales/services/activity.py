@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from sales import permissions as perms
 from sales.repositories import activities as activities_repo
+from sales.services import work_sessions
 from sales.services.access import StaffContext
 from sales.services.audit import AuditContext, _assert_no_secrets
 
@@ -36,6 +37,8 @@ EVENT_LEAD_MARKED_WON = "lead_marked_won"
 EVENT_LEAD_MARKED_LOST = "lead_marked_lost"
 EVENT_LEAD_ARCHIVED = "lead_archived"
 EVENT_LEAD_RESTORED = "lead_restored"
+# f2b6d8a1c4e9: the salesperson put the lead on the wait list (a timestamp and a pending status - nothing else happens)
+EVENT_LEAD_WAIT_LISTED = "lead_wait_listed"
 
 # ---- Phase 3: the work done on a lead. Each event names its item in metadata (call_id / followup_id / demo_id / trial_id).
 EVENT_CALL_CREATED = "call_created"
@@ -75,6 +78,9 @@ LEAD_EVENT_TYPES: FrozenSet[str] = frozenset({
     EVENT_STAGE_CHANGED, EVENT_LEAD_MARKED_WON, EVENT_LEAD_MARKED_LOST, EVENT_LEAD_ARCHIVED, EVENT_LEAD_RESTORED,
 })
 WORK_EVENT_TYPES: Dict[str, FrozenSet[str]] = {     # view permission -> the events it unlocks
+    # the wait list is the salesperson's own working state: whoever decides on leads reads it; Lead Data Entry, who may open a lead they
+    # entered, never does
+    perms.PERM_LEADS_CHANGE_STAGE: frozenset({EVENT_LEAD_WAIT_LISTED}),
     perms.PERM_CALLS_VIEW: frozenset({EVENT_CALL_CREATED, EVENT_CALL_UPDATED}),
     perms.PERM_FOLLOWUPS_VIEW: frozenset({
         EVENT_FOLLOWUP_CREATED, EVENT_FOLLOWUP_UPDATED, EVENT_FOLLOWUP_COMPLETED, EVENT_FOLLOWUP_CANCELLED,
@@ -154,6 +160,8 @@ async def record(
         metadata={"actor_roles": [role["key"] for role in actor.roles], **metadata},
         correlation_id=audit.correlation_id,
     )
+    # every recorded work action is also a moment of work: the persisted work sessions behind "work hours"
+    await work_sessions.touch(db, actor.user_id)
 
 
 async def list_events(

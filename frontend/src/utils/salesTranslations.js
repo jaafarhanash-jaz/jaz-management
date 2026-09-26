@@ -3,12 +3,14 @@
 // primary language, matching the rest of the platform. Phase 1 (workspace, team)
 // lives below; Phase 2 (leads, campaigns, pipeline) is in salesLeadsTranslations.js
 // Phase 3 (calls, follow-ups, demos, trials) in salesActivitiesTranslations.js, Phase 4 (conversion, customers,
-// onboarding) in salesCustomersTranslations.js and Phase 5 (dashboard, reports) in salesReportsTranslations.js; all are
-// merged in at the bottom of this file.
+// onboarding) in salesCustomersTranslations.js, Phase 5 (dashboard, reports) in salesReportsTranslations.js and the simplified
+// workflow (lead queue, customer setup, distribution, export) in salesWorkflowTranslations.js; all are merged in at the bottom.
 import { leadsTranslations } from '@/utils/salesLeadsTranslations';
 import { activitiesTranslations } from '@/utils/salesActivitiesTranslations';
 import { customersTranslations } from '@/utils/salesCustomersTranslations';
 import { reportsTranslations } from '@/utils/salesReportsTranslations';
+import { workflowTranslations } from '@/utils/salesWorkflowTranslations';
+import { batchesTranslations } from '@/utils/salesBatchesTranslations';
 
 const baseTranslations = {
   ar: {
@@ -156,8 +158,8 @@ const baseTranslations = {
 };
 
 export const salesTranslations = {
-  ar: { ...baseTranslations.ar, ...leadsTranslations.ar, ...activitiesTranslations.ar, ...customersTranslations.ar, ...reportsTranslations.ar },
-  en: { ...baseTranslations.en, ...leadsTranslations.en, ...activitiesTranslations.en, ...customersTranslations.en, ...reportsTranslations.en },
+  ar: { ...baseTranslations.ar, ...leadsTranslations.ar, ...activitiesTranslations.ar, ...customersTranslations.ar, ...reportsTranslations.ar, ...workflowTranslations.ar, ...batchesTranslations.ar },
+  en: { ...baseTranslations.en, ...leadsTranslations.en, ...activitiesTranslations.en, ...customersTranslations.en, ...reportsTranslations.en, ...workflowTranslations.en, ...batchesTranslations.en },
 };
 
 export const ts = (key, language = 'ar') =>

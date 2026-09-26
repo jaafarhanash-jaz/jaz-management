@@ -7,7 +7,7 @@ import api from '@/utils/api';
 import { apiErrorMessage } from '@/utils/salesErrors';
 import { formatDateTime, formatValue, lostReasonName, priorityName, sourceName } from '@/utils/salesLeads';
 import { ts } from '@/utils/salesTranslations';
-import { Archive, ArchiveRestore, ArrowRight, ArrowRightLeft, CircleX, History, Pencil, Plus, Trophy, UserMinus, UserPlus } from 'lucide-react';
+import { Archive, ArchiveRestore, ArrowRight, ArrowRightLeft, CircleX, History, Hourglass, Pencil, Plus, Trophy, UserMinus, UserPlus } from 'lucide-react';
 
 // The lead's immutable activity timeline (GET /sales/leads/{id}/activities, newest first): what happened, who did it,
 // when, and the before/after values the server recorded. Read-only by construction - there is nothing to edit here.
@@ -24,6 +24,7 @@ const EVENT_META = {
   lead_marked_lost: { icon: CircleX, style: 'bg-red-50 text-red-700 border-red-200' },
   lead_archived: { icon: Archive, style: 'bg-gray-50 text-gray-700 border-gray-200' },
   lead_restored: { icon: ArchiveRestore, style: 'bg-green-50 text-green-700 border-green-200' },
+  lead_wait_listed: { icon: Hourglass, style: 'bg-amber-50 text-amber-700 border-amber-200' },
   ...WORK_EVENT_META,                     // Phase 3: calls, follow-ups, demos, trials
   ...CUSTOMER_EVENT_META,                 // Phase 4: conversion and onboarding
 };

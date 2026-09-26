@@ -19,6 +19,10 @@ history lives in the Phase-2 timeline.
 
 Phase 5 - dashboard and reports add no table: they aggregate the tables above. Only three reporting indexes (marked "Phase 5"
 below) and two permissions were added, by migrations/versions/b6d1f3a8c294_sales_dashboard_reports.py.
+
+Simplified workflow - the Sales Manager's settings (sales_settings: automatic lead distribution), what a customer setup
+started the company on (sales_customers.subscription_type) and the "latest leads I created" index, mirroring
+migrations/versions/a3f8c2d7e915_sales_simplified_workflow.py.
 """
 import uuid
 from datetime import date, datetime
@@ -37,6 +41,7 @@ from sqlalchemy import (
     Index,
     Integer,
     Numeric,
+    SmallInteger,
     String,
     Text,
     UniqueConstraint,
@@ -49,17 +54,25 @@ from sqlalchemy.orm import Mapped, mapped_column
 from database import Base
 from models import TimestampMixin, fk_uuid, uuid_pk  # core helpers, imported read-only
 from sales.constants import (
+    ATTEMPT_RESULTS,
+    BATCH_ATTEMPT_KINDS,
     CALL_RESULTS,
     CAMPAIGN_STATUSES,
     CUSTOMER_STATUSES,
+    DATA_BATCH_SIZE,
+    DATA_BATCH_STATUSES,
     DEMO_STATUSES,
+    DISTRIBUTION_MODES,
+    FIRST_OUTCOMES,
     FOLLOWUP_STATUSES,
     LOST_REASONS,
     MAX_CALL_SECONDS,
     ONBOARDING_STAGES,
     PIPELINE_STAGES,
     PRIORITIES,
+    SUBSCRIPTION_TYPES,
     TRIAL_STATUSES,
+    WORK_BATCH_STATUSES,
 )
 
 
@@ -302,6 +315,10 @@ class SalesLead(Base, TimestampMixin):
     archived_by: Mapped[Optional[uuid.UUID]] = fk_uuid("users.id", nullable=True)
 
     created_by: Mapped[uuid.UUID] = fk_uuid("users.id")
+    # The Data Batch this lead entered (f2b6d8a1c4e9): set once when Data Entry staff create it, never moved (a database trigger
+    # refuses any change, and any change of created_by). NULL for a lead nobody entered through Data Entry. Invisible to every
+    # role but the Sales Manager (never part of a lead's API shape).
+    data_batch_id: Mapped[Optional[uuid.UUID]] = fk_uuid("sales_data_batches.id", nullable=True, ondelete="RESTRICT")
 
     # normalized copies for duplicate detection (see the class docstring)
     name_norm: Mapped[str] = mapped_column(String, nullable=False)
@@ -336,6 +353,9 @@ class SalesLead(Base, TimestampMixin):
         Index("ix_sales_leads_stage", "pipeline_stage", postgresql_where=text("archived_at IS NULL")),
         Index("ix_sales_leads_unassigned", "created_at", postgresql_where=text("assigned_to IS NULL AND archived_at IS NULL")),
         Index("ix_sales_leads_created_by", "created_by"),
+        Index("ix_sales_leads_data_batch", "data_batch_id", postgresql_where=text("data_batch_id IS NOT NULL")),
+        # simplified workflow (a3f8c2d7e915): "the latest N leads this person created" (the Lead Data Entry edit window)
+        Index("ix_sales_leads_creator_recent", "created_by", text("created_at DESC"), text("id DESC")),
         Index("ix_sales_leads_campaign_id", "campaign_id", postgresql_where=text("campaign_id IS NOT NULL")),
         Index("ix_sales_leads_source", "source"),
         Index("ix_sales_leads_archived_by", "archived_by", postgresql_where=text("archived_by IS NOT NULL")),
@@ -544,9 +564,15 @@ class SalesCustomer(Base, TimestampMixin):
     converted_by: Mapped[uuid.UUID] = fk_uuid("users.id")
     converted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     status: Mapped[str] = mapped_column(String, nullable=False, server_default=text("'active'"))
+    # What the customer setup started the company on (a3f8c2d7e915). NULL for customers converted by the Phase-4 flow.
+    subscription_type: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
     __table_args__ = (
         CheckConstraint(f"status IN {_in_list(CUSTOMER_STATUSES)}", name="ck_sales_customers_status"),
+        CheckConstraint(
+            f"subscription_type IS NULL OR subscription_type IN {_in_list(SUBSCRIPTION_TYPES)}",
+            name="ck_sales_customers_subscription_type",
+        ),
         # "repeating the same conversion must not create another company/customer" - the database is the real guarantee
         Index("uq_sales_customers_lead", "lead_id", unique=True),
         Index("uq_sales_customers_company", "company_id", unique=True),
@@ -584,4 +610,204 @@ class SalesOnboarding(Base, TimestampMixin):
         Index("ix_sales_onboarding_assignee_stage", "assigned_to", "stage", postgresql_where=text("assigned_to IS NOT NULL")),
         Index("ix_sales_onboarding_stage", "stage", text("started_at DESC")),
         Index("ix_sales_onboarding_started_at", text("started_at DESC")),
+    )
+
+
+# =============================================================================
+# Simplified workflow - the Sales Manager's settings
+# =============================================================================
+class SalesSettings(Base):
+    """The Sales workspace settings: exactly ONE row (id = 1, CHECK), created by the migration. Automatic lead distribution
+    gives every new lead that nobody chose an owner for to the next person in a round-robin over the staff who may receive
+    leads (sales/services/distribution.py); `last_assigned_user_id` is where the rotation stands. The row is locked
+    (SELECT ... FOR UPDATE) while a lead picks its owner, so concurrent lead creations take turns instead of racing."""
+
+    __tablename__ = "sales_settings"
+
+    id: Mapped[int] = mapped_column(SmallInteger, primary_key=True, server_default=text("1"))
+    auto_distribution_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    distribution_mode: Mapped[str] = mapped_column(String, nullable=False, server_default=text("'equal'"))
+    last_assigned_user_id: Mapped[Optional[uuid.UUID]] = fk_uuid("users.id", nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_by: Mapped[Optional[uuid.UUID]] = fk_uuid("users.id", nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("id = 1", name="ck_sales_settings_singleton"),
+        CheckConstraint(f"distribution_mode IN {_in_list(DISTRIBUTION_MODES)}", name="ck_sales_settings_distribution_mode"),
+    )
+
+
+# =============================================================================
+# Batches, attempts and work sessions (migration f2b6d8a1c4e9)
+# =============================================================================
+class SalesMasterBatch(Base):
+    """Ten full Data Batches (oldest first, each in at most one master) - an internal Sales Manager organisation layer. The batches
+    underneath stay intact; nothing else in Sales reads a master batch."""
+
+    __tablename__ = "sales_master_batches"
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    seq: Mapped[int] = mapped_column(BigInteger, Identity(always=True), nullable=False)
+    formed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (UniqueConstraint("seq", name="uq_sales_master_batches_seq"),)
+
+
+class SalesDataBatch(Base):
+    """Every DATA_BATCH_SIZE leads entered by ALL Data Entry staff combined. Owned by nobody: each lead keeps its own created_by /
+    created_at. `open` while it fills (at most one is open, enforced by a partial unique index), `full` at 100."""
+
+    __tablename__ = "sales_data_batches"
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    seq: Mapped[int] = mapped_column(BigInteger, Identity(always=True), nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False, server_default=text("'open'"))
+    lead_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    filled_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    master_batch_id: Mapped[Optional[uuid.UUID]] = fk_uuid("sales_master_batches.id", nullable=True, ondelete="RESTRICT")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("seq", name="uq_sales_data_batches_seq"),
+        CheckConstraint(f"status IN {_in_list(DATA_BATCH_STATUSES)}", name="ck_sales_data_batches_status"),
+        CheckConstraint(f"lead_count >= 0 AND lead_count <= {DATA_BATCH_SIZE}", name="ck_sales_data_batches_count"),
+        CheckConstraint("(status = 'full') = (filled_at IS NOT NULL)", name="ck_sales_data_batches_filled_pair"),
+        CheckConstraint(f"status <> 'full' OR lead_count = {DATA_BATCH_SIZE}", name="ck_sales_data_batches_full_is_100"),
+        CheckConstraint("master_batch_id IS NULL OR status = 'full'", name="ck_sales_data_batches_master_needs_full"),
+        Index("uq_sales_data_batches_one_open", "status", unique=True, postgresql_where=text("status = 'open'")),
+        Index("ix_sales_data_batches_master", "master_batch_id", postgresql_where=text("master_batch_id IS NOT NULL")),
+        Index("ix_sales_data_batches_unmastered", "seq", postgresql_where=text("status = 'full' AND master_batch_id IS NULL")),
+    )
+
+
+class SalesWorkBatch(Base):
+    """A salesperson's 100 worked leads. `employee_id` = whose leads formed it; who works it NOW is its latest attempt. Open while
+    any lead is pending, closed when every lead has a final result."""
+
+    __tablename__ = "sales_work_batches"
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    seq: Mapped[int] = mapped_column(BigInteger, Identity(always=True), nullable=False)
+    employee_id: Mapped[uuid.UUID] = fk_uuid("users.id")
+    lead_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False, server_default=text("'open'"))
+    closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("seq", name="uq_sales_work_batches_seq"),
+        CheckConstraint(f"status IN {_in_list(WORK_BATCH_STATUSES)}", name="ck_sales_work_batches_status"),
+        CheckConstraint("lead_count > 0", name="ck_sales_work_batches_count"),
+        CheckConstraint("(status = 'closed') = (closed_at IS NOT NULL)", name="ck_sales_work_batches_closed_pair"),
+        Index("ix_sales_work_batches_employee", "employee_id", text("created_at DESC")),
+        Index("ix_sales_work_batches_status", "status", text("created_at DESC")),
+    )
+
+
+class SalesBatchAttempt(Base):
+    """One salesperson's pass over a Work Batch's leads: #1 is the initial one (formed from their own work), every later one a
+    manager's reassignment over the SAME leads. At most one attempt of a batch is open."""
+
+    __tablename__ = "sales_batch_attempts"
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    work_batch_id: Mapped[uuid.UUID] = fk_uuid("sales_work_batches.id", ondelete="RESTRICT")
+    attempt_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    employee_id: Mapped[uuid.UUID] = fk_uuid("users.id")
+    kind: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False, server_default=text("'open'"))
+    lead_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    started_by: Mapped[uuid.UUID] = fk_uuid("users.id")
+    closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("work_batch_id", "attempt_no", name="uq_sales_batch_attempts_no"),
+        CheckConstraint("attempt_no >= 1", name="ck_sales_batch_attempts_no"),
+        CheckConstraint(f"kind IN {_in_list(BATCH_ATTEMPT_KINDS)}", name="ck_sales_batch_attempts_kind"),
+        CheckConstraint(f"status IN {_in_list(WORK_BATCH_STATUSES)}", name="ck_sales_batch_attempts_status"),
+        CheckConstraint("lead_count > 0", name="ck_sales_batch_attempts_count"),
+        CheckConstraint("(status = 'closed') = (closed_at IS NOT NULL)", name="ck_sales_batch_attempts_closed_pair"),
+        CheckConstraint("(attempt_no = 1) = (kind = 'initial')", name="ck_sales_batch_attempts_first_is_initial"),
+        Index("uq_sales_batch_attempts_one_open", "work_batch_id", unique=True, postgresql_where=text("status = 'open'")),
+        Index("ix_sales_batch_attempts_employee", "employee_id", "status"),
+    )
+
+
+class SalesBatchAttemptLead(Base):
+    """Membership: the leads a batch attempt covers. A lead is referenced, never copied - the same lead is a member of every attempt
+    of its batch that covers it."""
+
+    __tablename__ = "sales_batch_attempt_leads"
+
+    batch_attempt_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("sales_batch_attempts.id", ondelete="RESTRICT"), primary_key=True
+    )
+    lead_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("sales_leads.id", ondelete="RESTRICT"), primary_key=True)
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("ordinal >= 1", name="ck_sales_batch_attempt_leads_ordinal"),
+        Index("ix_sales_batch_attempt_leads_lead", "lead_id"),
+    )
+
+
+class SalesLeadAttempt(Base):
+    """One salesperson's try at one lead - the persistent per-lead history behind every batch statistic and every performance
+    number. `first_outcome` is what they decided first; `result` how it ended (NULL = pending on the wait list). Never deleted."""
+
+    __tablename__ = "sales_lead_attempts"
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    lead_id: Mapped[uuid.UUID] = fk_uuid("sales_leads.id", ondelete="RESTRICT")
+    employee_id: Mapped[uuid.UUID] = fk_uuid("users.id")
+    attempt_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    first_outcome: Mapped[str] = mapped_column(String, nullable=False)
+    outcome_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    wait_listed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    result: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    result_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    recorded_by: Mapped[uuid.UUID] = fk_uuid("users.id")
+    batch_attempt_id: Mapped[Optional[uuid.UUID]] = fk_uuid("sales_batch_attempts.id", nullable=True, ondelete="RESTRICT")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        CheckConstraint("attempt_no >= 1", name="ck_sales_lead_attempts_no"),
+        CheckConstraint(f"first_outcome IN {_in_list(FIRST_OUTCOMES)}", name="ck_sales_lead_attempts_outcome"),
+        CheckConstraint(f"result IS NULL OR result IN {_in_list(ATTEMPT_RESULTS)}", name="ck_sales_lead_attempts_result"),
+        CheckConstraint("(first_outcome = 'wait_list') = (wait_listed_at IS NOT NULL)", name="ck_sales_lead_attempts_wait_pair"),
+        CheckConstraint("(result IS NULL) = (result_at IS NULL)", name="ck_sales_lead_attempts_result_pair"),
+        CheckConstraint("first_outcome = 'wait_list' OR (result IS NOT NULL AND result = first_outcome)", name="ck_sales_lead_attempts_direct_is_final"),
+        CheckConstraint("result IS DISTINCT FROM 'released' OR first_outcome = 'wait_list'", name="ck_sales_lead_attempts_released"),
+        Index("uq_sales_lead_attempts_no", "lead_id", "attempt_no", unique=True),
+        Index("uq_sales_lead_attempts_one_pending", "lead_id", unique=True, postgresql_where=text("result IS NULL")),
+        Index("ix_sales_lead_attempts_employee", "employee_id", text("outcome_at DESC")),
+        Index("ix_sales_lead_attempts_unbatched", "employee_id", "outcome_at", "id", postgresql_where=text("batch_attempt_id IS NULL")),
+        Index("ix_sales_lead_attempts_batch_attempt", "batch_attempt_id", postgresql_where=text("batch_attempt_id IS NOT NULL")),
+        Index("ix_sales_lead_attempts_outcome_at", text("outcome_at DESC")),
+    )
+
+
+class SalesWorkSession(Base):
+    """A persisted stretch of work: consecutive recorded work actions of one person less than SESSION_GAP apart (constants.py).
+    The source of the "work hours" numbers; never deleted."""
+
+    __tablename__ = "sales_work_sessions"
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    user_id: Mapped[uuid.UUID] = fk_uuid("users.id")
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ended_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    actions: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint("ended_at >= started_at", name="ck_sales_work_sessions_order"),
+        CheckConstraint("actions >= 1", name="ck_sales_work_sessions_actions"),
+        Index("ix_sales_work_sessions_user_end", "user_id", text("ended_at DESC")),
+        Index("ix_sales_work_sessions_user_start", "user_id", "started_at"),
     )

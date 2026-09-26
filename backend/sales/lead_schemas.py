@@ -178,6 +178,8 @@ class LeadCan(BaseModel):
     assign: bool
     archive: bool
     restore: bool
+    edit_locked: bool = False      # the caller changes leads, but this one is outside their edit window (a manager can)
+    wait_list: bool = False        # f2b6d8a1c4e9: the caller may put this lead on its owner's wait list now
 
 
 class LeadSummary(BaseModel):
@@ -211,6 +213,7 @@ class LeadSummary(BaseModel):
     updated_at: datetime
     allowed_stages: List[str]
     can: LeadCan
+    wait_listed_at: Optional[datetime] = None     # f2b6d8a1c4e9: on its owner's wait list since (callers who decide on leads only)
 
 
 class LeadDetail(LeadSummary):

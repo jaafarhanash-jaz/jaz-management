@@ -13,12 +13,15 @@ import pytest
 from sales_test_utils import (
     ALL_MODULES,
     ALL_PERMISSION_KEYS,
+    EFFECTIVE_ROLE_PERMISSIONS,
+    RETIRED_ROLES,
     STAFF_PASSWORD,
     SYSTEM_ROLE_MODULES,
     SYSTEM_ROLE_PERMISSIONS,
     api,
     assert_scratch_target,
     auth,
+    create_retired_onboarding_employee,
     create_staff,
     login,
     team_items,
@@ -48,7 +51,7 @@ def personas(admin_h):
         "manager": create_staff(admin_h, ["sales_manager"], "manager"),
         "employee": create_staff(admin_h, ["sales_employee"], "employee"),
         "data_entry": create_staff(admin_h, ["lead_data_entry"], "entry"),
-        "onboarding": create_staff(admin_h, ["onboarding_employee"], "onboarding"),
+        "onboarding": create_retired_onboarding_employee(admin_h, "onboarding"),     # holds the RETIRED role
         "no_roles": create_staff(admin_h, [], "noroles"),
     }
 
@@ -105,12 +108,14 @@ class TestSuperAdmin:
         assert {p["id"] for p in personas.values()} <= {i["id"] for i in team_items(admin_h)}
         roles = api("GET", "/api/sales/roles", admin_h)
         assert roles.status_code == 200
-        assert {r["key"] for r in roles.json() if r["is_system"]} == {"sales_manager", "sales_employee", "lead_data_entry", "onboarding_employee"}
+        # the retired Onboarding Employee role is not offered any more (it still exists: test_sales_db.py)
+        assert {r["key"] for r in roles.json() if r["is_system"]} == {"sales_manager", "sales_employee", "lead_data_entry"}
 
     def test_system_roles_carry_only_the_approved_grants(self, admin_h):
         by_key = {r["key"]: set(r["permissions"]) for r in api("GET", "/api/sales/roles", admin_h).json() if r["is_system"]}
-        assert set(by_key) == {"sales_manager", "sales_employee", "lead_data_entry", "onboarding_employee"}
-        assert by_key == SYSTEM_ROLE_PERMISSIONS  # exactly the approved grants (Phase 1 + 2 + 3), nothing extra
+        assert set(by_key) == {"sales_manager", "sales_employee", "lead_data_entry"}
+        # exactly the approved grants of every ACTIVE system role, nothing extra (a retired role's grants: test_sales_db.py)
+        assert by_key == {role: keys for role, keys in SYSTEM_ROLE_PERMISSIONS.items() if role not in RETIRED_ROLES}
         # staff-account management is granted to NO role - Super Admin only
         assert not any(p.startswith("sales.staff.") for perms in by_key.values() for p in perms)
 
@@ -123,7 +128,8 @@ ROLE_MATRIX = {
     "manager":      ("sales_manager",       SYSTEM_ROLE_PERMISSIONS["sales_manager"],       SYSTEM_ROLE_MODULES["sales_manager"],       200, 200),
     "employee":     ("sales_employee",      SYSTEM_ROLE_PERMISSIONS["sales_employee"],      SYSTEM_ROLE_MODULES["sales_employee"],      403, 403),
     "data_entry":   ("lead_data_entry",     SYSTEM_ROLE_PERMISSIONS["lead_data_entry"],     SYSTEM_ROLE_MODULES["lead_data_entry"],     403, 403),
-    "onboarding":   ("onboarding_employee", SYSTEM_ROLE_PERMISSIONS["onboarding_employee"], SYSTEM_ROLE_MODULES["onboarding_employee"], 403, 403),
+    # the RETIRED role: its holder is authenticated staff with no role, no permission and no section
+    "onboarding":   ("onboarding_employee", EFFECTIVE_ROLE_PERMISSIONS["onboarding_employee"], SYSTEM_ROLE_MODULES["onboarding_employee"], 403, 403),
 }
 
 
@@ -136,7 +142,7 @@ class TestStaffRoles:
         body = r.json()
         assert body["is_super_admin"] is False
         assert body["user"]["role"] == "jaz_staff"
-        assert [x["key"] for x in body["roles"]] == [role_key]
+        assert [x["key"] for x in body["roles"]] == ([] if role_key in RETIRED_ROLES else [role_key])
         assert set(body["permissions"]) == perms
         assert body["modules"] == modules
 
@@ -186,10 +192,10 @@ class TestZeroRolesStaff:
 # =============================================================================
 class TestMultiRoleUnion:
     def test_union_and_immediate_effect_of_grant_and_revoke(self, admin_h):
-        u = create_staff(admin_h, ["sales_employee", "onboarding_employee"], "multi")
+        u = create_staff(admin_h, ["sales_employee", "lead_data_entry"], "multi")
         me = api("GET", "/api/sales/me", u["headers"]).json()
-        assert {r["key"] for r in me["roles"]} == {"sales_employee", "onboarding_employee"}
-        employee_perms = SYSTEM_ROLE_PERMISSIONS["sales_employee"] | SYSTEM_ROLE_PERMISSIONS["onboarding_employee"]
+        assert {r["key"] for r in me["roles"]} == {"sales_employee", "lead_data_entry"}
+        employee_perms = SYSTEM_ROLE_PERMISSIONS["sales_employee"] | SYSTEM_ROLE_PERMISSIONS["lead_data_entry"]
         assert set(me["permissions"]) == employee_perms
         assert api("GET", "/api/sales/team", u["headers"]).status_code == 403
 
@@ -204,7 +210,7 @@ class TestMultiRoleUnion:
         assert api("DELETE", f"/api/sales/team/{u['id']}/roles/sales_manager", admin_h).status_code == 200
         me = api("GET", "/api/sales/me", u["headers"]).json()
         assert set(me["permissions"]) == employee_perms
-        assert {r["key"] for r in me["roles"]} == {"sales_employee", "onboarding_employee"}
+        assert {r["key"] for r in me["roles"]} == {"sales_employee", "lead_data_entry"}
         assert api("GET", "/api/sales/team", u["headers"]).status_code == 403
 
     def test_permission_survives_revoking_only_one_of_two_roles_that_grant_it(self, admin_h):
@@ -595,8 +601,8 @@ class TestStaffPermissionsAreIndependent:
             "create_with_role": ("POST", "/api/sales/team", {**_valid_create_body(), "role_keys": ["sales_employee"]}),
             "update": ("PATCH", f"/api/sales/team/{tid}", {"name": f"Renamed by {persona}"}),
             "reset": ("POST", f"/api/sales/team/{tid}/reset-password", {"new_password": "Perm#Reset99"}),
-            "assign": ("POST", f"/api/sales/team/{tid}/roles", {"role_key": "onboarding_employee"}),
-            "revoke": ("DELETE", f"/api/sales/team/{tid}/roles/onboarding_employee", None),
+            "assign": ("POST", f"/api/sales/team/{tid}/roles", {"role_key": "lead_data_entry"}),
+            "revoke": ("DELETE", f"/api/sales/team/{tid}/roles/lead_data_entry", None),
         }
         for name, (method, path, body) in calls.items():
             r = api(method, path, h, body)

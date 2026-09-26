@@ -5,15 +5,19 @@ import { Button } from '@/components/ui/button';
 import { SALES_SECTIONS, useSalesAccess } from '@/components/sales/SalesAccess';
 import WorkOverview from '@/components/sales/WorkOverview';
 import SalesDashboard from '@/components/sales/SalesDashboard';
+import MyLeadWorkspace from '@/components/sales/MyLeadWorkspace';
 import { ts, roleName } from '@/utils/salesTranslations';
 import { Briefcase, ShieldCheck, UserX } from 'lucide-react';
 
-// The Sales landing page. Someone who may open the dashboard (sales.dashboard.view) gets it - the server decides which
-// sections they see; anybody else keeps the Phase 1-4 page (the work overview and their sections).
+// The Sales landing page. Someone who works assigned leads (sales.leads.scope_assigned without the team-wide scope - a Sales
+// Employee) gets their lead queue FIRST: the current lead and its two outcomes are their primary workflow. Someone who may open
+// the dashboard (sales.dashboard.view) then gets it - the server decides which sections they see; anybody else keeps the
+// Phase 1-4 page (the work overview and their sections).
 const SalesHome = ({ onLogout, language, setLanguage, userRole }) => {
   const { loading, error, me, hasModule, reload, can } = useSalesAccess();
 
   const noRole = me && !me.is_super_admin && me.roles.length === 0;
+  const worksAssignedLeads = can('sales.leads.view') && can('sales.leads.scope_assigned') && !can('sales.leads.scope_all');
   const otherSections = SALES_SECTIONS.filter((s) => s.key !== 'home' && hasModule(s.key));
 
   return (
@@ -32,6 +36,8 @@ const SalesHome = ({ onLogout, language, setLanguage, userRole }) => {
 
         {me && (
           <>
+            {!noRole && worksAssignedLeads && <MyLeadWorkspace language={language} />}
+
             <Card className="p-6 bg-white border border-gray-200 rounded-md" data-testid="sales-home-identity">
               <p className="text-sm text-gray-500">{ts('home_welcome', language)}</p>
               <p className="text-xl font-semibold text-[#0A0A0A] mt-1">{me.user.name}</p>
@@ -62,7 +68,7 @@ const SalesHome = ({ onLogout, language, setLanguage, userRole }) => {
               </Card>
             ) : can('sales.dashboard.view') ? (
               <SalesDashboard language={language} />
-            ) : (
+            ) : worksAssignedLeads ? null : (
               <>
                 <WorkOverview language={language} />
 

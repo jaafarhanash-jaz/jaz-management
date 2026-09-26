@@ -4,7 +4,7 @@ Like the earlier helpers they only ever run against the disposable scratch datab
 Leads and their work are never deleted, so the scratch DB accumulates them across runs and a team-wide total can never be
 compared with a constant. The tests get EXACT numbers in two ways instead:
 
-  * an EMPTY WINDOW: `build_world` picks a few-day window in the far past (2001-2015), proves it holds no lead and no work
+  * an EMPTY WINDOW: `build_world` picks a few-day window in the far past (2000-2023), proves it holds no lead and no work
     (through the API, as Super Admin), creates a known dataset and BACKDATES it into the window (leads by a direct UPDATE of
     created_at / closed_at; calls, follow-ups, demos and trials through the API, which accepts past timestamps). The team-wide
     numbers of that window are then exactly the dataset - compared against `World`'s Python oracle, never against the code
@@ -12,12 +12,18 @@ compared with a constant. The tests get EXACT numbers in two ways instead:
   * FRESH PERSONAS: a personal (non-team) dashboard, or a team dashboard narrowed to one freshly created employee, only ever
     sees that employee's own data - exact even for "now" readings such as overdue follow-ups.
 """
+import fcntl
+import json
+import os
 import random
+import tempfile
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
+from sales_lead_test_utils import legacy_win
 from sales_activity_test_utils import (  # noqa: F401  (re-exported for the Phase-5 test modules)
     PHANTOM_ID,
     act,
@@ -102,24 +108,75 @@ class Window:
         return self.lo <= when < self.hi
 
 
+def _no_work_of_any_status(admin_headers: dict, padded: "Window") -> bool:
+    """True when the activities report - whose breakdown counts work of EVERY status, cancelled included - shows nothing in `padded`.
+    The dashboard's activity total leaves cancelled work out, yet every finished dataset leaves cancelled work behind (it winds down
+    the follow-up it made overdue, 41 days before its main day): a window that looks empty to the dashboard but holds such a leftover
+    would show an extra `cancelled` in a later dataset's breakdown."""
+    kinds = report(admin_headers, "activities", **window_params(padded))["kinds"]
+    return not any(count for kind in kinds.values() for count in kind["breakdown"].values())
+
+
+# Where a window may start. The API takes no activity (or period) before the year 2000 and a dataset reaches 41 days back from its
+# window, so the first start is 1 March 2000; the last stays years behind every preset ("this year", "last year", the last months) and
+# clear of the closed 2026 periods other tests compare exactly. Windows are never freed - the shared scratch database keeps every
+# dataset - and 2001-2015 is by now almost entirely used up (about 1 window in 100 is still free): the years on either side of it are
+# where the free windows are, and any draw that lands on a used one is simply drawn again.
+WINDOW_FIRST, WINDOW_LAST = date(2000, 3, 1), date(2023, 12, 20)
+
+_CLAIMS = os.path.join(tempfile.gettempdir(), "jaz_sales_report_windows.json")
+_CLAIM_SECONDS = 20 * 60        # longer than a module keeps its dataset
+_TRAILS = 45                    # days a dataset can reach BACK from its window (build_world's overdue follow-up is 40 days early)
+
+
+def _claim(window: "Window", pad: int) -> bool:
+    """Reserve the days `window` and its data can touch for the next few minutes, across every pytest worker on this machine, so that
+    two datasets being built at the same moment can never share a day (neither has any data yet for the other's proof to see). False
+    when another live window already holds one of the days: the caller draws again. The check-and-add is atomic under a file lock;
+    with no shared temp directory to coordinate through, the proof against the stored data still applies."""
+    first = (window.start - timedelta(days=_TRAILS + pad)).toordinal()
+    last = (window.end + timedelta(days=pad + 1)).toordinal()
+    now = time.time()
+    try:
+        with open(_CLAIMS, "a+") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)              # released when the file is closed
+            handle.seek(0)
+            try:
+                live = [c for c in json.loads(handle.read() or "[]") if c[2] > now]
+            except ValueError:
+                live = []
+            free = not any(first <= c[1] and c[0] <= last for c in live)
+            if free:
+                live.append([first, last, now + _CLAIM_SECONDS])
+            handle.seek(0)
+            handle.truncate()
+            handle.write(json.dumps(live))
+            return free
+    except OSError:
+        return True
+
+
 def empty_window(admin_headers: dict, days: int = 3, pad: int = 3) -> Window:
-    """A window of `days` days in 2001-2015 that holds no lead and no work at all - and neither do the `pad` days on each
-    side of it, where the boundary probes (a lead one instant outside the window) live. Proved through the API, as Super
-    Admin, who sees every team number. Random, so runs and modules do not collide; re-drawn if it is not empty."""
+    """A window of `days` days between 2000 and 2023 that holds no lead and no work at all - of any status, cancelled included -
+    and neither do the `pad` days on each side of it, where the boundary probes (a lead one instant outside the window) live.
+    Proved through the API, as Super Admin, who sees every team number. Random, so runs and modules do not collide; re-drawn if it
+    is not empty, and re-drawn if another window being built right now (any pytest worker) holds a day of it - so a dataset's exact
+    numbers can never include somebody else's data."""
     for _ in range(60):
-        start = date(2001, 1, 1) + timedelta(days=random.randint(0, 5400))
+        start = WINDOW_FIRST + timedelta(days=random.randint(0, (WINDOW_LAST - WINDOW_FIRST).days))
         window = Window(start, start + timedelta(days=days - 1))
         padded = Window(start - timedelta(days=pad), window.end + timedelta(days=pad))
         body = dash(admin_headers, **window_params(padded))
         onboarding = body["onboarding"] or {"activated_in_period": 0}
-        if body["kpis"]["total_leads"] == 0 and body["activity"]["total"] == 0 and onboarding["activated_in_period"] == 0:
+        if (body["kpis"]["total_leads"] == 0 and body["activity"]["total"] == 0 and onboarding["activated_in_period"] == 0
+                and _no_work_of_any_status(admin_headers, padded) and _claim(window, pad)):
             return window
     raise AssertionError("could not find an empty window in the scratch database")
 
 
 # ---- direct-DB backdating (scratch only) ---------------------------------------------------------------------------------
 def backdate_lead(lead_id: str, created_at: datetime, closed_at: Optional[datetime] = None) -> None:
-    from sqlalchemy import update
+    from sqlalchemy import text, update
     from sales.models import SalesLead
 
     values = {"created_at": created_at}
@@ -127,6 +184,9 @@ def backdate_lead(lead_id: str, created_at: datetime, closed_at: Optional[dateti
         values["closed_at"] = closed_at
 
     async def _go(db):
+        # sales_leads.created_at is immutable (migration f2b6d8a1c4e9: "when was it entered" is a permanent record); a test that needs a
+        # lead created in another period says so explicitly, for its own transaction only
+        await db.execute(text("SELECT set_config('jaz.allow_lead_backdating', 'on', true)"))
         await db.execute(update(SalesLead).where(SalesLead.id == uuid.UUID(lead_id)).values(**values))
 
     run_db(_go)
@@ -251,12 +311,13 @@ def build_world(admin_headers: dict, manager: dict, e1: dict, e2: dict) -> World
         spec.id = lead["id"]
         if spec.owner:
             assign(m, spec.id, world.people[spec.owner]["id"])
-        # walk the pipeline the way a real lead moves (won needs a working stage first)
+        # walk the pipeline the way a real lead moves; a `won` lead is one that was won by hand BEFORE the rule that ended it (nobody can
+        # move a lead to won any more): seeded, with the same rows the manual move wrote (sales_lead_test_utils.legacy_win)
         if spec.stage in ("contacted", "interested", "demo_scheduled"):
             set_stage(m, spec.id, spec.stage)
         elif spec.stage == "won":
             set_stage(m, spec.id, "contacted")
-            set_stage(m, spec.id, "won")
+            legacy_win(m, spec.id)
         elif spec.stage == "lost":
             set_stage(m, spec.id, "lost", lost_reason=spec.lost_reason)
         world.leads[spec.key] = spec

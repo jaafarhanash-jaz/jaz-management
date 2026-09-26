@@ -30,6 +30,7 @@ from sales_reports_test_utils import (
     window_params,
     wind_down,
 )
+from sales_customer_test_utils import onboarding_worker
 from sales_test_utils import admin_token, assert_scratch_target, auth, employee_token, employee_user, owner_token, owner_user  # noqa: F401
 
 ROUTES = {
@@ -54,7 +55,8 @@ MATRIX = {
     "employee2": ALL - {"employee-performance", "onboarding"},
     "data_entry": set(),                                               # metrics are opt-in: Lead Data Entry holds neither key
     "data_entry2": set(),
-    "onboarding": {"dashboard", "onboarding"},                         # the two doors, and behind them only onboarding
+    "onboarding": set(),                                               # the RETIRED Onboarding Employee role reaches nothing
+    "worker": {"dashboard", "onboarding"},                             # its keys via a custom role: the two doors, only onboarding
     "no_roles": set(),
 }
 
@@ -71,7 +73,9 @@ def admin_h(admin_token):
 
 @pytest.fixture(scope="module")
 def personas(admin_h):
-    return make_personas(admin_h, "rb")
+    out = make_personas(admin_h, "rb")
+    out["worker"] = onboarding_worker(admin_h, "rb-worker")          # the dormant onboarding architecture
+    return out
 
 
 @pytest.fixture(scope="module")

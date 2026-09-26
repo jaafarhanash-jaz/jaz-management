@@ -187,13 +187,27 @@ def user_to_dict(user) -> dict:
     }
 
 
+def subscription_has_ended(company, now: Optional[datetime] = None) -> bool:
+    """Whether the company's subscription period is over. Two meanings of the stored end, chosen by the company's
+    `subscription_ends_exactly` flag:
+      * False (every subscription the Super Admin activates / renews, and all older data): compares DATE portions
+        only, exactly like the old implementation's is_past_date - a subscription ending today stays active through
+        the whole day and expires tomorrow;
+      * True (a Sales trial: exactly 7 x 24 hours from its creation): the end is an exact instant - the subscription
+        ends AT that moment."""
+    end = company.subscription_end_date
+    if not end:
+        return False
+    now = now or datetime.now(timezone.utc)
+    if getattr(company, "subscription_ends_exactly", False):
+        return now >= end
+    return end.date() < now.date()
+
+
 async def resolve_subscription_status(db: AsyncSession, company) -> str:
-    """Self-heal on read: an active subscription whose end date has passed
-    is persisted as expired. Compares DATE portions only, exactly like the
-    old implementation's is_past_date - a subscription ending today stays
-    active through the whole day and expires tomorrow."""
-    if company.subscription_status == SUBSCRIPTION_ACTIVE and company.subscription_end_date and \
-            company.subscription_end_date.date() < datetime.now(timezone.utc).date():
+    """Self-heal on read: an active subscription whose period has ended (subscription_has_ended) is persisted as
+    expired."""
+    if company.subscription_status == SUBSCRIPTION_ACTIVE and subscription_has_ended(company):
         company.subscription_status = SUBSCRIPTION_EXPIRED
         await db.flush()
         return SUBSCRIPTION_EXPIRED

@@ -14,6 +14,7 @@ import pytest
 from sales.timezone import app_today
 
 from sales_lead_test_utils import (
+    legacy_win,
     PHANTOM_ID,
     activities,
     assign,
@@ -93,7 +94,8 @@ class TestCreate:
         assert lead["created_by"]["id"] == p["manager"]["id"]
         assert lead["created_at"] and lead["updated_at"]
         assert lead["allowed_stages"] == ["lost"]
-        assert lead["can"] == {"update": True, "change_stage": True, "assign": True, "archive": True, "restore": False}
+        assert lead["can"] == {"update": True, "change_stage": True, "assign": True, "archive": True, "restore": False, "edit_locked": False,
+                               "wait_list": False}       # the wait list is the OWNER's tool: nobody owns this lead yet
 
     def test_full_lead_round_trips_every_field(self, p, mgr):
         campaign = create_campaign(mgr)
@@ -400,8 +402,8 @@ def dataset(p, mgr):
             if stage == "lost":
                 set_stage(mgr, lead["id"], "lost", lost_reason="no_response")
             elif stage == "won":
-                set_stage(mgr, lead["id"], "contacted")   # a lead must have been contacted before it can be won
-                set_stage(mgr, lead["id"], "won")
+                set_stage(mgr, lead["id"], "contacted")
+                legacy_win(mgr, lead["id"])               # a lead won BEFORE the rule that ended manual wins (nobody can move a lead to won now)
             else:
                 set_stage(mgr, lead["id"], stage)
         out[name] = get_lead(mgr, lead["id"])

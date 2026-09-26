@@ -1,8 +1,10 @@
 """JAZ Sales - Phase 2: the sales pipeline (HTTP integration tier).
 
-Stage changes are validated on the server, every change is recorded (who / when / before / after), Won and Lost are
-explicit states, Lost always carries a reason, and nobody can reach a stage - or set a lost reason - any other way.
-The expected transition table is written out here independently of the implementation.
+Stage changes are validated on the server, every change is recorded (who / when / before / after), Lost is an explicit
+state that always carries a reason, and nobody can reach a stage - or set a lost reason - any other way. `won` is NOT a manual
+move for ANYBODY (Sales Employee, Sales Manager or Super Admin): a lead is won only by the Customer Setup, which creates its
+customer in the same transaction (test_sales_workflow.py has the per-role proof; here the transition table, the terminal state and
+the happy path). The expected transition table is written out here independently of the implementation.
 """
 import concurrent.futures
 
@@ -17,9 +19,11 @@ from sales_lead_test_utils import (
     errors_of,
     get_lead,
     lead_body,
+    legacy_win,
     make_personas,
     set_stage,
 )
+from sales_customer_test_utils import agree
 from sales_test_utils import admin_token, api, assert_scratch_target, auth  # noqa: F401  (admin_token: mints instead of logging in)
 
 STAGES = ["new", "assigned", "contacted", "interested", "demo_scheduled", "demo_completed", "trial", "negotiation", "won", "lost"]
@@ -27,11 +31,12 @@ WORKING = ["contacted", "interested", "demo_scheduled", "demo_completed", "trial
 LOST_REASONS = ["too_expensive", "not_interested", "already_using_another_system", "no_response", "wrong_number",
                 "business_closed", "not_suitable", "delayed_decision", "competitor", "other"]
 
-# The specification, stage by stage: where a lead in that stage may be moved BY HAND (owner present).
+# The specification, stage by stage: where a lead in that stage may be moved BY HAND (owner present). `won` is nobody's manual
+# target - it is reached only through the Customer Setup - so it appears in no row; a lead that is won stays won.
 ALLOWED = {
     "new": {"lost"},
     "assigned": set(WORKING) | {"lost"},
-    **{stage: (set(WORKING) - {stage}) | {"won", "lost"} for stage in WORKING},
+    **{stage: (set(WORKING) - {stage}) | {"lost"} for stage in WORKING},
     "won": set(),
     "lost": {"assigned"},          # reopening: back to `assigned` while it has an owner (`new` when it has none)
 }
@@ -58,7 +63,8 @@ def mgr(p):
 
 
 def lead_in(mgr, p, stage, *, owner="employee"):
-    """A fresh lead sitting in `stage` (with an owner, except `new`), reached through legitimate operations."""
+    """A fresh lead sitting in `stage` (with an owner, except `new`), reached through legitimate operations. A `won` lead is one that
+    was won by hand BEFORE the rule that ended manual wins (seeded: sales_lead_test_utils.legacy_win)."""
     lead = create_lead(mgr)
     if stage == "new":
         return lead
@@ -67,7 +73,8 @@ def lead_in(mgr, p, stage, *, owner="employee"):
         return get_lead(mgr, lead["id"])
     if stage == "won":
         set_stage(mgr, lead["id"], "contacted")
-        return set_stage(mgr, lead["id"], "won")
+        legacy_win(mgr, lead["id"])
+        return get_lead(mgr, lead["id"])
     if stage == "lost":
         return set_stage(mgr, lead["id"], "lost", lost_reason="no_response")
     return set_stage(mgr, lead["id"], stage)
@@ -91,31 +98,37 @@ def _stage_chain_is_consistent(events, final_stage):
 # =============================================================================
 class TestTheHappyPath:
     def test_a_lead_walks_the_whole_pipeline_to_won(self, p, mgr):
+        """The salesperson walks it stage by stage; the last step is the Customer Setup ("Agreed"), which wins the lead in the same
+        transaction that creates its customer. `won` is offered to nobody, whoever asks."""
         emp = p["employee"]["headers"]
         lead = create_lead(mgr)
         assert (lead["pipeline_stage"], lead["allowed_stages"]) == ("new", ["lost"])
         assign(mgr, lead["id"], p["employee"]["id"])
-        for stage in ["contacted", "interested", "demo_scheduled", "demo_completed", "trial", "negotiation", "won"]:
+        for stage in ["contacted", "interested", "demo_scheduled", "demo_completed", "trial", "negotiation"]:
             r = _move(emp, lead["id"], stage, note=f"moved to {stage}")
             assert r.status_code == 200, (stage, r.text)
             body = r.json()
             assert body["pipeline_stage"] == stage
-            assert set(body["allowed_stages"]) == ALLOWED[stage]
-            assert (body["closed_at"] is not None) == (stage == "won")
+            assert set(body["allowed_stages"]) == ALLOWED[stage] and "won" not in body["allowed_stages"]
+            assert body["closed_at"] is None
+        for headers in (emp, mgr):                                                    # not to the salesperson, not to the manager
+            assert "won" not in get_lead(headers, lead["id"])["allowed_stages"]
+        agree(emp, get_lead(mgr, lead["id"]))                                          # "Agreed": the customer, the company - and the win
         final = get_lead(mgr, lead["id"])
         assert final["pipeline_stage"] == "won" and final["lost_reason"] is None and final["allowed_stages"] == []
+        assert final["closed_at"] is not None
 
         events = activities(mgr, lead["id"])
         stage_events = [e for e in events if e["event_type"] == "stage_changed"]
         assert [e["after"]["pipeline_stage"] for e in stage_events] == ["assigned", "contacted", "interested", "demo_scheduled",
                                                                        "demo_completed", "trial", "negotiation", "won"]
-        for event in stage_events[1:]:                                             # the employee's own moves
+        for event in stage_events[1:-1]:                                           # the employee's own moves
             assert event["actor"]["id"] == p["employee"]["id"] and event["note"] == f"moved to {event['after']['pipeline_stage']}"
         assert stage_events[0]["metadata"]["automatic"] is True                    # new -> assigned came from the assignment
-        assert [e["event_type"] for e in events][-2:] == ["stage_changed", "lead_marked_won"]
-        won = events[-1]
+        assert [e["event_type"] for e in events][-3:] == ["stage_changed", "lead_marked_won", "lead_converted"]
+        won = events[-2]
         assert won["before"] == {"pipeline_stage": "negotiation"} and won["after"] == {"pipeline_stage": "won"}
-        assert won["actor"]["id"] == p["employee"]["id"] and won["note"] == "moved to won"
+        assert won["actor"]["id"] == p["employee"]["id"] and won["metadata"]["cause"] == "customer_setup"
         _stage_chain_is_consistent(events, "won")
 
     def test_who_and_when_are_recorded_and_ordered(self, p, mgr):
@@ -142,7 +155,13 @@ class TestTransitionTable:
             events_before = len(activities(mgr, lead["id"]))
             extra = {"lost_reason": "not_suitable"} if target == "lost" else {}
             r = _move(mgr, lead["id"], target, **extra)
-            if target in ALLOWED[current]:
+            if target == "won":                                                     # never a manual move - even for the manager
+                assert r.status_code == 403, f"{current} -> won must be refused: {r.status_code} {r.text[:200]}"
+                detail = errors_of(r)
+                assert detail["field"] == "stage" and detail["code"] == "won_requires_customer_setup"
+                assert get_lead(mgr, lead["id"]) == before                          # a refused move changes nothing...
+                assert len(activities(mgr, lead["id"])) == events_before                             # ...and records nothing
+            elif target in ALLOWED[current]:
                 assert r.status_code == 200, f"{current} -> {target} should be allowed: {r.status_code} {r.text[:200]}"
                 assert r.json()["pipeline_stage"] == target
             else:
@@ -169,14 +188,17 @@ class TestTransitionTable:
     def test_a_lead_nobody_owns_can_only_be_closed(self, p, mgr):
         lead = lead_in(mgr, p, "interested")
         api("POST", f"/api/sales/leads/{lead['id']}/unassign", mgr)
-        for target in ("contacted", "demo_scheduled", "won"):
+        for target in ("contacted", "demo_scheduled"):
             r = _move(mgr, lead["id"], target)
             assert r.status_code == 409 and errors_of(r)["code"] == "assignee_required", target
+        assert _move(mgr, lead["id"], "won").status_code == 403                    # ... and never won by hand, owner or not
         assert get_lead(mgr, lead["id"])["allowed_stages"] == ["lost"]
         assert _move(mgr, lead["id"], "lost", lost_reason="business_closed").status_code == 200
 
-    def test_won_needs_contact_first(self, p, mgr):
-        assert _move(mgr, lead_in(mgr, p, "assigned")["id"], "won").status_code == 409
+    def test_won_is_never_a_manual_move_not_even_from_the_last_working_stage(self, p, mgr):
+        for stage in ("assigned", "negotiation"):
+            r = _move(mgr, lead_in(mgr, p, stage)["id"], "won")
+            assert r.status_code == 403 and errors_of(r)["code"] == "won_requires_customer_setup", stage
 
     def test_stage_names_outside_the_pipeline_are_rejected(self, p, mgr):
         lead = create_lead(mgr)
@@ -212,7 +234,7 @@ class TestLost:
         assert _move(mgr, lead["id"], "lost", lost_reason=reason).status_code == 422
         assert get_lead(mgr, lead["id"])["pipeline_stage"] == "contacted"
 
-    @pytest.mark.parametrize("target", ["interested", "won", "negotiation"])
+    @pytest.mark.parametrize("target", ["interested", "negotiation"])
     def test_only_a_lost_lead_may_carry_a_reason(self, p, mgr, target):
         lead = lead_in(mgr, p, "contacted")
         r = _move(mgr, lead["id"], target, lost_reason="other")
@@ -257,22 +279,33 @@ class TestLost:
         r = _move(mgr, owned["id"], "new")
         assert r.status_code == 409 and errors_of(r)["code"] == "unassign_required"
 
-    @pytest.mark.parametrize("target", ["contacted", "won", "trial"])
+    @pytest.mark.parametrize("target", ["contacted", "trial"])
     def test_a_lost_lead_cannot_jump_straight_back_into_the_pipeline(self, p, mgr, target):
         lost = lead_in(mgr, p, "lost")
         assert _move(mgr, lost["id"], target).status_code == 409
+        assert _move(mgr, lost["id"], "won").status_code == 403                     # ... let alone to won
 
 
 class TestWon:
-    def test_won_is_explicit_stamps_the_close_time_and_is_terminal(self, p, mgr):
-        won = lead_in(mgr, p, "won")
+    def test_a_lead_won_by_the_customer_setup_is_stamped_and_terminal(self, p, mgr):
+        lead = lead_in(mgr, p, "negotiation")
+        agree(p["employee"]["headers"], lead)
+        won = get_lead(mgr, lead["id"])
         assert won["pipeline_stage"] == "won" and won["closed_at"] is not None and won["lost_reason"] is None
         assert won["allowed_stages"] == []
+        self._nothing_leaves_won(mgr, won)
+
+    def test_a_lead_won_by_hand_before_the_rule_is_just_as_terminal(self, p, mgr):
+        won = lead_in(mgr, p, "won")                                               # seeded: the historical state
+        assert won["pipeline_stage"] == "won" and won["closed_at"] is not None and won["allowed_stages"] == []
+        self._nothing_leaves_won(mgr, won)
+
+    @staticmethod
+    def _nothing_leaves_won(mgr, won):
         for target in STAGES:
-            if target == "won":
-                continue
             extra = {"lost_reason": "other"} if target == "lost" else {}
-            assert _move(mgr, won["id"], target, **extra).status_code == 409, target
+            r = _move(mgr, won["id"], target, **extra)
+            assert r.status_code == (403 if target == "won" else 409), target
         assert get_lead(mgr, won["id"]) == won
 
     def test_a_won_lead_still_belongs_to_its_owner_and_can_be_archived(self, p, mgr):
@@ -320,7 +353,7 @@ class TestPipelineViews:
             assign(mgr, lead["id"], p["employee"]["id"])
         set_stage(mgr, b["id"], "contacted")
         set_stage(mgr, c["id"], "contacted")
-        set_stage(mgr, c["id"], "won")
+        legacy_win(mgr, c["id"])                                                  # (a lead won before the rule that ended manual wins)
         set_stage(mgr, d["id"], "lost", lost_reason="other")
         counts = api("GET", f"/api/sales/leads/stage-counts?campaign_id={campaign['id']}", mgr).json()["counts"]
         assert counts == {"new": 0, "assigned": 1, "contacted": 1, "interested": 0, "demo_scheduled": 0, "demo_completed": 0,
@@ -333,7 +366,7 @@ class TestPipelineViews:
         set_stage(mgr, lead["id"], "demo_scheduled")
         found = api("GET", f"/api/sales/leads?campaign_id={campaign['id']}&pipeline_stage=demo_scheduled", mgr).json()
         assert [i["id"] for i in found["items"]] == [lead["id"]] and found["items"][0]["allowed_stages"] == [
-            "contacted", "interested", "demo_completed", "trial", "negotiation", "won", "lost"]
+            "contacted", "interested", "demo_completed", "trial", "negotiation", "lost"]
 
 
 # =============================================================================

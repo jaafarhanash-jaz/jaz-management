@@ -54,6 +54,9 @@ const SalesCustomerDetail = ({ onLogout, language, setLanguage, userRole }) => {
   }
 
   const { lead, company, onboarding, can } = customer;
+  // Simplified workflow: onboarding is not part of the active workflow (the Customer Setup completes a customer and its pages
+  // are not reachable), so its card and link are not shown. The data and the API stay for a later re-enabling.
+  const showOnboarding = false;
 
   return shell(
     <div className="space-y-5" data-testid="customer-detail">
@@ -75,7 +78,7 @@ const SalesCustomerDetail = ({ onLogout, language, setLanguage, userRole }) => {
                 <Link to={`/sales/leads/${lead.id}`} data-testid="customer-open-lead"><Target className="w-4 h-4 me-2" aria-hidden="true" />{ts('cust_open_lead', language)}</Link>
               </Button>
             )}
-            {can.view_onboarding && onboarding && (
+            {showOnboarding && can.view_onboarding && onboarding && (
               <Button asChild className="bg-[#0033A0] hover:bg-[#002277] rounded-sm">
                 <Link to={`/sales/onboarding/${onboarding.id}`} data-testid="customer-open-onboarding"><ClipboardCheck className="w-4 h-4 me-2" aria-hidden="true" />{ts('cust_open_onboarding', language)}</Link>
               </Button>
@@ -95,6 +98,7 @@ const SalesCustomerDetail = ({ onLogout, language, setLanguage, userRole }) => {
             <Row icon={Building2} label={ts('cust_field_company', language)} testid="cust-row-company"><bdi>{company.name}</bdi></Row>
             <Row label={ts('cust_field_subscription', language)} testid="cust-row-subscription">
               {company.subscription_status ? ts(`sub_status_${company.subscription_status}`, language) : <Empty />}
+              {customer.subscription_type && <span className="ms-2 rounded-full border border-gray-300 px-2 py-0.5 text-xs text-gray-700" data-testid="cust-subscription-type">{ts(`sub_type_${customer.subscription_type}`, language)}</span>}
             </Row>
             <Row label={ts('cust_field_owner', language)} testid="cust-row-owner">{company.owner_name ? <bdi>{company.owner_name}</bdi> : <Empty />}</Row>
             <Row icon={Mail} label={ts('cust_field_owner_email', language)} testid="cust-row-owner-email">{company.owner_email ? <Ltr>{company.owner_email}</Ltr> : <Empty />}</Row>
@@ -126,6 +130,7 @@ const SalesCustomerDetail = ({ onLogout, language, setLanguage, userRole }) => {
             </div>
           </Card>
 
+          {showOnboarding && (
           <Card className="p-5 bg-white border border-gray-200 rounded-md" data-testid="customer-onboarding">
             <h2 className="text-lg font-semibold text-[#0A0A0A] mb-2">{ts('cust_section_onboarding', language)}</h2>
             {onboarding ? (
@@ -139,6 +144,7 @@ const SalesCustomerDetail = ({ onLogout, language, setLanguage, userRole }) => {
               <p className="text-sm text-gray-500" data-testid="customer-no-onboarding">{ts('cust_no_onboarding_access', language)}</p>
             )}
           </Card>
+          )}
         </div>
       </div>
     </div>,

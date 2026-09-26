@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import { Outlet } from 'react-router-dom';
-import { BarChart3, Briefcase, Building2, ClipboardCheck, Columns3, FlaskConical, LayoutDashboard, ListChecks, Megaphone, PhoneCall, Presentation, Target, UserCircle, Users } from 'lucide-react';
+import { Activity, BarChart3, Briefcase, Building2, ClipboardCheck, Columns3, FlaskConical, Layers, LayoutDashboard, ListChecks, Megaphone, PhoneCall, Presentation, Target, UserCircle, Users } from 'lucide-react';
 import api from '@/utils/api';
 import { ts } from '@/utils/salesTranslations';
 
@@ -27,6 +27,8 @@ export const SALES_SECTIONS = [
   { key: 'onboarding', path: '/sales/onboarding', icon: ClipboardCheck, labelKey: 'nav_onboarding' },
   { key: 'campaigns', path: '/sales/campaigns', icon: Megaphone, labelKey: 'nav_campaigns' },
   { key: 'reports', path: '/sales/reports', icon: BarChart3, labelKey: 'nav_reports' },
+  { key: 'batches', path: '/sales/batches', icon: Layers, labelKey: 'nav_batches' },           // the Sales Manager's alone (f2b6d8a1c4e9)
+  { key: 'performance', path: '/sales/performance', icon: Activity, labelKey: 'nav_performance' },
   { key: 'team', path: '/sales/team', icon: Users, labelKey: 'nav_team' },
 ];
 
