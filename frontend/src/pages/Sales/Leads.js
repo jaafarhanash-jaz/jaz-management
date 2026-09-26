@@ -18,21 +18,25 @@ import AssignDialog from '@/components/sales/AssignDialog';
 import DistributionDialog, { useDistributionStatus } from '@/components/sales/DistributionDialog';
 import LeadExportButtons from '@/components/sales/LeadExportButtons';
 import { PriorityBadge, StageBadge } from '@/components/sales/LeadBadges';
-import { ArrowDownUp, ChevronLeft, ChevronRight, Columns3, Plus, Search, Shuffle, Target, UserPlus, X } from 'lucide-react';
+import { ArrowDownUp, ChevronLeft, ChevronRight, Plus, Search, Shuffle, Target, UserPlus, X } from 'lucide-react';
 
 const PAGE_SIZE = 25;
 const ALL = '__all__';
 const SORTS = ['created_at', 'updated_at', 'business_name', 'priority', 'estimated_value', 'pipeline_stage'];
+// The stages the current MVP drives: a lead is New, is Assigned to a salesperson, and ends Won (the Customer Setup) or Lost (Not
+// interested). The stages between them belong to the retired pipeline (contacted ... negotiation): their tab is listed only while
+// it holds leads (or is the selected filter), so no empty legacy tab shows and no lead becomes unreachable.
+const MVP_STAGES = ['new', 'assigned', 'won', 'lost'];
 
-// URL search params ARE the filter state, so Back/Forward and in-app links (the board's "view all", a campaign's lead count)
-// land on exactly the same filtered view.
-const FILTER_KEYS = ['q', 'pipeline_stage', 'assigned_to', 'source', 'campaign_id', 'priority', 'created_from', 'created_to', 'archived', 'sort', 'order'];
+// URL search params ARE the filter state, so Back/Forward and in-app links land on exactly the same filtered view. (Every filter
+// here has a control on the page; the campaign filter is not one of them - campaigns are outside the current MVP.)
+const FILTER_KEYS = ['q', 'pipeline_stage', 'assigned_to', 'source', 'priority', 'created_from', 'created_to', 'archived', 'sort', 'order'];
 const DEFAULTS = { archived: 'exclude', sort: 'created_at', order: 'desc' };
 
 const SalesLeads = ({ onLogout, language, setLanguage, userRole }) => {
   const { can, hasModule, loading: accessLoading } = useSalesAccess();
   const [params, setParams] = useSearchParams();
-  const ref = useSalesReference({ campaigns: can('sales.campaigns.view'), assignees: can('sales.leads.assign') });
+  const ref = useSalesReference({ assignees: can('sales.leads.assign') });
 
   const filters = {};
   FILTER_KEYS.forEach((key) => { filters[key] = params.get(key) || DEFAULTS[key] || ''; });
@@ -152,11 +156,6 @@ const SalesLeads = ({ onLogout, language, setLanguage, userRole }) => {
             </Button>
           )}
           {canExport && <LeadExportButtons query={exportQuery} language={language} />}
-          {hasModule('pipeline') && (
-            <Button asChild variant="outline" className="rounded-sm">
-              <Link to="/sales/pipeline"><Columns3 className="w-4 h-4 me-2" aria-hidden="true" />{ts('nav_pipeline', language)}</Link>
-            </Button>
-          )}
           {canCreate && (
             <Button asChild className="bg-[#0033A0] hover:bg-[#002277] rounded-sm" data-testid="add-lead-btn">
               <Link to="/sales/leads/new"><Plus className="w-4 h-4 me-2" aria-hidden="true" />{ts('leads_add', language)}</Link>
@@ -165,10 +164,12 @@ const SalesLeads = ({ onLogout, language, setLanguage, userRole }) => {
         </div>
       </div>
 
-      {/* pipeline stage tabs with counts (they are the stage filter) */}
+      {/* stage tabs with counts (they are the stage filter); a retired-pipeline stage is listed only while it holds leads or is selected */}
       <div className="overflow-x-auto" data-testid="stage-tabs">
         <div role="tablist" aria-label={ts('filter_stage', language)} className="flex gap-2 min-w-max pb-1">
-          {[{ key: '', label: ts('filter_all', language), count: counts ? counts.total : null }, ...STAGES.map((s) => ({ key: s, label: stageName(s, language), count: counts ? counts.counts[s] : null }))].map((tab) => (
+          {[{ key: '', label: ts('filter_all', language), count: counts ? counts.total : null },
+            ...STAGES.filter((s) => MVP_STAGES.includes(s) || filters.pipeline_stage === s || (counts && counts.counts[s] > 0))
+              .map((s) => ({ key: s, label: stageName(s, language), count: counts ? counts.counts[s] : null }))].map((tab) => (
             <button
               key={tab.key || 'all'}
               type="button"
@@ -197,7 +198,6 @@ const SalesLeads = ({ onLogout, language, setLanguage, userRole }) => {
           </div>
           {selectField('f-assigned', ts('filter_assigned', language), filters.assigned_to, (v) => setFilter('assigned_to', v), assigneeOptions, 'filter-assigned')}
           {selectField('f-source', ts('lead_field_source', language), filters.source, (v) => setFilter('source', v), ref.sources.map((s) => ({ value: s.key, label: language === 'ar' ? s.name_ar : s.name_en })), 'filter-source')}
-          {can('sales.campaigns.view') && selectField('f-campaign', ts('lead_field_campaign', language), filters.campaign_id, (v) => setFilter('campaign_id', v), ref.campaigns.map((c) => ({ value: c.id, label: c.name })), 'filter-campaign')}
           {selectField('f-priority', ts('lead_field_priority', language), filters.priority, (v) => setFilter('priority', v), PRIORITIES.map((p) => ({ value: p, label: priorityName(p, language) })), 'filter-priority')}
           <div className="col-span-2 sm:col-span-1">
             <Label htmlFor="f-from" className="text-xs text-gray-600">{ts('filter_created_from', language)}</Label>
@@ -281,7 +281,6 @@ const SalesLeads = ({ onLogout, language, setLanguage, userRole }) => {
                   <TableHead className="text-start">{ts('leads_col_contact', language)}</TableHead>
                   <TableHead className="text-start">{ts('lead_field_city', language)}</TableHead>
                   <TableHead className="text-start hidden xl:table-cell">{ts('lead_field_source', language)}</TableHead>
-                  <TableHead className="text-start hidden xl:table-cell">{ts('lead_field_campaign', language)}</TableHead>
                   <TableHead className="text-start">{ts('lead_field_pipeline_stage', language)}</TableHead>
                   <TableHead className="text-start">{ts('lead_field_priority', language)}</TableHead>
                   <TableHead className="text-start">{ts('lead_field_assigned_to', language)}</TableHead>
@@ -310,7 +309,6 @@ const SalesLeads = ({ onLogout, language, setLanguage, userRole }) => {
                     </TableCell>
                     <TableCell className="text-sm">{lead.city || <span className="text-gray-400">-</span>}</TableCell>
                     <TableCell className="text-sm hidden xl:table-cell">{sourceName(ref.sources, lead.source, language)}</TableCell>
-                    <TableCell className="text-sm hidden xl:table-cell">{lead.campaign ? lead.campaign.name : <span className="text-gray-400">-</span>}</TableCell>
                     <TableCell><StageBadge stage={lead.pipeline_stage} language={language} /></TableCell>
                     <TableCell><PriorityBadge priority={lead.priority} language={language} /></TableCell>
                     <TableCell className="text-sm">

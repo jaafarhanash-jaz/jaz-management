@@ -3,6 +3,7 @@
 export const workflowTranslations = {
   ar: {
     // ---- the lead queue ----
+    nav_queue: 'طابور العملاء المحتملين',      // the menu name of a Sales Employee's landing page (not "قائمة الانتظار": that is the Wait List)
     wf_queue_title: 'عميلك المحتمل التالي',
     wf_queue_counter: 'العميل المحتمل {n} من {total}',
     wf_queue_prev: 'السابق',
@@ -149,6 +150,7 @@ export const workflowTranslations = {
     err_export_too_large: 'عدد العملاء المحتملين المطابقين كبير جداً للتصدير. ضيّق عوامل التصفية.',
   },
   en: {
+    nav_queue: 'Lead Queue',
     wf_queue_title: 'Your next lead',
     wf_queue_counter: 'Lead {n} of {total}',
     wf_queue_prev: 'Previous',

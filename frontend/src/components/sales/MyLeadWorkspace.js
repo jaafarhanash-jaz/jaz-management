@@ -155,7 +155,6 @@ const MyLeadWorkspace = ({ language }) => {
             )}
             <p className="text-sm text-gray-600 md:col-span-2" data-testid="queue-source">
               {ts('lead_field_source', language)}: {sourceName(ref.sources, lead.source, language)}
-              {lead.campaign && <> · {ts('lead_field_campaign', language)}: <bdi>{lead.campaign.name}</bdi></>}
             </p>
           </div>
 

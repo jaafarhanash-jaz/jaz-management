@@ -1,24 +1,27 @@
-import { Link } from 'react-router-dom';
+import { Link, Navigate } from 'react-router-dom';
 import { Layout } from '@/components/Layout';
 import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
-import { SALES_SECTIONS, useSalesAccess } from '@/components/sales/SalesAccess';
-import WorkOverview from '@/components/sales/WorkOverview';
+import { SALES_SECTIONS, salesHomeKind, useSalesAccess } from '@/components/sales/SalesAccess';
 import SalesDashboard from '@/components/sales/SalesDashboard';
 import MyLeadWorkspace from '@/components/sales/MyLeadWorkspace';
 import { ts, roleName } from '@/utils/salesTranslations';
-import { Briefcase, ShieldCheck, UserX } from 'lucide-react';
+import { ShieldCheck, UserX } from 'lucide-react';
 
-// The Sales landing page. Someone who works assigned leads (sales.leads.scope_assigned without the team-wide scope - a Sales
-// Employee) gets their lead queue FIRST: the current lead and its two outcomes are their primary workflow. Someone who may open
-// the dashboard (sales.dashboard.view) then gets it - the server decides which sections they see; anybody else keeps the
-// Phase 1-4 page (the work overview and their sections).
+// The Sales landing page, by what the person works with (see salesHomeKind):
+//   queue      a Sales Employee - their lead queue (the current lead and its outcomes) under their identity card
+//   dashboard  a Sales Manager / Super Admin - the dashboard
+//   none       Data Entry and anybody else who may open Leads - there is nothing on this page for them, so they land on Leads;
+//              someone with no Leads access sees the sections that are open to them
+// Sections outside the current MVP are never offered here (SALES_SECTIONS marks them `legacy`).
 const SalesHome = ({ onLogout, language, setLanguage, userRole }) => {
   const { loading, error, me, hasModule, reload, can } = useSalesAccess();
 
   const noRole = me && !me.is_super_admin && me.roles.length === 0;
-  const worksAssignedLeads = can('sales.leads.view') && can('sales.leads.scope_assigned') && !can('sales.leads.scope_all');
-  const otherSections = SALES_SECTIONS.filter((s) => s.key !== 'home' && hasModule(s.key));
+  const kind = salesHomeKind(can);
+  const otherSections = SALES_SECTIONS.filter((s) => s.key !== 'home' && !s.legacy && hasModule(s.key));
+
+  if (me && !noRole && kind === 'none' && hasModule('leads')) return <Navigate to="/sales/leads" replace />;
 
   return (
     <Layout userRole={userRole} onLogout={onLogout} language={language} setLanguage={setLanguage}>
@@ -36,7 +39,7 @@ const SalesHome = ({ onLogout, language, setLanguage, userRole }) => {
 
         {me && (
           <>
-            {!noRole && worksAssignedLeads && <MyLeadWorkspace language={language} />}
+            {!noRole && kind === 'queue' && <MyLeadWorkspace language={language} />}
 
             <Card className="p-6 bg-white border border-gray-200 rounded-md" data-testid="sales-home-identity">
               <p className="text-sm text-gray-500">{ts('home_welcome', language)}</p>
@@ -66,36 +69,24 @@ const SalesHome = ({ onLogout, language, setLanguage, userRole }) => {
                 <h2 className="text-lg font-semibold text-[#0A0A0A]">{ts('home_no_role_title', language)}</h2>
                 <p className="text-gray-500 mt-2 max-w-xl mx-auto">{ts('home_no_role_body', language)}</p>
               </Card>
-            ) : can('sales.dashboard.view') ? (
+            ) : kind === 'dashboard' ? (
               <SalesDashboard language={language} />
-            ) : worksAssignedLeads ? null : (
-              <>
-                <WorkOverview language={language} />
-
-                <Card className="p-12 text-center bg-white border border-gray-200" data-testid="sales-home-foundation">
-                  <Briefcase className="w-12 h-12 mx-auto text-gray-300 mb-4" />
-                  <h2 className="text-lg font-semibold text-[#0A0A0A]">{ts('home_foundation_title', language)}</h2>
-                  <p className="text-gray-500 mt-2">{ts('home_foundation_body', language)}</p>
-                </Card>
-
-                {otherSections.length > 0 && (
-                  <div data-testid="sales-home-sections">
-                    <p className="text-sm text-gray-500 mb-2">{ts('home_available_sections', language)}</p>
-                    <div className="flex flex-wrap gap-3">
-                      {otherSections.map((s) => {
-                        const Icon = s.icon;
-                        return (
-                          <Link key={s.key} to={s.path} data-testid={`sales-home-link-${s.key}`}
-                            className="flex items-center gap-2 px-4 py-3 bg-white border border-gray-200 rounded-md text-sm font-medium text-gray-700 hover:bg-gray-50">
-                            <Icon className="w-4 h-4" />{ts(s.labelKey, language)}
-                          </Link>
-                        );
-                      })}
-                    </div>
-                  </div>
-                )}
-              </>
-            )}
+            ) : kind === 'none' && otherSections.length > 0 ? (
+              <div data-testid="sales-home-sections">
+                <p className="text-sm text-gray-500 mb-2">{ts('home_available_sections', language)}</p>
+                <div className="flex flex-wrap gap-3">
+                  {otherSections.map((s) => {
+                    const Icon = s.icon;
+                    return (
+                      <Link key={s.key} to={s.path} data-testid={`sales-home-link-${s.key}`}
+                        className="flex items-center gap-2 px-4 py-3 bg-white border border-gray-200 rounded-md text-sm font-medium text-gray-700 hover:bg-gray-50">
+                        <Icon className="w-4 h-4" />{ts(s.labelKey, language)}
+                      </Link>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : null}
           </>
         )}
       </div>

@@ -7,7 +7,7 @@ export const reportsTranslations = {
     // ---- navigation and titles
     nav_reports: 'التقارير',
     dash_title: 'لوحة المبيعات',
-    dash_subtitle: 'مؤشرات الأداء وحالة المسار للفترة المحددة.',
+    dash_subtitle: 'أرقام العملاء المحتملين ومصادرهم للفترة المحددة.',
     reports_title: 'التقارير',
     reports_subtitle: 'تقارير عملية مبنية على بيانات المبيعات ضمن صلاحياتك.',
 
@@ -181,7 +181,7 @@ export const reportsTranslations = {
     // ---- navigation and titles
     nav_reports: 'Reports',
     dash_title: 'Sales Dashboard',
-    dash_subtitle: 'Performance indicators and pipeline status for the selected period.',
+    dash_subtitle: 'Lead figures and sources for the selected period.',
     reports_title: 'Reports',
     reports_subtitle: 'Practical reports built on the Sales data you have access to.',
 

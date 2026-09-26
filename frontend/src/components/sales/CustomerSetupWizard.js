@@ -7,7 +7,7 @@ import { Label } from '@/components/ui/label';
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Textarea } from '@/components/ui/textarea';
-import { CompanyMatches } from '@/components/sales/ConvertLeadDialog';
+import { CompanyMatches } from '@/components/sales/CompanyMatches';
 import { FieldError } from '@/components/sales/ActivityFields';
 import api from '@/utils/api';
 import { validateAndFocus } from '@/utils/formValidation';

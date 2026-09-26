@@ -21,9 +21,21 @@ const ALL = '__all__';
 
 const onbStageName = (stage, language) => ts(`onb_stage_${stage}`, language);
 
-// The Sales dashboard: a period, the key figures, the pipeline, the team's performance, sources, campaigns, activity and
-// onboarding. Everything is computed by GET /api/sales/dashboard; a section the caller may not see arrives as null and is
-// simply not drawn (never as a zero). The period, and the employee a team caller narrows to, live in the URL.
+// What the dashboard draws in the current MVP: a period, the lead figures and the lead sources. Everything else GET /api/sales/dashboard
+// still returns belongs to something outside the MVP - the pipeline board, the per-employee table (the Performance page covers it),
+// campaigns, calls / follow-ups / demos / trials, onboarding - so it is not drawn. The API keeps returning it; setting a flag to
+// true draws that section again.
+const SHOW = { pipeline: false, performance: false, campaigns: false, activity: false, onboarding: false };
+// Key figures of the same features: the pipeline funnel (contacted / interested / in a demo stage / in negotiation) and the
+// follow-up, demo and trial work counts. The MVP figures stay: total, new, assigned, won, lost and the conversion rate.
+const HIDDEN_KPIS = new Set([
+  'contacted_leads', 'interested_leads', 'demos', 'negotiations',
+  'active_trials', 'upcoming_demos', 'overdue_followups', 'upcoming_followups',
+]);
+
+// The Sales dashboard: a period, the key figures and the lead sources (see SHOW above for the rest). Everything is computed
+// by GET /api/sales/dashboard; a section the caller may not see arrives as null and is simply not drawn (never as a zero).
+// The period, and the employee a team caller narrows to, live in the URL.
 const SalesDashboard = ({ language }) => {
   const { can } = useSalesAccess();
   const [params, setParams] = useSearchParams();
@@ -134,13 +146,13 @@ const DashboardBody = ({ data, language, showDefinitions, setShowDefinitions }) 
   const { kpis } = data;
   const hasLeadFigures = kpis.total_leads !== null && kpis.total_leads !== undefined;
   const cards = KPIS.filter((k) => {
+    if (HIDDEN_KPIS.has(k.key)) return false;
     if (k.key === 'conversion_rate') return hasLeadFigures;              // null with leads = "no data"; null without lead access = not shown
     return kpis[k.key] !== null && kpis[k.key] !== undefined;
   });
-  // Simplified workflow: onboarding is no longer part of the active workflow (the customer setup completes a customer), so its
-  // section is not shown; the API still returns it for a later expansion.
-  const showOnboarding = false;
-  const anything = cards.length > 0 || data.pipeline || data.performance || data.sources || data.campaigns || data.activity || (showOnboarding && data.onboarding);
+  const anything = cards.length > 0 || data.sources
+    || (SHOW.pipeline && data.pipeline) || (SHOW.performance && data.performance) || (SHOW.campaigns && data.campaigns)
+    || (SHOW.activity && data.activity) || (SHOW.onboarding && data.onboarding);
 
   if (!anything) {
     return <Card className="p-10 text-center bg-white border border-gray-200 text-gray-500" data-testid="dashboard-nothing">{ts('dash_nothing', language)}</Card>;
@@ -166,7 +178,7 @@ const DashboardBody = ({ data, language, showDefinitions, setShowDefinitions }) 
         </section>
       )}
 
-      {data.pipeline && (
+      {SHOW.pipeline && data.pipeline && (
         <Section id="pipeline" title={ts('sec_pipeline', language)} basis="cohort" hint={ts('def_pipeline', language)} language={language}
           actions={<Button asChild variant="outline" size="sm" className="rounded-sm"><Link to="/sales/pipeline">{ts('dash_view_board', language)}</Link></Button>}>
           <BarList testid="pipeline-bars" language={language} rows={data.pipeline.map((s) => ({
@@ -176,7 +188,7 @@ const DashboardBody = ({ data, language, showDefinitions, setShowDefinitions }) 
         </Section>
       )}
 
-      {data.performance && (
+      {SHOW.performance && data.performance && (
         <Section id="performance" title={ts('sec_performance', language)} basis="cohort" language={language}
           hint={data.performance.total > data.performance.items.length ? ts('rc_more_items', language).replace('{shown}', formatCount(data.performance.items.length, language)).replace('{total}', formatCount(data.performance.total, language)) : null}>
           {data.performance.items.length === 0
@@ -185,8 +197,8 @@ const DashboardBody = ({ data, language, showDefinitions, setShowDefinitions }) 
         </Section>
       )}
 
-      {(data.sources || data.campaigns) && (
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+      {(data.sources || (SHOW.campaigns && data.campaigns)) && (
+        <div className={`grid grid-cols-1 ${SHOW.campaigns ? 'lg:grid-cols-2' : ''} gap-5`}>
           {data.sources && (
             <Section id="sources" title={ts('sec_sources', language)} basis="cohort" language={language}>
               {data.sources.length === 0
@@ -197,7 +209,7 @@ const DashboardBody = ({ data, language, showDefinitions, setShowDefinitions }) 
                 }))} />}
             </Section>
           )}
-          {data.campaigns && (
+          {SHOW.campaigns && data.campaigns && (
             <Section id="campaigns" title={ts('sec_campaigns', language)} basis="cohort" language={language}
               hint={data.campaigns.total > data.campaigns.items.length ? ts('rc_more_items', language).replace('{shown}', formatCount(data.campaigns.items.length, language)).replace('{total}', formatCount(data.campaigns.total, language)) : null}>
               {data.campaigns.items.length === 0 && data.campaigns.no_campaign.leads === 0
@@ -217,7 +229,7 @@ const DashboardBody = ({ data, language, showDefinitions, setShowDefinitions }) 
         </div>
       )}
 
-      {data.activity && (
+      {SHOW.activity && data.activity && (
         <Section id="activity" title={ts('sec_activity', language)} basis="event" hint={ts('def_activity', language)} language={language}>
           <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
             {[['calls', 'nav_calls'], ['followups', 'nav_followups'], ['demos', 'nav_demos'], ['trials', 'nav_trials']]
@@ -236,7 +248,7 @@ const DashboardBody = ({ data, language, showDefinitions, setShowDefinitions }) 
         </Section>
       )}
 
-      {showOnboarding && data.onboarding && (
+      {SHOW.onboarding && data.onboarding && (
         <Section id="onboarding" title={ts('sec_onboarding', language)} hint={ts('def_onboarding', language)} language={language}>
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-5">
             <Figure id="onb-active" value={data.onboarding.active} label={ts('rc_active', language)} basis="now" language={language} />
@@ -279,16 +291,18 @@ const Definitions = ({ language, cards }) => (
           <dd className="text-gray-600 mt-0.5">{kpiDefinition(k, language, stageName)}</dd>
         </div>
       ))}
-      {['cohort', 'event', 'now'].map((b) => (
+      {['cohort', 'event', 'now'].filter((b) => b === 'cohort' || (b === 'event' && SHOW.activity) || cards.some((k) => k.basis === b)).map((b) => (
         <div key={b}>
           <dt className="font-medium text-[#0A0A0A]">{basisName(b, language)}</dt>
           <dd className="text-gray-600 mt-0.5">{basisHint(b, language)}</dd>
         </div>
       ))}
-      <div>
-        <dt className="font-medium text-[#0A0A0A]">{ts('rc_value', language)}</dt>
-        <dd className="text-gray-600 mt-0.5">{ts('def_value', language)}</dd>
-      </div>
+      {SHOW.pipeline && (
+        <div>
+          <dt className="font-medium text-[#0A0A0A]">{ts('rc_value', language)}</dt>
+          <dd className="text-gray-600 mt-0.5">{ts('def_value', language)}</dd>
+        </div>
+      )}
     </dl>
   </Card>
 );

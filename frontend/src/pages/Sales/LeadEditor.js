@@ -34,7 +34,7 @@ const SalesLeadEditor = ({ onLogout, language, setLanguage, userRole }) => {
   const navigate = useNavigate();
   const { can, hasModule, loading: accessLoading } = useSalesAccess();
   const canAssign = can('sales.leads.assign');
-  const ref = useSalesReference({ campaigns: can('sales.campaigns.view'), assignees: canAssign && !editing });
+  const ref = useSalesReference({ assignees: canAssign && !editing });
 
   const [original, setOriginal] = useState(null);
   const [loadState, setLoadState] = useState(editing ? 'loading' : 'ready');   // loading | ready | forbidden | notfound | error
@@ -236,21 +236,6 @@ const SalesLeadEditor = ({ onLogout, language, setLanguage, userRole }) => {
               </Select>
               {fieldError('source')}
             </div>
-            {can('sales.campaigns.view') && (
-              <div>
-                <Label htmlFor="lf-campaign_id">{ts('lead_field_campaign', language)}</Label>
-                <Select value={form.campaign_id || NONE} onValueChange={(v) => setField('campaign_id', v === NONE ? '' : v)}>
-                  <SelectTrigger id="lf-campaign_id" className="mt-1" data-testid="lf-campaign_id"><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value={NONE}>{ts('none', language)}</SelectItem>
-                    {ref.campaigns.map((c) => <SelectItem key={c.id} value={c.id}>{c.name}</SelectItem>)}
-                    {/* the lead's current campaign may be completed/paused and still be listed; if it is missing, keep it selectable */}
-                    {original?.campaign && !ref.campaigns.some((c) => c.id === original.campaign.id) && <SelectItem value={original.campaign.id}>{original.campaign.name}</SelectItem>}
-                  </SelectContent>
-                </Select>
-                {fieldError('campaign_id')}
-              </div>
-            )}
             <div>
               <Label htmlFor="lf-priority">{ts('lead_field_priority', language)}</Label>
               <Select value={form.priority} onValueChange={(v) => setField('priority', v)}>
