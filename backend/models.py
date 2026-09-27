@@ -139,9 +139,24 @@ class Company(Base, TimestampMixin, SoftDeleteMixin):
     working_hours_start_time: Mapped[str] = mapped_column(String(5), nullable=False, server_default="08:00")
     working_hours_end_time: Mapped[str] = mapped_column(String(5), nullable=False, server_default="17:00")
 
+    # First-Time Company Setup Wizard (Part 1). Default is deliberately
+    # 'completed' (fail-closed), NOT 'not_started' - every company row that
+    # already existed before this column was added, plus any future
+    # insertion path this app doesn't already know about (fixtures, the
+    # demo seed), silently gets treated as already onboarded. Only the one
+    # deliberate "this is a brand new company" path (services/admin.py
+    # create_company) explicitly overrides it to 'not_started'. See
+    # services/onboarding.py for the step machine this drives.
+    onboarding_status: Mapped[str] = mapped_column(String, nullable=False, server_default="completed")
+    onboarding_current_step: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    onboarding_completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
     __table_args__ = (
         CheckConstraint(
             "subscription_status IN ('active','expired','suspended')", name="ck_companies_subscription_status"
+        ),
+        CheckConstraint(
+            "onboarding_status IN ('not_started','in_progress','completed')", name="ck_companies_onboarding_status"
         ),
     )
 

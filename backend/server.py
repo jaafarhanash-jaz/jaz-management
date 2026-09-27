@@ -35,6 +35,7 @@ import services.employees as employees_service
 import services.heartbeat as heartbeat_service
 import services.messages as messages_service
 import services.notifications as notifications_service
+import services.onboarding as onboarding_service
 import services.realtime as realtime_service
 import services.reports as reports_service
 import services.schedule_resolution as schedule_resolution
@@ -270,6 +271,10 @@ class UserResponse(BaseModel):
     schedule_name: Optional[str] = None
     cv: Optional[Dict[str, Any]] = None
     photo: Optional[Dict[str, Any]] = None
+    # First-Time Company Setup Wizard (Part 1) - present (possibly null)
+    # for every role; only the company_owner router gate acts on it.
+    onboarding_status: Optional[str] = None
+    onboarding_current_step: Optional[str] = None
 
 class CompanyCreate(BaseModel):
     name: str
@@ -849,6 +854,19 @@ class WeeklyHolidayPatternCreate(BaseModel):
     title: str = "عطلة أسبوعية"
     description: str = ""
 
+# ---- First-Time Company Setup Wizard (Part 1) ----
+
+class OnboardingResponse(BaseModel):
+    status: str
+    current_step: Optional[str] = None
+    completed_at: Optional[str] = None
+
+class OnboardingStepUpdate(BaseModel):
+    step: str
+
+class OnboardingRestartRequest(BaseModel):
+    confirm: bool
+
 # ============ Helper Functions ============
 
 def generate_qr_code(data: str) -> str:
@@ -1055,6 +1073,32 @@ async def list_user_devices(user_id: str, current_user: dict = Depends(get_curre
     return await devices_service.list_devices_for_user(pg, user_id)
 
 # ============ Company Owner Routes ============
+
+# ---- First-Time Company Setup Wizard (Part 1) ----
+
+@api_router.get("/owner/onboarding", response_model=OnboardingResponse)
+async def get_onboarding_status(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await onboarding_service.get_status(pg, current_user)
+
+@api_router.post("/owner/onboarding/step", response_model=OnboardingResponse)
+async def set_onboarding_step(data: OnboardingStepUpdate, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await onboarding_service.set_step(pg, current_user, data.step)
+
+@api_router.post("/owner/onboarding/complete", response_model=OnboardingResponse)
+async def complete_onboarding(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await onboarding_service.complete(pg, current_user)
+
+@api_router.post("/owner/onboarding/restart", response_model=OnboardingResponse)
+async def restart_onboarding(data: OnboardingRestartRequest, current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):
+    if current_user["role"] != UserRole.COMPANY_OWNER:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await onboarding_service.restart(pg, current_user, data.confirm)
 
 @api_router.get("/owner/dashboard")
 async def get_owner_dashboard(current_user: dict = Depends(get_current_user), pg: AsyncSession = Depends(get_db)):

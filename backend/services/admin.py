@@ -271,6 +271,12 @@ async def create_company(db: AsyncSession, data) -> dict:
         subscription_start_date=None,
         subscription_end_date=None,
         address=data.address,
+        # Every other insertion path (fixtures, services/seed.py's demo
+        # company) keeps the column's fail-closed 'completed' default -
+        # this is the one deliberate "brand new company" path that opts
+        # into the First-Time Company Setup Wizard.
+        onboarding_status="not_started",
+        onboarding_current_step="welcome",
         **plan_config_for_company(plan),
     )
     await db.flush()

@@ -119,8 +119,9 @@ async def rotate_refresh_token(db: AsyncSession, raw_token: str) -> dict:
     if user is None:
         raise HTTPException(status_code=401, detail="User not found")
 
-    user_dict = user_to_dict(user)
-    await enforce_company_access(db, user_dict)
+    company = await companies_repo.get_by_id(db, user.company_id) if user.company_id else None
+    user_dict = user_to_dict(user, company=company)
+    await enforce_company_access(db, user_dict, company=company)
 
     new_raw_token = secrets.token_urlsafe(32)
     new_expires_at = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
@@ -146,10 +147,18 @@ def _photo_response(user) -> Optional[dict]:
     return {"mime_type": user.avatar_mime_type}
 
 
-def user_to_dict(user) -> dict:
+def user_to_dict(user, company=None) -> dict:
     """Mirrors the old Mongo doc shape (str ids, ISO datetime strings) so
     every not-yet-migrated route body that reads current_user as a plain
-    dict keeps working unchanged."""
+    dict keeps working unchanged.
+
+    `company` is optional and purely additive (First-Time Company Setup
+    Wizard, Part 1): every call site already has the user's company on
+    hand or can fetch it once (see login/get_current_user/
+    rotate_refresh_token below) - passing it here means the wizard's
+    routing decision is available from login/me with no extra endpoint
+    call. Omitted (e.g. a super_admin, who has no company) -> both fields
+    are simply null."""
     return {
         "id": str(user.id),
         "email": user.email,
@@ -166,6 +175,8 @@ def user_to_dict(user) -> dict:
         "photo": _photo_response(user),
         "last_seen_at": user.last_seen_at.isoformat() if user.last_seen_at else None,
         "created_at": user.created_at.isoformat() if user.created_at else None,
+        "onboarding_status": company.onboarding_status if company else None,
+        "onboarding_current_step": company.onboarding_current_step if company else None,
     }
 
 
@@ -209,8 +220,9 @@ async def login(db: AsyncSession, email_or_phone: str, password: str) -> dict:
     if not user or not await verify_password(password, user.password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    user_dict = user_to_dict(user)
-    await enforce_company_access(db, user_dict)
+    company = await companies_repo.get_by_id(db, user.company_id) if user.company_id else None
+    user_dict = user_to_dict(user, company=company)
+    await enforce_company_access(db, user_dict, company=company)
 
     token = create_access_token({"sub": user_dict["id"], "role": user_dict["role"]})
     refresh_token = await _issue_refresh_token(db, user.id)
@@ -233,7 +245,7 @@ async def get_current_user(db: AsyncSession, token: str) -> dict:
     if user is None:
         raise HTTPException(status_code=401, detail="User not found")
 
-    user_dict = user_to_dict(user)
+    user_dict = user_to_dict(user, company=company)
     # This dependency runs on every single authenticated request in the
     # app - one combined query here instead of two sequential ones
     # (get_by_id, then companies_repo.get_by_id inside

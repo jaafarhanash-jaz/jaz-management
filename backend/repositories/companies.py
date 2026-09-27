@@ -47,6 +47,30 @@ async def detach_plan_from_deleted_companies(db: AsyncSession, plan_id) -> None:
     )
 
 
+async def set_onboarding_step(db: AsyncSession, company_id, *, status: str, current_step: str) -> None:
+    await db.execute(
+        update(Company).where(Company.id == company_id).values(
+            onboarding_status=status, onboarding_current_step=current_step,
+        )
+    )
+
+
+async def complete_onboarding(db: AsyncSession, company_id, *, completed_at) -> None:
+    await db.execute(
+        update(Company).where(Company.id == company_id).values(
+            onboarding_status="completed", onboarding_current_step=None, onboarding_completed_at=completed_at,
+        )
+    )
+
+
+async def restart_onboarding(db: AsyncSession, company_id, *, status: str, current_step: str) -> None:
+    await db.execute(
+        update(Company).where(Company.id == company_id).values(
+            onboarding_status=status, onboarding_current_step=current_step, onboarding_completed_at=None,
+        )
+    )
+
+
 async def get_working_hours(db: AsyncSession, company_id) -> dict:
     company = await get_by_id(db, company_id)
     if not company:
